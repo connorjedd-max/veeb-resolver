@@ -1,16 +1,13 @@
-# Veeb Render Resolver V24
+# Veeb YouTube Resolver V25
 
-V24 removes the failed Safari foreground race and makes YouTube extraction strictly single-flight on the small Render instance.
+V25 is a speed/reliability revision of V24.
 
-Key changes:
-- authenticated mweb only
-- one yt-dlp/ffmpeg pipeline at a time
-- same-track prefetch is reused instead of canceled/restarted
-- unrelated speculative work is canceled and its process group is torn down before foreground extraction starts
-- shared writable YouTube cookie jar again, now safe because extraction is serialized
-- explicit shared yt-dlp cache directory at `/tmp/veeb-yt-dlp-cache`
-- `--no-check-formats` is explicit
-- keeps format 18 -> ffmpeg AAC-only MP4 cache and byte ranges
+The key change is progressive cache handoff. V24 waited for the entire audio file to finish downloading before the browser received anything. The user's logs showed first playable media around 16-19 seconds but the completed cache could arrive 7-10 seconds later. V25 keeps the resolver build independent of the browser, buffers a substantial fragmented-MP4 lead-in (default 192 KiB), then lets playback read from the growing file while the rest continues caching in the background.
 
-Keep the same Render secret and `/etc/secrets/youtube-cookies.txt` secret file.
-No new required environment variables.
+This keeps the known-good authenticated mweb + bgutil PO-token path and single-flight CPU policy. Completed files still become normal byte-range cache hits.
+
+Optional environment variable:
+
+- `VEEB_LIVE_PREBUFFER_BYTES` defaults to `196608` (192 KiB). Increase it if a particular browser needs more startup buffer. Lower values can start slightly sooner but are less conservative.
+
+Keep the existing `RESOLVER_SECRET` and `/etc/secrets/youtube-cookies.txt` secret file.

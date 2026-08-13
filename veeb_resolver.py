@@ -47,6 +47,7 @@ CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
 PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "1")))
 FILE_CHUNK_BYTES = 256 * 1024
 FOREGROUND_READY_BYTES = max(64 * 1024, int(os.environ.get("VEEB_FOREGROUND_READY_BYTES", str(128 * 1024))))
+LIVE_PREBUFFER_BYTES = max(64 * 1024, int(os.environ.get("VEEB_LIVE_PREBUFFER_BYTES", str(192 * 1024))))
 PLAYBACK_WAIT_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_PLAYBACK_WAIT", "0")))
 
 # V24 uses one authenticated mweb pipeline only. Racing extra clients on the
@@ -58,6 +59,7 @@ _prefetch_started: set[str] = set()
 _prefetch_started_at: dict[str, float] = {}
 _process_cookie_files: dict[int, str] = {}
 _foreground_tasks: dict[str, asyncio.Task] = {}
+_build_states: dict[str, "ProgressiveBuildState"] = {}
 # Exactly one yt-dlp/ffmpeg pipeline at a time. On the free Render CPU,
 # concurrent challenge solving increased cold-start latency rather than helping.
 _youtube_pipeline_lock = asyncio.Lock()
@@ -553,109 +555,60 @@ async def open_stream_with_fallback(video_id: str, purpose: str):
     raise HTTPException(status_code=502, detail="No YouTube playback client produced media bytes")
 
 
-async def build_cache(video_id: str) -> bool:
+class ProgressiveBuildState:
+    def __init__(self, video_id: str, purpose: str):
+        ensure_cache_dir()
+        self.video_id = video_id
+        self.purpose = purpose
+        self.temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.progressive.part"
+        self.started = time.monotonic()
+        self.bytes_written = 0
+        self.client: str | None = None
+        self.success = False
+        self.error: str | None = None
+        self.ready = asyncio.Event()
+        self.done = asyncio.Event()
+        self.condition = asyncio.Condition()
+        self.task: asyncio.Task | None = None
+
+
+async def _notify_build_state(state: ProgressiveBuildState) -> None:
+    async with state.condition:
+        state.condition.notify_all()
+
+
+async def build_progressive_cache(state: ProgressiveBuildState) -> bool:
+    """Build one track while exposing a growing, already-buffered file.
+
+    V24 waited for the entire song before the browser received a byte. Logs
+    showed that this could add another 7-10 seconds after yt-dlp had already
+    produced playable media. V25 keeps the reliable cache build independent of
+    the browser, but lets playback attach once a substantial fMP4 prebuffer is
+    safely on disk.
+    """
+    video_id = state.video_id
     if cache_is_valid(video_id):
+        state.success = True
+        state.ready.set()
+        state.done.set()
+        await _notify_build_state(state)
         return True
 
-    ensure_cache_dir()
-    final_path = cache_path(video_id)
-    temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.part"
-    started = time.monotonic()
+    process = None
+    stderr_task = None
+    stderr_tail: list[str] = []
+    total = 0
+    success = False
 
-    async with _prefetch_semaphore:
+    try:
         async with _youtube_pipeline_lock:
-            _prefetch_started.add(video_id)
-            _prefetch_started_at[video_id] = time.monotonic()
             if cache_is_valid(video_id):
-                _prefetch_started.discard(video_id)
-                _prefetch_started_at.pop(video_id, None)
+                state.success = True
+                state.ready.set()
+                state.done.set()
+                await _notify_build_state(state)
                 return True
 
-            process = None
-            stderr_task = None
-            total = 0
-            success = False
-            client = None
-            stderr_tail: list[str] = []
-
-            try:
-                (
-                    process,
-                    stderr_task,
-                    stderr_tail,
-                    first_chunk,
-                    client,
-                    _,
-                ) = await open_stream_with_fallback(video_id, "prefetch")
-
-                assert process.stdout is not None
-                with open(temp_path, "wb") as handle:
-                    handle.write(first_chunk)
-                    total += len(first_chunk)
-
-                    while True:
-                        chunk = await process.stdout.read(FILE_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-                        total += len(chunk)
-
-                await process.wait()
-
-                if process.returncode == 0 and total >= 1024:
-                    os.replace(temp_path, final_path)
-                    success = True
-                    cleanup_cache()
-
-                print(
-                    "audio prefetch finished",
-                    json.dumps({
-                        "videoId": video_id,
-                        "ok": success,
-                        "client": client,
-                        "bytes": total,
-                        "elapsedSeconds": round(time.monotonic() - started, 2),
-                        "returnCode": process.returncode,
-                        "stderrTail": [] if success else stderr_tail[-20:],
-                    }),
-                    flush=True,
-                )
-
-                return success
-            finally:
-                if not success:
-                    try:
-                        temp_path.unlink()
-                    except OSError:
-                        pass
-                if process is not None:
-                    await terminate_process(process, stderr_task)
-                _prefetch_started.discard(video_id)
-                _prefetch_started_at.pop(video_id, None)
-
-
-async def build_cache_foreground(video_id: str) -> bool:
-    """Build the selected track with exclusive priority on the Render CPU."""
-    if cache_is_valid(video_id):
-        return True
-
-    ensure_cache_dir()
-    final_path = cache_path(video_id)
-    temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.live.part"
-    started = time.monotonic()
-
-    async with _youtube_pipeline_lock:
-        if cache_is_valid(video_id):
-            return True
-
-        process = None
-        stderr_task = None
-        total = 0
-        success = False
-        client = None
-        stderr_tail: list[str] = []
-
-        try:
             (
                 process,
                 stderr_task,
@@ -663,114 +616,139 @@ async def build_cache_foreground(video_id: str) -> bool:
                 first_chunk,
                 client,
                 _,
-            ) = await open_foreground_stream(video_id)
+            ) = await open_stream_with_fallback(video_id, state.purpose)
+            state.client = client
 
             assert process.stdout is not None
-            with open(temp_path, "wb") as handle:
-                handle.write(first_chunk)
-                total += len(first_chunk)
+            with open(state.temp_path, "wb") as handle:
+                if first_chunk:
+                    handle.write(first_chunk)
+                    handle.flush()
+                    total += len(first_chunk)
+                    state.bytes_written = total
+                    if total >= LIVE_PREBUFFER_BYTES:
+                        state.ready.set()
+                    await _notify_build_state(state)
 
                 while True:
                     chunk = await process.stdout.read(FILE_CHUNK_BYTES)
                     if not chunk:
                         break
                     handle.write(chunk)
+                    handle.flush()
                     total += len(chunk)
+                    state.bytes_written = total
+                    if total >= LIVE_PREBUFFER_BYTES:
+                        state.ready.set()
+                    await _notify_build_state(state)
 
             await process.wait()
 
             if process.returncode == 0 and total >= 1024:
-                os.replace(temp_path, final_path)
+                os.replace(state.temp_path, cache_path(video_id))
                 success = True
+                state.success = True
                 cleanup_cache()
+            else:
+                state.error = f"pipeline return code {process.returncode}"
 
             print(
-                "foreground cache build finished",
+                "progressive cache build finished",
                 json.dumps({
                     "videoId": video_id,
+                    "purpose": state.purpose,
                     "ok": success,
-                    "client": client,
+                    "client": state.client,
                     "bytes": total,
-                    "elapsedSeconds": round(time.monotonic() - started, 2),
+                    "elapsedSeconds": round(time.monotonic() - state.started, 2),
                     "returnCode": process.returncode,
                     "stderrTail": [] if success else stderr_tail[-20:],
                 }),
                 flush=True,
             )
             return success
-        finally:
-            if not success:
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-            if process is not None:
-                await terminate_process(process, stderr_task)
+    except asyncio.CancelledError:
+        state.error = "cancelled"
+        raise
+    except Exception as exc:
+        state.error = str(exc)[:1200]
+        print(
+            "progressive cache build error",
+            json.dumps({"videoId": video_id, "purpose": state.purpose, "error": state.error}),
+            flush=True,
+        )
+        return False
+    finally:
+        state.bytes_written = total
+        state.success = success or state.success
+        state.ready.set()
+        state.done.set()
+        await _notify_build_state(state)
+        if not state.success:
+            try:
+                state.temp_path.unlink()
+            except OSError:
+                pass
+        if process is not None:
+            await terminate_process(process, stderr_task)
 
 
-def _foreground_task_finished(video_id: str, task: asyncio.Task) -> None:
-    current = _foreground_tasks.get(video_id)
-    if current is task:
+def _build_state_finished(video_id: str, state: ProgressiveBuildState, task: asyncio.Task) -> None:
+    current = _build_states.get(video_id)
+    if current is state and state.task is task:
+        # Keep the state object reachable until callbacks/streamers have observed
+        # completion. Cached requests do not need it after this point.
+        _build_states.pop(video_id, None)
+
+    if _cache_tasks.get(video_id) is task:
+        _cache_tasks.pop(video_id, None)
+    if _foreground_tasks.get(video_id) is task:
         _foreground_tasks.pop(video_id, None)
+
+    _prefetch_started.discard(video_id)
+    _prefetch_started_at.pop(video_id, None)
+
     try:
         task.result()
     except asyncio.CancelledError:
-        pass
+        if state.purpose == "prefetch":
+            print("audio prefetch task cancelled", json.dumps({"videoId": video_id}), flush=True)
     except Exception as exc:
         print(
-            "foreground cache task error",
-            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
+            "audio build task error",
+            json.dumps({"videoId": video_id, "purpose": state.purpose, "error": str(exc)[:1200]}),
             flush=True,
         )
+
+
+def start_progressive_build(video_id: str, purpose: str) -> ProgressiveBuildState:
+    existing = _build_states.get(video_id)
+    if existing and existing.task and not existing.task.done():
+        return existing
+
+    state = ProgressiveBuildState(video_id, purpose)
+    task = asyncio.create_task(build_progressive_cache(state))
+    state.task = task
+    _build_states[video_id] = state
+    task.add_done_callback(lambda done: _build_state_finished(video_id, state, done))
+    return state
 
 
 def start_foreground_build(video_id: str) -> asyncio.Task:
-    existing = _foreground_tasks.get(video_id)
-    if existing and not existing.done():
-        return existing
-    task = asyncio.create_task(build_cache_foreground(video_id))
-    _foreground_tasks[video_id] = task
-    task.add_done_callback(lambda done: _foreground_task_finished(video_id, done))
-    return task
-
-
-def _task_finished(video_id: str, task: asyncio.Task) -> None:
-    current = _cache_tasks.get(video_id)
-    if current is task:
-        _cache_tasks.pop(video_id, None)
-
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        print(
-            "audio prefetch task cancelled",
-            json.dumps({"videoId": video_id}),
-            flush=True,
-        )
-    except Exception as exc:
-        print(
-            "audio prefetch task error",
-            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
-            flush=True,
-        )
+    state = start_progressive_build(video_id, "live")
+    assert state.task is not None
+    _foreground_tasks[video_id] = state.task
+    return state.task
 
 
 def start_prefetch(video_id: str, *, intent: bool = False) -> tuple[str, asyncio.Task | None]:
     if cache_is_valid(video_id):
         return "cached", None
 
-    foreground = _foreground_tasks.get(video_id)
-    if foreground and not foreground.done():
-        return "foreground", foreground
+    state = _build_states.get(video_id)
+    if state and state.task and not state.task.done():
+        return "warming", state.task
 
-    existing = _cache_tasks.get(video_id)
-    if existing and not existing.done():
-        return "warming", existing
-
-    # Never build a speculative queue. Queued prefetches were the source of
-    # 40-60 second apparent waits in V22. There may be one speculative track
-    # only. A strong hover/touch intent may replace that one; weak automatic
-    # page guesses simply back off while the resolver is busy.
     active_other = [
         (other_id, task)
         for other_id, task in _cache_tasks.items()
@@ -788,10 +766,70 @@ def start_prefetch(video_id: str, *, intent: bool = False) -> tuple[str, asyncio
             )
             task.cancel()
 
-    task = asyncio.create_task(build_cache(video_id))
-    _cache_tasks[video_id] = task
-    task.add_done_callback(lambda done: _task_finished(video_id, done))
-    return "warming", task
+    _prefetch_started.add(video_id)
+    _prefetch_started_at[video_id] = time.monotonic()
+    state = start_progressive_build(video_id, "prefetch")
+    assert state.task is not None
+    _cache_tasks[video_id] = state.task
+    return "warming", state.task
+
+
+async def wait_for_progressive_ready(state: ProgressiveBuildState) -> None:
+    if state.ready.is_set():
+        return
+    await state.ready.wait()
+
+
+async def progressive_file_body(state: ProgressiveBuildState) -> AsyncIterator[bytes]:
+    """Read from the growing temp file without owning/cancelling the build."""
+    offset = 0
+    handle = None
+
+    try:
+        while True:
+            if handle is None:
+                source = state.temp_path
+                if not source.is_file() and cache_path(state.video_id).is_file():
+                    source = cache_path(state.video_id)
+                if source.is_file():
+                    handle = open(source, "rb")
+                elif state.done.is_set():
+                    break
+                else:
+                    async with state.condition:
+                        await state.condition.wait()
+                    continue
+
+            handle.seek(offset)
+            chunk = handle.read(FILE_CHUNK_BYTES)
+            if chunk:
+                offset += len(chunk)
+                yield chunk
+                await asyncio.sleep(0)
+                continue
+
+            if state.done.is_set():
+                break
+
+            async with state.condition:
+                if state.bytes_written <= offset and not state.done.is_set():
+                    await state.condition.wait()
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def progressive_headers(state: ProgressiveBuildState) -> dict[str, str]:
+    return {
+        "Content-Type": STREAM_CONTENT_TYPE,
+        "Accept-Ranges": "none",
+        "Cache-Control": "no-store",
+        "X-Veeb-Resolver": "yt-dlp-progressive-v25",
+        "X-Veeb-Cache": "BUILDING",
+        "X-Veeb-Progressive": "1",
+        "X-Veeb-Source-Format": SOURCE_FORMAT,
+        "X-Veeb-Prebuffer-Bytes": str(state.bytes_written),
+    }
 
 
 async def file_body(path: Path, start: int, length: int) -> AsyncIterator[bytes]:
@@ -970,7 +1008,7 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v24",
+        "service": "veeb-youtube-resolver-v25",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
@@ -994,11 +1032,12 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "mweb-singleflight-shared-cache-edge-ready",
+        "streamTransport": "mweb-progressive-prebuffer-singleflight",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
         "cacheMaxFiles": CACHE_MAX_FILES,
+        "livePrebufferBytes": LIVE_PREBUFFER_BYTES,
         "cachedTracks": len(cached_files),
         "prefetchConcurrency": PREFETCH_CONCURRENCY,
         "activePrefetches": len([task for task in _cache_tasks.values() if not task.done()]),
@@ -1037,103 +1076,105 @@ async def stream_endpoint(
         print("audio cache hit", json.dumps({"videoId": video_id}), flush=True)
         return await serve_cached(cache_path(video_id), request)
 
-    active = _cache_tasks.get(video_id)
-    if active and not active.done():
-        print(
-            "audio reusing same-track prefetch",
-            json.dumps({
-                "videoId": video_id,
-                "elapsedSeconds": round(
-                    time.monotonic() - _prefetch_started_at.get(video_id, time.monotonic()),
-                    2,
-                ),
-            }),
-            flush=True,
-        )
-        try:
-            await active
-        except Exception:
-            pass
-
-        if cache_is_valid(video_id):
-            print("audio cache hit after same-track prefetch", json.dumps({"videoId": video_id}), flush=True)
-            return await serve_cached(cache_path(video_id), request)
-
     if request.method == "HEAD":
+        state = _build_states.get(video_id)
         return Response(
             status_code=200,
             headers={
                 "Content-Type": STREAM_CONTENT_TYPE,
-                "Accept-Ranges": "bytes",
+                "Accept-Ranges": "none" if state and not state.done.is_set() else "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-cache-first-v24",
-                "X-Veeb-Cache": "MISS",
+                "X-Veeb-Resolver": "yt-dlp-progressive-v25",
+                "X-Veeb-Cache": "BUILDING" if state and not state.done.is_set() else "MISS",
             },
         )
 
-    # Foreground owns the Render CPU. Cancel every unrelated speculative task
-    # and wait briefly for its full process group to die before yt-dlp starts.
-    # V23 showed that simply firing cancellation and immediately continuing still
-    # let the losing Deno process contend with the selected track.
-    preempted_tasks = []
-    preempted_ids = []
-    for other_id, other_task in list(_cache_tasks.items()):
-        if other_id != video_id and not other_task.done():
-            preempted_ids.append(other_id)
-            preempted_tasks.append(other_task)
-            other_task.cancel()
-
-    if preempted_tasks:
+    state = _build_states.get(video_id)
+    if state and state.task and not state.task.done():
         print(
-            "audio preempting speculative work",
-            json.dumps({"videoId": video_id, "preempted": sorted(preempted_ids)}),
+            "audio joining active build",
+            json.dumps({
+                "videoId": video_id,
+                "purpose": state.purpose,
+                "elapsedSeconds": round(time.monotonic() - state.started, 2),
+                "bytesReady": state.bytes_written,
+            }),
             flush=True,
         )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*preempted_tasks, return_exceptions=True),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
+    else:
+        # Foreground owns the Render CPU. Kill unrelated speculative work first.
+        preempted_tasks = []
+        preempted_ids = []
+        for other_id, other_task in list(_cache_tasks.items()):
+            if other_id != video_id and not other_task.done():
+                preempted_ids.append(other_id)
+                preempted_tasks.append(other_task)
+                other_task.cancel()
+
+        if preempted_tasks:
             print(
-                "audio prefetch teardown timeout",
+                "audio preempting speculative work",
                 json.dumps({"videoId": video_id, "preempted": sorted(preempted_ids)}),
                 flush=True,
             )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*preempted_tasks, return_exceptions=True),
+                    timeout=1.25,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    "audio prefetch teardown timeout",
+                    json.dumps({"videoId": video_id, "preempted": sorted(preempted_ids)}),
+                    flush=True,
+                )
 
-    task = start_foreground_build(video_id)
-    if _foreground_tasks.get(video_id) is task:
+        start_foreground_build(video_id)
+        state = _build_states[video_id]
         print(
-            "audio foreground single-flight",
+            "audio foreground progressive build",
             json.dumps({
                 "videoId": video_id,
                 "preemptedSpeculativePrefetches": sorted(preempted_ids),
                 "client": PRIMARY_CLIENT,
+                "livePrebufferBytes": LIVE_PREBUFFER_BYTES,
                 "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
             }),
             flush=True,
         )
 
-    try:
-        await task
-    except asyncio.CancelledError:
-        raise HTTPException(status_code=503, detail="Playback preparation was cancelled")
-    except Exception as exc:
-        print(
-            "audio foreground build error",
-            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
-            flush=True,
+    await wait_for_progressive_ready(state)
+
+    if cache_is_valid(video_id):
+        print("audio cache ready before progressive handoff", json.dumps({"videoId": video_id}), flush=True)
+        return await serve_cached(cache_path(video_id), request)
+
+    if state.bytes_written < 1024 or state.error:
+        if state.task and not state.task.done():
+            try:
+                await state.task
+            except Exception:
+                pass
+        if cache_is_valid(video_id):
+            return await serve_cached(cache_path(video_id), request)
+        raise HTTPException(
+            status_code=502,
+            detail=state.error or "Audio preparation completed without playable media",
         )
 
-    if not cache_is_valid(video_id):
-        raise HTTPException(status_code=502, detail="Audio preparation completed without a playable cache file")
-
     print(
-        "audio cold cache ready for playback",
+        "audio progressive handoff",
         json.dumps({
             "videoId": video_id,
-            "bytes": cache_path(video_id).stat().st_size,
+            "purpose": state.purpose,
+            "bytesReady": state.bytes_written,
+            "elapsedSeconds": round(time.monotonic() - state.started, 2),
         }),
         flush=True,
     )
-    return await serve_cached(cache_path(video_id), request)
+
+    return StreamingResponse(
+        progressive_file_body(state),
+        status_code=200,
+        headers=progressive_headers(state),
+    )
