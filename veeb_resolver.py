@@ -26,15 +26,15 @@ WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube
 SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "18")
 STREAM_CONTENT_TYPE = "audio/mp4"
 
-# V19 cold-start strategy:
-# 1. Try tv_downgraded first. yt-dlp itself prefers this client for logged-in
-#    free-account cookies, and it does not need the mweb GVS PO-token path.
-# 2. Fall back to the known-good mweb path with fetch_pot=auto and the
-#    ad-playback context optimization enabled for non-Premium accounts.
-PRIMARY_CLIENT = os.environ.get("YOUTUBE_PRIMARY_CLIENT", "tv_downgraded").strip() or "tv_downgraded"
-FALLBACK_CLIENT = os.environ.get("YOUTUBE_FALLBACK_CLIENT", "mweb").strip() or "mweb"
-FAST_CLIENT_TIMEOUT_SECONDS = float(os.environ.get("YOUTUBE_FAST_CLIENT_TIMEOUT_SECONDS", "12"))
+# V20 cold-start strategy:
+# The V19 logs proved tv_downgraded only added a dead 12 second attempt.
+# V20 goes directly to the known-good mweb path and uses yt-dlp's recommended
+# Deno EJS runtime plus player_skip=configs to remove avoidable startup work.
+PRIMARY_CLIENT = os.environ.get("YOUTUBE_CLIENT", "mweb").strip() or "mweb"
+FALLBACK_CLIENT = ""
+FAST_CLIENT_TIMEOUT_SECONDS = 0.0
 STREAM_START_TIMEOUT_SECONDS = float(os.environ.get("STREAM_START_TIMEOUT_SECONDS", "0"))
+JSC_RUNTIME = os.environ.get("YOUTUBE_JSC_RUNTIME", "deno").strip() or "deno"
 YOUTUBE_PREMIUM_ACCOUNT = os.environ.get("YOUTUBE_PREMIUM_ACCOUNT", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -42,7 +42,7 @@ YOUTUBE_PREMIUM_ACCOUNT = os.environ.get("YOUTUBE_PREMIUM_ACCOUNT", "false").str
 CACHE_DIR = Path(os.environ.get("VEEB_AUDIO_CACHE_DIR", "/tmp/veeb-audio-cache"))
 CACHE_TTL_SECONDS = int(os.environ.get("VEEB_AUDIO_CACHE_TTL", str(6 * 60 * 60)))
 CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
-PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "2")))
+PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "1")))
 FILE_CHUNK_BYTES = 256 * 1024
 
 _cache_tasks: dict[str, asyncio.Task] = {}
@@ -102,6 +102,11 @@ def youtube_extractor_args(client: str) -> str:
     # with Premium cookies because it can remove Premium formats.
     if client in {"mweb", "web_music"} and not YOUTUBE_PREMIUM_ACCOUNT:
         args.append("use_ad_playback_context=true")
+
+    # Safe request reduction: yt-dlp documents player_skip=configs as skipping
+    # the client-config network request. We keep webpage + JS because format 18
+    # still needs the normal player/signature path on this account/IP.
+    args.append("player_skip=configs")
 
     return "youtube:" + ";".join(args)
 
@@ -172,7 +177,7 @@ def build_pipeline(video_id: str, client: str) -> str:
         "--socket-timeout", "20",
         "--retries", "2",
         "--fragment-retries", "2",
-        "--js-runtimes", "node",
+        "--js-runtimes", JSC_RUNTIME,
         "--extractor-args", youtube_extractor_args(client),
     ]
 
@@ -353,6 +358,19 @@ async def open_stream_with_fallback(video_id: str, purpose: str):
 
         try:
             first_chunk = await read_first_chunk(process, timeout_seconds)
+        except asyncio.CancelledError:
+            print(
+                "cold playback attempt cancelled",
+                json.dumps({
+                    "videoId": video_id,
+                    "purpose": purpose,
+                    "client": client,
+                    "elapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                }),
+                flush=True,
+            )
+            await terminate_process(process, stderr_task)
+            raise
         except asyncio.TimeoutError:
             last_tail = list(stderr_tail)
             print(
@@ -503,6 +521,12 @@ def _task_finished(video_id: str, task: asyncio.Task) -> None:
 
     try:
         task.result()
+    except asyncio.CancelledError:
+        print(
+            "audio prefetch task cancelled",
+            json.dumps({"videoId": video_id}),
+            flush=True,
+        )
     except Exception as exc:
         print(
             "audio prefetch task error",
@@ -586,7 +610,7 @@ def cached_headers(path: Path) -> dict[str, str]:
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
         "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v19",
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v20",
         "X-Veeb-Cache": "HIT",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
     }
@@ -701,13 +725,13 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v19",
+        "service": "veeb-youtube-resolver-v20",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
-        "primaryClient": PRIMARY_CLIENT,
-        "fallbackClient": FALLBACK_CLIENT,
-        "fastClientTimeoutSeconds": FAST_CLIENT_TIMEOUT_SECONDS,
-        "fallbackStartTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
+        "youtubeClient": PRIMARY_CLIENT,
+        "jsRuntime": JSC_RUNTIME,
+        "playerSkip": ["configs"],
+        "streamStartTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
         "premiumAccountMode": YOUTUBE_PREMIUM_ACCOUNT,
         "mwebAdPlaybackContext": not YOUTUBE_PREMIUM_ACCOUNT,
         "fetchPotPolicy": "auto",
@@ -719,7 +743,7 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "format18-fast-client-fallback-cache-prefetch",
+        "streamTransport": "format18-mweb-deno-fast-cold-cache-prefetch",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
@@ -779,10 +803,22 @@ async def stream_endpoint(
                 "Content-Type": STREAM_CONTENT_TYPE,
                 "Accept-Ranges": "none",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v19-cold",
+                "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v20-fast-cold",
                 "X-Veeb-Cache": "MISS",
             },
         )
+
+    # Foreground audio always wins over speculative warming. Render's free CPU
+    # is limited, so do not let an unrelated yt-dlp/EJS prefetch steal cycles
+    # from the track the user actually tapped.
+    for other_id, other_task in list(_cache_tasks.items()):
+        if other_id != video_id and not other_task.done():
+            print(
+                "audio prefetch cancelled for live priority",
+                json.dumps({"videoId": other_id, "liveVideoId": video_id}),
+                flush=True,
+            )
+            other_task.cancel()
 
     (
         process,
@@ -796,7 +832,7 @@ async def stream_endpoint(
     headers = {
         "Content-Type": STREAM_CONTENT_TYPE,
         "Cache-Control": "private, max-age=3600",
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v19-cold",
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v20-fast-cold",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
         "X-Veeb-Cold-Client": client,
         "X-Veeb-Cache": "MISS",

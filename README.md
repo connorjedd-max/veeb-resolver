@@ -1,75 +1,43 @@
-# Veeb Render Resolver V19
+# Veeb Render Resolver V20 - FAST COLD START
 
-V19 targets the remaining cold-play delay.
+V20 is built directly from the V19 timing logs. V19 showed that `tv_downgraded`
+added 12 seconds before the known-good mweb path even started, and the largest
+remaining delay was YouTube's JavaScript challenge stage.
 
-## Cold-start strategy
+## V20 changes
 
-V18 forced every cold request through `mweb`, which requires the GVS PO-token path. V19 tries the logged-in `tv_downgraded` client first, then falls back to the known-good `mweb` path.
+1. **No tv_downgraded attempt.** It goes straight to mweb.
+2. **Native Deno 2.8.1 for EJS.** yt-dlp currently recommends Deno for YouTube
+   JavaScript challenge solving. Node remains installed only for the bgutil POT server.
+3. **`player_skip=configs`.** Removes the client-config network request while keeping
+   the webpage and JS steps required by the working format-18 path.
+4. **Foreground playback priority.** A cold live play cancels unrelated speculative
+   prefetch tasks so Render CPU is spent on the song the user actually tapped.
+5. Keeps V18/V19 cache, prefetch and byte-range serving.
+6. Prefetch concurrency defaults to 1 to avoid two EJS challenges fighting for the
+   limited CPU on the free Render instance.
 
-Primary path:
-
-`tv_downgraded + cookies + format 18`
-
-Fallback path:
-
-`mweb + cookies + fetch_pot=auto + use_ad_playback_context=true + format 18`
-
-The fallback still uses the existing bgutil HTTP PO-token server.
-
-## Why this should be faster
-
-- `tv_downgraded` supports account cookies and is one of yt-dlp's current default clients when logged-in cookies are supplied.
-- `fetch_pot=auto` stops yt-dlp from requesting PO tokens for contexts that do not require them.
-- `use_ad_playback_context=true` tells yt-dlp to skip the mandatory preroll waiting behavior for mweb.
-- V18 prefetch and local audio cache remain intact.
-- New startup phase timing logs show where every remaining second is being spent.
-
-## Premium account note
-
-The dedicated Veeb YouTube account is assumed to be a normal free account.
-
-If the cookie file ever comes from a YouTube Premium account, set this Render environment variable:
-
-`YOUTUBE_PREMIUM_ACCOUNT=true`
-
-That disables `use_ad_playback_context`, as required by yt-dlp's documentation for Premium cookies.
-
-## Existing settings to keep
+## Keep existing Render settings
 
 - `RESOLVER_SECRET`
-- Secret file `youtube-cookies.txt`
+- Secret file: `youtube-cookies.txt`
 
-No Cloudflare Worker change is required from V7.2.
-
-## Optional tuning
-
-- `YOUTUBE_PRIMARY_CLIENT=tv_downgraded`
-- `YOUTUBE_FALLBACK_CLIENT=mweb`
-- `YOUTUBE_FAST_CLIENT_TIMEOUT_SECONDS=12`
-- `STREAM_START_TIMEOUT_SECONDS=0`
-
-The 12-second primary timeout prevents a broken TV-client attempt from hanging forever before the mweb fallback begins.
+No new secret is required.
 
 ## Expected health
 
-- `service`: `veeb-youtube-resolver-v19`
-- `primaryClient`: `tv_downgraded`
-- `fallbackClient`: `mweb`
-- `fetchPotPolicy`: `auto`
-- `mwebAdPlaybackContext`: `true`
-- `streamTransport`: `format18-fast-client-fallback-cache-prefetch`
-- `rangeSeeking`: `true`
+- `service`: `veeb-youtube-resolver-v20`
+- `youtubeClient`: `mweb`
+- `jsRuntime`: `deno`
+- `playerSkip`: `["configs"]`
+- `poTokenHttpServerReady`: `true`
+- `streamTransport`: `format18-mweb-deno-fast-cold-cache-prefetch`
 
-## Useful cold-play logs
+## Logs to compare
 
-Fast path success should look like:
+The key number is:
 
-`cold playback attempt ... "client":"tv_downgraded"`
+`cold first media bytes ... totalColdElapsedSeconds`
 
-then:
-
-`cold first media bytes ... "client":"tv_downgraded","totalColdElapsedSeconds":...`
-
-If TV fails, V19 logs the failure and automatically tries mweb. On mweb, the phase logs will show webpage, player API, JS challenge, PO-token request, format selection, and first-byte timing.
-
-Cached and prefetched playback works exactly as in V18.
+Compare that directly with V19's 48.42 seconds and the earlier mweb-only ~20-30 second
+starts. The `tv_downgraded` 12-second penalty should be completely gone.

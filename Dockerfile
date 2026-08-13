@@ -6,8 +6,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv git ca-certificates ffmpeg \
+        python3 python3-venv git ca-certificates ffmpeg curl unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Native Deno avoids npm-wrapper startup overhead. yt-dlp recommends Deno
+# for YouTube EJS challenge solving.
+ENV DENO_INSTALL=/usr/local \
+    DENO_DIR=/tmp/deno-cache
+RUN curl -fsSL https://deno.land/install.sh | sh -s v2.8.1 \
+    && deno --version
 
 WORKDIR /app
 
@@ -27,4 +34,4 @@ COPY veeb_resolver.py /app/veeb_resolver.py
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn veeb_resolver:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["sh", "-c", "deno eval '1+1' >/dev/null 2>&1 || true; node /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn veeb_resolver:app --host 0.0.0.0 --port ${PORT:-10000}"]
