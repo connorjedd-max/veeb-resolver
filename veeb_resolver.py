@@ -1,30 +1,52 @@
 import asyncio
+import importlib.metadata
+import json
 import os
 import re
-import time
-import json
-import shutil
-import importlib.metadata
-import socket
 import shlex
+import shutil
+import socket
+import time
+import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 app = FastAPI(title="Veeb YouTube Resolver", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
 WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
 
-# Format 18 is the YouTube path that has proven reliable from this Render host.
-# V17 strips its video track with ffmpeg and relays AAC-only fragmented MP4.
 SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "18")
 STREAM_CONTENT_TYPE = "audio/mp4"
+
+# V19 cold-start strategy:
+# 1. Try tv_downgraded first. yt-dlp itself prefers this client for logged-in
+#    free-account cookies, and it does not need the mweb GVS PO-token path.
+# 2. Fall back to the known-good mweb path with fetch_pot=auto and the
+#    ad-playback context optimization enabled for non-Premium accounts.
+PRIMARY_CLIENT = os.environ.get("YOUTUBE_PRIMARY_CLIENT", "tv_downgraded").strip() or "tv_downgraded"
+FALLBACK_CLIENT = os.environ.get("YOUTUBE_FALLBACK_CLIENT", "mweb").strip() or "mweb"
+FAST_CLIENT_TIMEOUT_SECONDS = float(os.environ.get("YOUTUBE_FAST_CLIENT_TIMEOUT_SECONDS", "12"))
 STREAM_START_TIMEOUT_SECONDS = float(os.environ.get("STREAM_START_TIMEOUT_SECONDS", "0"))
+YOUTUBE_PREMIUM_ACCOUNT = os.environ.get("YOUTUBE_PREMIUM_ACCOUNT", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+CACHE_DIR = Path(os.environ.get("VEEB_AUDIO_CACHE_DIR", "/tmp/veeb-audio-cache"))
+CACHE_TTL_SECONDS = int(os.environ.get("VEEB_AUDIO_CACHE_TTL", str(6 * 60 * 60)))
+CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
+PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "2")))
+FILE_CHUNK_BYTES = 256 * 1024
+
+_cache_tasks: dict[str, asyncio.Task] = {}
+_prefetch_semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
 
 def require_auth(authorization: str | None) -> None:
@@ -49,10 +71,7 @@ def get_writable_cookie_file() -> str | None:
         os.chmod(WRITABLE_COOKIE_FILE, 0o600)
         print(
             "cookie runtime copy ready",
-            json.dumps({
-                "source": YOUTUBE_COOKIE_FILE,
-                "runtime": WRITABLE_COOKIE_FILE,
-            }),
+            json.dumps({"source": YOUTUBE_COOKIE_FILE, "runtime": WRITABLE_COOKIE_FILE}),
             flush=True,
         )
 
@@ -67,7 +86,79 @@ def pot_http_server_ready() -> bool:
         return False
 
 
-def build_pipeline(video_id: str) -> str:
+def client_plan() -> list[str]:
+    result: list[str] = []
+    for client in (PRIMARY_CLIENT, FALLBACK_CLIENT):
+        if client and client not in result:
+            result.append(client)
+    return result
+
+
+def youtube_extractor_args(client: str) -> str:
+    args = [f"player_client={client}", "fetch_pot=auto"]
+
+    # yt-dlp documents use_ad_playback_context specifically for mweb and
+    # web_music. It removes the mandatory preroll wait. It must not be used
+    # with Premium cookies because it can remove Premium formats.
+    if client in {"mweb", "web_music"} and not YOUTUBE_PREMIUM_ACCOUNT:
+        args.append("use_ad_playback_context=true")
+
+    return "youtube:" + ";".join(args)
+
+
+def cache_path(video_id: str) -> Path:
+    return CACHE_DIR / f"{video_id}.m4a.mp4"
+
+
+def cache_is_valid(video_id: str) -> bool:
+    path = cache_path(video_id)
+    if not path.is_file():
+        return False
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+
+    if stat.st_size < 1024:
+        return False
+
+    return (time.time() - stat.st_mtime) < CACHE_TTL_SECONDS
+
+
+def ensure_cache_dir() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_cache() -> None:
+    ensure_cache_dir()
+    now = time.time()
+    files: list[tuple[float, Path]] = []
+
+    for path in CACHE_DIR.glob("*.m4a.mp4"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+
+        if (now - stat.st_mtime) >= CACHE_TTL_SECONDS:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+
+        files.append((stat.st_mtime, path))
+
+    files.sort(key=lambda item: item[0], reverse=True)
+    for _, path in files[CACHE_MAX_FILES:]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def build_pipeline(video_id: str, client: str) -> str:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     cookie_file = get_writable_cookie_file()
 
@@ -82,7 +173,7 @@ def build_pipeline(video_id: str) -> str:
         "--retries", "2",
         "--fragment-retries", "2",
         "--js-runtimes", "node",
-        "--extractor-args", "youtube:player_client=mweb;fetch_pot=always",
+        "--extractor-args", youtube_extractor_args(client),
     ]
 
     if cookie_file:
@@ -90,9 +181,6 @@ def build_pipeline(video_id: str) -> str:
 
     ytdlp.extend(["-f", SOURCE_FORMAT, watch_url])
 
-    # -c:a copy means no audio re-encode. ffmpeg only removes the H.264 video
-    # stream and rewrites the existing AAC audio into fragmented MP4 so the
-    # browser can begin playback before the full song has downloaded.
     ffmpeg = [
         "ffmpeg",
         "-hide_banner",
@@ -113,9 +201,39 @@ def build_pipeline(video_id: str) -> str:
     )
 
 
-async def drain_stderr(process: asyncio.subprocess.Process, tail: list[str]) -> None:
+def classify_startup_phase(line: str) -> str | None:
+    lower = line.lower()
+    if "downloading webpage" in lower:
+        return "webpage"
+    if "client config" in lower:
+        return "client_config"
+    if "player api json" in lower:
+        return "player_api"
+    if "solving js challenges" in lower:
+        return "js_challenge"
+    if "generating a " in lower and "po token" in lower:
+        return "pot_request"
+    if "downloading 1 format(s)" in lower:
+        return "format_selected"
+    if "http error 403" in lower:
+        return "http_403"
+    if "error:" in lower:
+        return "error"
+    return None
+
+
+async def drain_stderr(
+    process: asyncio.subprocess.Process,
+    tail: list[str],
+    video_id: str,
+    client: str,
+    purpose: str,
+    attempt_started: float,
+) -> None:
     if process.stderr is None:
         return
+
+    seen_phases: set[str] = set()
 
     while True:
         line = await process.stderr.readline()
@@ -127,8 +245,23 @@ async def drain_stderr(process: asyncio.subprocess.Process, tail: list[str]) -> 
             continue
 
         tail.append(text)
-        if len(tail) > 160:
-            del tail[:-160]
+        if len(tail) > 180:
+            del tail[:-180]
+
+        phase = classify_startup_phase(text)
+        if phase and phase not in seen_phases:
+            seen_phases.add(phase)
+            print(
+                "cold startup phase",
+                json.dumps({
+                    "videoId": video_id,
+                    "purpose": purpose,
+                    "client": client,
+                    "phase": phase,
+                    "elapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                }),
+                flush=True,
+            )
 
 
 async def terminate_process(process: asyncio.subprocess.Process, stderr_task: asyncio.Task | None) -> None:
@@ -147,126 +280,405 @@ async def terminate_process(process: asyncio.subprocess.Process, stderr_task: as
             stderr_task.cancel()
 
 
-async def start_stream(video_id: str):
-    pipeline = build_pipeline(video_id)
-
+async def start_attempt(video_id: str, purpose: str, client: str, attempt_number: int):
+    pipeline = build_pipeline(video_id, client)
     env = os.environ.copy()
-    env.setdefault("TOKEN_TTL", "6")
+    attempt_started = time.monotonic()
 
     print(
-        "audio-only stream start",
+        "cold playback attempt",
         json.dumps({
             "videoId": video_id,
+            "purpose": purpose,
+            "attempt": attempt_number,
+            "client": client,
             "sourceFormat": SOURCE_FORMAT,
-            "output": "aac-fragmented-mp4",
+            "extractorArgs": youtube_extractor_args(client),
             "potHttpReady": pot_http_server_ready(),
-            "startupTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
         }),
         flush=True,
     )
 
     process = await asyncio.create_subprocess_exec(
-        "bash",
-        "-o", "pipefail",
-        "-c", pipeline,
+        "bash", "-o", "pipefail", "-c", pipeline,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
 
     stderr_tail: list[str] = []
-    stderr_task = asyncio.create_task(drain_stderr(process, stderr_tail))
-    return process, stderr_task, stderr_tail
+    stderr_task = asyncio.create_task(
+        drain_stderr(
+            process,
+            stderr_tail,
+            video_id,
+            client,
+            purpose,
+            attempt_started,
+        )
+    )
+    return process, stderr_task, stderr_tail, attempt_started
 
 
-async def read_first_chunk(process: asyncio.subprocess.Process) -> bytes:
+async def read_first_chunk(process: asyncio.subprocess.Process, timeout_seconds: float) -> bytes:
     assert process.stdout is not None
 
-    if STREAM_START_TIMEOUT_SECONDS > 0:
+    if timeout_seconds > 0:
         return await asyncio.wait_for(
             process.stdout.read(64 * 1024),
-            timeout=STREAM_START_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
 
     return await process.stdout.read(64 * 1024)
 
 
-async def open_working_stream(video_id: str):
-    process, stderr_task, stderr_tail = await start_stream(video_id)
+async def open_stream_with_fallback(video_id: str, purpose: str):
+    plans = client_plan()
+    last_tail: list[str] = []
+    total_started = time.monotonic()
 
-    try:
-        first_chunk = await read_first_chunk(process)
-    except asyncio.TimeoutError:
-        print(
-            "audio-only stream startup timeout",
-            json.dumps({"videoId": video_id, "stderrTail": stderr_tail[-30:]}),
-            flush=True,
+    for index, client in enumerate(plans):
+        process, stderr_task, stderr_tail, attempt_started = await start_attempt(
+            video_id,
+            purpose,
+            client,
+            index + 1,
         )
-        await terminate_process(process, stderr_task)
-        raise HTTPException(status_code=504, detail="Audio stream startup timeout")
 
-    if first_chunk:
+        timeout_seconds = (
+            FAST_CLIENT_TIMEOUT_SECONDS
+            if index == 0 and len(plans) > 1
+            else STREAM_START_TIMEOUT_SECONDS
+        )
+
+        try:
+            first_chunk = await read_first_chunk(process, timeout_seconds)
+        except asyncio.TimeoutError:
+            last_tail = list(stderr_tail)
+            print(
+                "cold playback attempt timeout",
+                json.dumps({
+                    "videoId": video_id,
+                    "purpose": purpose,
+                    "client": client,
+                    "elapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                    "timeoutSeconds": timeout_seconds,
+                    "fallingBack": index + 1 < len(plans),
+                    "stderrTail": stderr_tail[-15:],
+                }),
+                flush=True,
+            )
+            await terminate_process(process, stderr_task)
+            continue
+
+        if first_chunk:
+            print(
+                "cold first media bytes",
+                json.dumps({
+                    "videoId": video_id,
+                    "purpose": purpose,
+                    "client": client,
+                    "bytes": len(first_chunk),
+                    "attemptElapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                    "totalColdElapsedSeconds": round(time.monotonic() - total_started, 2),
+                    "contentType": STREAM_CONTENT_TYPE,
+                }),
+                flush=True,
+            )
+            return process, stderr_task, stderr_tail, first_chunk, client, total_started
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
+
+        last_tail = list(stderr_tail)
         print(
-            "audio-only first bytes",
+            "cold playback attempt failed",
             json.dumps({
                 "videoId": video_id,
-                "bytes": len(first_chunk),
-                "contentType": STREAM_CONTENT_TYPE,
+                "purpose": purpose,
+                "client": client,
+                "returnCode": process.returncode,
+                "elapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                "fallingBack": index + 1 < len(plans),
+                "stderrTail": stderr_tail[-30:],
             }),
             flush=True,
         )
-        return process, stderr_task, first_chunk
-
-    try:
-        await asyncio.wait_for(process.wait(), timeout=1)
-    except asyncio.TimeoutError:
-        pass
+        await terminate_process(process, stderr_task)
 
     print(
-        "audio-only stream produced no bytes",
+        "cold playback all clients failed",
         json.dumps({
             "videoId": video_id,
-            "returnCode": process.returncode,
-            "stderrTail": stderr_tail[-50:],
+            "purpose": purpose,
+            "clients": plans,
+            "totalColdElapsedSeconds": round(time.monotonic() - total_started, 2),
+            "stderrTail": last_tail[-30:],
         }),
         flush=True,
     )
-
-    await terminate_process(process, stderr_task)
-    raise HTTPException(status_code=502, detail="yt-dlp/ffmpeg produced no audio bytes")
+    raise HTTPException(status_code=502, detail="No YouTube playback client produced media bytes")
 
 
-async def stream_stdout(
+async def build_cache(video_id: str) -> bool:
+    if cache_is_valid(video_id):
+        return True
+
+    ensure_cache_dir()
+    final_path = cache_path(video_id)
+    temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.part"
+    started = time.monotonic()
+
+    async with _prefetch_semaphore:
+        if cache_is_valid(video_id):
+            return True
+
+        process = None
+        stderr_task = None
+        total = 0
+        success = False
+        client = None
+        stderr_tail: list[str] = []
+
+        try:
+            (
+                process,
+                stderr_task,
+                stderr_tail,
+                first_chunk,
+                client,
+                _,
+            ) = await open_stream_with_fallback(video_id, "prefetch")
+
+            assert process.stdout is not None
+            with open(temp_path, "wb") as handle:
+                handle.write(first_chunk)
+                total += len(first_chunk)
+
+                while True:
+                    chunk = await process.stdout.read(FILE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    total += len(chunk)
+
+            await process.wait()
+
+            if process.returncode == 0 and total >= 1024:
+                os.replace(temp_path, final_path)
+                success = True
+                cleanup_cache()
+
+            print(
+                "audio prefetch finished",
+                json.dumps({
+                    "videoId": video_id,
+                    "ok": success,
+                    "client": client,
+                    "bytes": total,
+                    "elapsedSeconds": round(time.monotonic() - started, 2),
+                    "returnCode": process.returncode,
+                    "stderrTail": [] if success else stderr_tail[-20:],
+                }),
+                flush=True,
+            )
+
+            return success
+        finally:
+            if not success:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            if process is not None:
+                await terminate_process(process, stderr_task)
+
+
+def _task_finished(video_id: str, task: asyncio.Task) -> None:
+    current = _cache_tasks.get(video_id)
+    if current is task:
+        _cache_tasks.pop(video_id, None)
+
+    try:
+        task.result()
+    except Exception as exc:
+        print(
+            "audio prefetch task error",
+            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
+            flush=True,
+        )
+
+
+def start_prefetch(video_id: str) -> tuple[str, asyncio.Task | None]:
+    if cache_is_valid(video_id):
+        return "cached", None
+
+    existing = _cache_tasks.get(video_id)
+    if existing and not existing.done():
+        return "warming", existing
+
+    task = asyncio.create_task(build_cache(video_id))
+    _cache_tasks[video_id] = task
+    task.add_done_callback(lambda done: _task_finished(video_id, done))
+    return "warming", task
+
+
+async def file_body(path: Path, start: int, length: int) -> AsyncIterator[bytes]:
+    remaining = length
+    with open(path, "rb") as handle:
+        handle.seek(start)
+        while remaining > 0:
+            chunk = handle.read(min(FILE_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+            await asyncio.sleep(0)
+
+
+def parse_range(range_header: str | None, size: int) -> tuple[int, int] | None:
+    if not range_header:
+        return None
+
+    match = RANGE_RE.fullmatch(range_header.strip())
+    if not match:
+        raise HTTPException(
+            status_code=416,
+            detail="Unsupported Range header",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+
+    start_text, end_text = match.groups()
+
+    if not start_text and not end_text:
+        raise HTTPException(status_code=416, detail="Invalid byte range")
+
+    if start_text:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+    else:
+        suffix = int(end_text)
+        if suffix <= 0:
+            raise HTTPException(status_code=416, detail="Invalid suffix range")
+        start = max(0, size - suffix)
+        end = size - 1
+
+    if start >= size or start < 0:
+        raise HTTPException(
+            status_code=416,
+            detail="Range outside cached file",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+
+    end = min(end, size - 1)
+    if end < start:
+        raise HTTPException(status_code=416, detail="Invalid byte range")
+
+    return start, end
+
+
+def cached_headers(path: Path) -> dict[str, str]:
+    stat = path.stat()
+    return {
+        "Content-Type": STREAM_CONTENT_TYPE,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=3600",
+        "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v19",
+        "X-Veeb-Cache": "HIT",
+        "X-Veeb-Source-Format": SOURCE_FORMAT,
+    }
+
+
+async def serve_cached(path: Path, request: Request):
+    size = path.stat().st_size
+    headers = cached_headers(path)
+    parsed = parse_range(request.headers.get("Range"), size)
+
+    if parsed is None:
+        headers["Content-Length"] = str(size)
+        if request.method == "HEAD":
+            return Response(status_code=200, headers=headers)
+        return StreamingResponse(
+            file_body(path, 0, size),
+            status_code=200,
+            headers=headers,
+        )
+
+    start, end = parsed
+    length = end - start + 1
+    headers["Content-Length"] = str(length)
+    headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+    if request.method == "HEAD":
+        return Response(status_code=206, headers=headers)
+
+    return StreamingResponse(
+        file_body(path, start, length),
+        status_code=206,
+        headers=headers,
+    )
+
+
+async def open_live_stream(video_id: str):
+    return await open_stream_with_fallback(video_id, "live")
+
+
+async def live_stream_and_cache(
     process: asyncio.subprocess.Process,
     first_chunk: bytes,
     video_id: str,
+    client: str,
 ) -> AsyncIterator[bytes]:
     assert process.stdout is not None
-
+    ensure_cache_dir()
+    final_path = cache_path(video_id)
+    temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.live.part"
     total = 0
     started = time.monotonic()
+    completed = False
 
     try:
-        total += len(first_chunk)
-        yield first_chunk
+        with open(temp_path, "wb") as handle:
+            handle.write(first_chunk)
+            total += len(first_chunk)
+            yield first_chunk
 
-        while True:
-            chunk = await process.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            yield chunk
-    finally:
+            while True:
+                chunk = await process.stdout.read(FILE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                total += len(chunk)
+                yield chunk
+
+        await process.wait()
+
+        if process.returncode == 0 and total >= 1024:
+            os.replace(temp_path, final_path)
+            completed = True
+            cleanup_cache()
+
         print(
             "audio-only stream finished",
             json.dumps({
                 "videoId": video_id,
+                "client": client,
                 "bytesSent": total,
                 "elapsedSeconds": round(time.monotonic() - started, 2),
                 "returnCode": process.returncode,
+                "cached": completed,
             }),
             flush=True,
         )
+    finally:
+        if not completed:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 @app.get("/health")
@@ -276,13 +688,30 @@ async def health() -> dict[str, Any]:
     except importlib.metadata.PackageNotFoundError:
         pot_version = None
 
+    try:
+        ytdlp_version = importlib.metadata.version("yt-dlp")
+    except importlib.metadata.PackageNotFoundError:
+        ytdlp_version = None
+
     get_writable_cookie_file()
+    ensure_cache_dir()
+    cleanup_cache()
+
+    cached_files = list(CACHE_DIR.glob("*.m4a.mp4"))
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v17",
+        "service": "veeb-youtube-resolver-v19",
         "secretConfigured": bool(RESOLVER_SECRET),
-        "youtubeClient": "mweb",
+        "youtubeClients": client_plan(),
+        "primaryClient": PRIMARY_CLIENT,
+        "fallbackClient": FALLBACK_CLIENT,
+        "fastClientTimeoutSeconds": FAST_CLIENT_TIMEOUT_SECONDS,
+        "fallbackStartTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
+        "premiumAccountMode": YOUTUBE_PREMIUM_ACCOUNT,
+        "mwebAdPlaybackContext": not YOUTUBE_PREMIUM_ACCOUNT,
+        "fetchPotPolicy": "auto",
+        "ytDlpVersion": ytdlp_version,
         "poTokenProvider": "bgutil",
         "poTokenProviderVersion": pot_version,
         "poTokenHttpServerReady": pot_http_server_ready(),
@@ -290,10 +719,32 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "yt-dlp-format18-ffmpeg-audio-only",
+        "streamTransport": "format18-fast-client-fallback-cache-prefetch",
         "audioCodec": "aac-copy",
-        "rangeSeeking": False,
+        "cacheDir": str(CACHE_DIR),
+        "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        "cacheMaxFiles": CACHE_MAX_FILES,
+        "cachedTracks": len(cached_files),
+        "prefetchConcurrency": PREFETCH_CONCURRENCY,
+        "activePrefetches": len([task for task in _cache_tasks.values() if not task.done()]),
+        "rangeSeeking": True,
     }
+
+
+@app.post("/prefetch/{video_id}")
+async def prefetch_endpoint(
+    video_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    validate_video_id(video_id)
+
+    status, _ = start_prefetch(video_id)
+    return JSONResponse(
+        {"ok": True, "videoId": video_id, "status": status},
+        status_code=200 if status == "cached" else 202,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
@@ -305,21 +756,55 @@ async def stream_endpoint(
     require_auth(authorization)
     validate_video_id(video_id)
 
+    if cache_is_valid(video_id):
+        print("audio cache hit", json.dumps({"videoId": video_id}), flush=True)
+        return await serve_cached(cache_path(video_id), request)
+
+    active = _cache_tasks.get(video_id)
+    if active and not active.done():
+        print("audio waiting for prefetch", json.dumps({"videoId": video_id}), flush=True)
+        try:
+            await active
+        except Exception:
+            pass
+
+        if cache_is_valid(video_id):
+            print("audio cache hit after prefetch", json.dumps({"videoId": video_id}), flush=True)
+            return await serve_cached(cache_path(video_id), request)
+
+    if request.method == "HEAD":
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": STREAM_CONTENT_TYPE,
+                "Accept-Ranges": "none",
+                "Cache-Control": "no-store",
+                "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v19-cold",
+                "X-Veeb-Cache": "MISS",
+            },
+        )
+
+    (
+        process,
+        stderr_task,
+        _,
+        first_chunk,
+        client,
+        _,
+    ) = await open_live_stream(video_id)
+
     headers = {
         "Content-Type": STREAM_CONTENT_TYPE,
-        "Cache-Control": "private, no-store, max-age=0",
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v17",
+        "Cache-Control": "private, max-age=3600",
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v19-cold",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
+        "X-Veeb-Cold-Client": client,
+        "X-Veeb-Cache": "MISS",
         "Accept-Ranges": "none",
     }
 
-    if request.method == "HEAD":
-        return Response(status_code=200, headers=headers)
-
-    process, stderr_task, first_chunk = await open_working_stream(video_id)
-
     return StreamingResponse(
-        stream_stdout(process, first_chunk, video_id),
+        live_stream_and_cache(process, first_chunk, video_id, client),
         status_code=200,
         headers=headers,
         background=BackgroundTask(terminate_process, process, stderr_task),
