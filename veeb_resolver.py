@@ -19,6 +19,7 @@ app = FastAPI(title="Veeb YouTube Resolver", docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE_TTL_SECONDS = int(os.environ.get("RESOLVER_CACHE_TTL", "600"))
+YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
 
 # Cache only yt-dlp's resolved media metadata. The media itself is never stored.
 _resolve_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -42,10 +43,10 @@ def validate_video_id(video_id: str) -> str:
 def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # YouTube increasingly requires Proof-of-Origin tokens for some web clients.
-    # Veeb V7 uses yt-dlp's documented PO-token provider framework with the mweb
-    # client and bgutil's local generation script. No Google account cookies are
-    # used or stored by the resolver.
+    # Veeb V8 keeps V7's mweb + bgutil PO-token setup and, when present,
+    # supplies a dedicated YouTube cookies.txt secret file to yt-dlp. The file
+    # is expected to be mounted at runtime by Render and is never committed.
+    cookie_file = YOUTUBE_COOKIE_FILE if os.path.isfile(YOUTUBE_COOKIE_FILE) else None
     cmd = [
         "yt-dlp",
         "--dump-single-json",
@@ -58,9 +59,15 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
         "--js-runtimes", "node",
         "--extractor-args", "youtube:player_client=mweb",
         "--extractor-args", "youtubepot-bgutilscript:server_home=/opt/bgutil/server",
+    ]
+
+    if cookie_file:
+        cmd.extend(["--cookies", cookie_file])
+
+    cmd.extend([
         "-f", "bestaudio[protocol^=http][vcodec=none]/bestaudio[protocol^=http]/bestaudio/best",
         watch_url,
-    ]
+    ])
 
     env = os.environ.copy()
     env.setdefault("TOKEN_TTL", "6")
@@ -177,12 +184,15 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v7",
+        "service": "veeb-youtube-resolver-v8",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClient": "mweb",
         "poTokenProvider": "bgutil",
         "poTokenProviderVersion": pot_version,
         "poTokenServerPresent": os.path.isdir("/opt/bgutil/server"),
+        "cookieFileConfigured": bool(YOUTUBE_COOKIE_FILE),
+        "cookieFilePresent": os.path.isfile(YOUTUBE_COOKIE_FILE),
+        "cookieFilePath": YOUTUBE_COOKIE_FILE,
     }
 
 

@@ -1,44 +1,75 @@
-# Veeb Render Resolver V7
+# Veeb Render Resolver V8
 
-This is a drop-in replacement for the existing Veeb resolver repo.
+V8 is a drop-in replacement for V7. Veeb, the Cloudflare Worker, the Render URL, and `RESOLVER_SECRET` all stay unchanged.
 
-V7 keeps the same public API (`/health`, `/resolve/:videoId`, `/stream/:videoId`) and the same Cloudflare Worker configuration. The only change is how yt-dlp resolves YouTube playback internally.
-
-It now uses:
+V8 keeps:
 - yt-dlp
 - Node 22 / EJS
 - `mweb` YouTube client
 - `bgutil-ytdlp-pot-provider` 1.3.1
-- the provider's local generation script at `/opt/bgutil/server`
+- the local bgutil provider script
 
-No YouTube/Google account cookies are configured or required by this package.
+V8 adds support for one runtime-only YouTube cookie file:
 
-## Update the existing Render service
+`/etc/secrets/youtube-cookies.txt`
 
-1. Replace the files in your existing `veeb-resolver` GitHub repo with these files.
-2. Commit/push to `main`.
-3. Render should auto-deploy. If not, choose **Manual Deploy -> Deploy latest commit**.
-4. Keep your existing Render environment variable `RESOLVER_SECRET` exactly as-is.
-5. Do not change the Cloudflare `YOUTUBE_RESOLVER_URL` or `YOUTUBE_RESOLVER_SECRET` values.
+The cookie file is not included in this ZIP and must never be committed to GitHub.
 
-## Verify
+## 1. Replace the existing resolver files
+
+Replace the files in your existing `veeb-resolver` GitHub repo with the files from this package and push to `main`.
+
+Render should redeploy automatically. If it does not, use **Manual Deploy -> Deploy latest commit**.
+
+## 2. Add the cookie file in Render
+
+In the existing Render service, add a Secret File with:
+
+- Filename: `youtube-cookies.txt`
+- Contents: your Netscape-format YouTube cookies export
+
+Render mounts secret files under `/etc/secrets/`, so V8 will read:
+
+`/etc/secrets/youtube-cookies.txt`
+
+Do not put the cookies into an environment variable and do not commit them to GitHub.
+
+## 3. Keep existing settings
+
+Keep the existing Render environment variable:
+
+`RESOLVER_SECRET`
+
+Do not change these Cloudflare Worker bindings:
+
+- `YOUTUBE_RESOLVER_URL=https://veeb-resolver.onrender.com`
+- `YOUTUBE_RESOLVER_SECRET=<same secret as Render>`
+
+## 4. Verify
 
 Open:
 
 `https://veeb-resolver.onrender.com/health`
 
-You should see values including:
+Expected key values:
 
 ```json
 {
   "ok": true,
-  "service": "veeb-youtube-resolver-v7",
+  "service": "veeb-youtube-resolver-v8",
   "secretConfigured": true,
   "youtubeClient": "mweb",
   "poTokenProvider": "bgutil",
   "poTokenProviderVersion": "1.3.1",
-  "poTokenServerPresent": true
+  "poTokenServerPresent": true,
+  "cookieFileConfigured": true,
+  "cookieFilePresent": true,
+  "cookieFilePath": "/etc/secrets/youtube-cookies.txt"
 }
 ```
 
-Then try playback in Veeb. If it fails, copy the new Render log lines beginning with `yt-dlp resolver error:`. V7 intentionally prints yt-dlp's useful diagnostic output on a failed extraction.
+If `cookieFilePresent` is false, Render has not mounted the secret file under the expected filename.
+
+## Security note
+
+Use a dedicated YouTube/Google account for this resolver, not your primary account. Treat `youtube-cookies.txt` like a password. Anyone with a valid session cookie file may be able to act as that account until the session is revoked or expires.
