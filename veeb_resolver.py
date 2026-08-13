@@ -824,7 +824,7 @@ def progressive_headers(state: ProgressiveBuildState) -> dict[str, str]:
         "Content-Type": STREAM_CONTENT_TYPE,
         "Accept-Ranges": "none",
         "Cache-Control": "no-store",
-        "X-Veeb-Resolver": "yt-dlp-progressive-v25",
+        "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
         "X-Veeb-Cache": "BUILDING",
         "X-Veeb-Progressive": "1",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
@@ -893,7 +893,7 @@ def cached_headers(path: Path) -> dict[str, str]:
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
         "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v24",
+        "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
         "X-Veeb-Cache": "HIT",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
     }
@@ -1008,7 +1008,7 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v25",
+        "service": "veeb-youtube-resolver-v26",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
@@ -1032,12 +1032,12 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "mweb-progressive-prebuffer-singleflight",
+        "streamTransport": "mweb-complete-cache-singleflight",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
         "cacheMaxFiles": CACHE_MAX_FILES,
-        "livePrebufferBytes": LIVE_PREBUFFER_BYTES,
+        "buildBufferBytes": LIVE_PREBUFFER_BYTES,
         "cachedTracks": len(cached_files),
         "prefetchConcurrency": PREFETCH_CONCURRENCY,
         "activePrefetches": len([task for task in _cache_tasks.values() if not task.done()]),
@@ -1084,7 +1084,7 @@ async def stream_endpoint(
                 "Content-Type": STREAM_CONTENT_TYPE,
                 "Accept-Ranges": "none" if state and not state.done.is_set() else "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-progressive-v25",
+                "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
                 "X-Veeb-Cache": "BUILDING" if state and not state.done.is_set() else "MISS",
             },
         )
@@ -1137,44 +1137,51 @@ async def stream_endpoint(
                 "videoId": video_id,
                 "preemptedSpeculativePrefetches": sorted(preempted_ids),
                 "client": PRIMARY_CLIENT,
-                "livePrebufferBytes": LIVE_PREBUFFER_BYTES,
+                "buildBufferBytes": LIVE_PREBUFFER_BYTES,
                 "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
             }),
             flush=True,
         )
 
-    await wait_for_progressive_ready(state)
+    # V26 reliability rule: never hand a growing MP4 to the browser.
+    # The V25 logs show the complete media file normally lands less than a
+    # second after the progressive handoff point, while browsers can buffer or
+    # reject the chunked, non-seekable response. Keep the expensive YouTube
+    # extraction single-flight, wait for the independent cache build to finish,
+    # then serve a normal Content-Length/Range-capable MP4.
+    if state.task and not state.task.done():
+        print(
+            "audio waiting for stable cache",
+            json.dumps({
+                "videoId": video_id,
+                "purpose": state.purpose,
+                "elapsedSeconds": round(time.monotonic() - state.started, 2),
+                "bytesReady": state.bytes_written,
+            }),
+            flush=True,
+        )
+        try:
+            await state.task
+        except asyncio.CancelledError:
+            raise HTTPException(status_code=503, detail="Audio preparation was cancelled")
+        except Exception as exc:
+            state.error = state.error or str(exc)[:1200]
 
-    if cache_is_valid(video_id):
-        print("audio cache ready before progressive handoff", json.dumps({"videoId": video_id}), flush=True)
-        return await serve_cached(cache_path(video_id), request)
-
-    if state.bytes_written < 1024 or state.error:
-        if state.task and not state.task.done():
-            try:
-                await state.task
-            except Exception:
-                pass
-        if cache_is_valid(video_id):
-            return await serve_cached(cache_path(video_id), request)
+    if not cache_is_valid(video_id):
         raise HTTPException(
             status_code=502,
-            detail=state.error or "Audio preparation completed without playable media",
+            detail=state.error or "Audio preparation completed without a stable playable file",
         )
 
+    path = cache_path(video_id)
     print(
-        "audio progressive handoff",
+        "audio stable cache ready for playback",
         json.dumps({
             "videoId": video_id,
             "purpose": state.purpose,
-            "bytesReady": state.bytes_written,
+            "bytes": path.stat().st_size,
             "elapsedSeconds": round(time.monotonic() - state.started, 2),
         }),
         flush=True,
     )
-
-    return StreamingResponse(
-        progressive_file_body(state),
-        status_code=200,
-        headers=progressive_headers(state),
-    )
+    return await serve_cached(path, request)
