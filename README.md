@@ -1,35 +1,29 @@
-# Veeb Render Resolver V16
+# Veeb Render Resolver V17
 
-V16 removes the failed format-251 attempt entirely.
+V17 keeps the reliable YouTube format-18 path, but removes the video track before
+sending the response to Veeb.
 
-The logs proved format 18 is the working path on this Render setup, so V16 goes
-straight to format 18 and avoids wasting ~20-25 seconds trying format 251 first.
+Pipeline:
 
-## Playback path
+YouTube format 18 -> yt-dlp -> ffmpeg -> AAC-only fragmented MP4 -> Veeb
 
-Veeb -> Cloudflare Worker -> Render -> yt-dlp format 18 -> stdout -> Veeb
+ffmpeg uses `-c:a copy`, so the AAC audio is not re-encoded. It only strips H.264
+video and repackages the AAC stream as fragmented MP4.
 
-## Keep existing Render settings
+This is intended to make mobile Chrome treat Veeb as genuine audio playback,
+which works better with Media Session and screen-off/background playback than
+feeding a muxed video/mp4 resource into an audio element.
 
-- `RESOLVER_SECRET`
-- Secret file: `youtube-cookies.txt`
+Keep existing Render settings:
 
-No Cloudflare changes are required.
+- RESOLVER_SECRET
+- Secret file: youtube-cookies.txt
 
-## Expected /health
+Expected /health:
 
-- `service`: `veeb-youtube-resolver-v16`
-- `poTokenHttpServerReady`: true
-- `streamFormat`: `18`
-- `streamTransport`: `yt-dlp-stdout-direct-format18`
-- `streamStartTimeoutSeconds`: 0
-
-## Expected successful logs
-
-- `yt-dlp stream start ... "format":"18"`
-- `Generating POT ...`
-- `yt-dlp first media bytes ... "format":"18","bytes":<non-zero>`
-- `GET /stream/<id> 200 OK`
-- `yt-dlp stream body finished ... "bytesSent":<non-zero>`
-
-Seeking remains disabled until playback startup and track transitions are stable.
+- service: veeb-youtube-resolver-v17
+- poTokenHttpServerReady: true
+- sourceFormat: 18
+- streamContentType: audio/mp4
+- streamTransport: yt-dlp-format18-ffmpeg-audio-only
+- audioCodec: aac-copy
