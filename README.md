@@ -1,42 +1,41 @@
-# Veeb Render Resolver V14
+# Veeb Render Resolver V15
 
-V14 combines the parts that actually worked:
+V15 is based on what the logs proved:
 
-- V12 proved yt-dlp stdout can send real bytes end-to-end.
-- V13 proved the local bgutil HTTP PO-token provider is running and generating tokens.
-- V14 removes V13's 30-second startup timeout.
+- Format 251 (Opus/WebM audio-only) is consistently returning HTTP 403 from YouTube's media server.
+- V12 successfully pushed 6.3 MB through the full pipeline on at least one request.
+- V12 was allowed to fall back to format 18 (MP4), so V15 reproduces that behavior deliberately.
 
-## Playback behavior
+## Strategy
 
-Render starts yt-dlp and waits for the first real audio bytes.
-By default there is NO resolver-side startup timeout.
+1. Try format 251 first.
+2. If yt-dlp produces no bytes / returns 403, retry the same video with format 18.
+3. Stream whichever format actually produces bytes.
 
-Once the first bytes arrive, Render returns HTTP 200 and streams the rest.
+This keeps the working bgutil HTTP PO-token server and cookie setup.
 
 ## Existing Render settings to keep
 
-- `RESOLVER_SECRET`
-- Secret file: `youtube-cookies.txt`
+- RESOLVER_SECRET
+- Secret file: youtube-cookies.txt
 
-No Cloudflare changes are required.
+No Cloudflare changes required.
 
-## Expected /health
+## Expected health
 
-- `service`: `veeb-youtube-resolver-v14`
-- `poTokenHttpServerReady`: true
-- `cookieFilePresent`: true
-- `writableCookieFilePresent`: true
-- `streamTransport`: `yt-dlp-stdout-wait-for-bytes`
-- `streamFormat`: `251`
-- `streamStartTimeoutSeconds`: 0
-- `rangeSeeking`: false
+- service: veeb-youtube-resolver-v15
+- poTokenHttpServerReady: true
+- primaryFormat: 251
+- fallbackFormat: 18
 
-## Expected successful logs
+## Success logs
 
-- `yt-dlp stream start ... "potHttpReady": true`
-- PO token generation logs
-- `yt-dlp first audio bytes ... "bytes": <non-zero>`
-- HTTP `GET /stream/<id>` 200
-- `yt-dlp stream body finished ... "bytesSent": <non-zero>`
+You may see:
 
-Seeking is still intentionally disabled until continuous playback is stable.
+yt-dlp format failed ... "format":"251" ... 403
+yt-dlp stream attempt ... "format":"18"
+yt-dlp first audio bytes ... "format":"18","bytes":<non-zero>
+GET /stream/<id> 200
+yt-dlp stream body finished ... "bytesSent":<non-zero>
+
+Format 18 is muxed MP4, but Veeb still never shows the YouTube video UI. This is a playback compatibility fallback.
