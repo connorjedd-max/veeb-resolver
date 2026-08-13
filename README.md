@@ -1,12 +1,17 @@
-# Veeb Render Resolver V13
+# Veeb Render Resolver V14
 
-V13 fixes two issues exposed by V12:
+V14 combines the parts that actually worked:
 
-1. It actually builds and starts bgutil's local HTTP PO-token server.
-2. It prebuffers real yt-dlp audio bytes before returning HTTP 200.
+- V12 proved yt-dlp stdout can send real bytes end-to-end.
+- V13 proved the local bgutil HTTP PO-token provider is running and generating tokens.
+- V14 removes V13's 30-second startup timeout.
 
-It also forces YouTube audio-only itag 251 (Opus/WebM) so Veeb does not silently
-fall back to muxed MP4/video format 18.
+## Playback behavior
+
+Render starts yt-dlp and waits for the first real audio bytes.
+By default there is NO resolver-side startup timeout.
+
+Once the first bytes arrive, Render returns HTTP 200 and streams the rest.
 
 ## Existing Render settings to keep
 
@@ -17,19 +22,21 @@ No Cloudflare changes are required.
 
 ## Expected /health
 
-- `service`: `veeb-youtube-resolver-v13`
+- `service`: `veeb-youtube-resolver-v14`
 - `poTokenHttpServerReady`: true
 - `cookieFilePresent`: true
 - `writableCookieFilePresent`: true
-- `streamTransport`: `yt-dlp-stdout-prebuffered`
+- `streamTransport`: `yt-dlp-stdout-wait-for-bytes`
 - `streamFormat`: `251`
+- `streamStartTimeoutSeconds`: 0
 - `rangeSeeking`: false
 
-## Expected successful playback logs
+## Expected successful logs
 
 - `yt-dlp stream start ... "potHttpReady": true`
-- `yt-dlp stream prebuffer ready ...`
+- PO token generation logs
+- `yt-dlp first audio bytes ... "bytes": <non-zero>`
 - HTTP `GET /stream/<id>` 200
 - `yt-dlp stream body finished ... "bytesSent": <non-zero>`
 
-Seeking is still intentionally disabled until continuous playback is proven.
+Seeking is still intentionally disabled until continuous playback is stable.

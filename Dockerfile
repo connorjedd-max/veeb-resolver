@@ -17,7 +17,6 @@ ENV PATH="/venv/bin:$PATH"
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Install AND BUILD the matching bgutil provider.
 RUN git clone --depth 1 --branch 1.3.1 \
       https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
     && cd /opt/bgutil/server \
@@ -28,5 +27,4 @@ COPY veeb_resolver.py /app/veeb_resolver.py
 
 EXPOSE 10000
 
-# Run bgutil's fast local HTTP token server and Veeb in the same Render container.
 CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn veeb_resolver:app --host 0.0.0.0 --port ${PORT:-10000}"]
