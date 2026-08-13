@@ -1,15 +1,16 @@
-# Veeb Render Resolver V23
+# Veeb Render Resolver V24
 
-V23 targets the remaining cold-play latency and V22 reliability problems.
+V24 removes the failed Safari foreground race and makes YouTube extraction strictly single-flight on the small Render instance.
 
-- Uvicorn does not start until the bgutil POT HTTP server answers `/ping`.
-- Speculative prefetch never queues more than one track.
-- Strong user intent can replace a weak speculative prefetch.
-- Young prefetches are promoted to foreground instead of trapping a click.
-- Foreground races a cookie-authenticated `web_safari` HLS no-JS lane against the reliable mweb lane.
-- The fast lane uses `player_skip=configs,js` and a pre-merged HLS rendition.
-- mweb remains the fallback and starts in parallel, so a failed Safari lane does not add a serial timeout.
-- Every concurrent yt-dlp attempt receives its own temporary cookie jar copy.
-- Completed playback remains cache-first with Content-Length and byte ranges.
+Key changes:
+- authenticated mweb only
+- one yt-dlp/ffmpeg pipeline at a time
+- same-track prefetch is reused instead of canceled/restarted
+- unrelated speculative work is canceled and its process group is torn down before foreground extraction starts
+- shared writable YouTube cookie jar again, now safe because extraction is serialized
+- explicit shared yt-dlp cache directory at `/tmp/veeb-yt-dlp-cache`
+- `--no-check-formats` is explicit
+- keeps format 18 -> ffmpeg AAC-only MP4 cache and byte ranges
 
-Keep the existing `RESOLVER_SECRET` and `/etc/secrets/youtube-cookies.txt`.
+Keep the same Render secret and `/etc/secrets/youtube-cookies.txt` secret file.
+No new required environment variables.
