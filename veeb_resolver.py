@@ -6,7 +6,8 @@ import json
 import subprocess
 import shutil
 import importlib.metadata
-from typing import Any
+import socket
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -19,7 +20,13 @@ VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE_TTL_SECONDS = int(os.environ.get("RESOLVER_CACHE_TTL", "600"))
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
 WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
-FORMAT_SELECTOR = "bestaudio[protocol^=http][vcodec=none]/bestaudio[protocol^=http]/bestaudio/best"
+
+# V13 deliberately forces YouTube's Opus audio-only format.
+# This avoids falling back to muxed MP4/video format 18.
+STREAM_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "251")
+STREAM_CONTENT_TYPE = "audio/webm"
+PREBUFFER_BYTES = int(os.environ.get("STREAM_PREBUFFER_BYTES", str(64 * 1024)))
+PREBUFFER_TIMEOUT_SECONDS = float(os.environ.get("STREAM_PREBUFFER_TIMEOUT_SECONDS", "30"))
 
 _resolve_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _cache_lock = asyncio.Lock()
@@ -58,6 +65,14 @@ def get_writable_cookie_file() -> str | None:
     return WRITABLE_COOKIE_FILE
 
 
+def pot_http_server_ready() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 4416), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
 def base_ytdlp_args() -> list[str]:
     args = [
         "--no-playlist",
@@ -66,8 +81,9 @@ def base_ytdlp_args() -> list[str]:
         "--retries", "2",
         "--fragment-retries", "2",
         "--js-runtimes", "node",
-        "--extractor-args", "youtube:player_client=mweb",
-        "--extractor-args", "youtubepot-bgutilscript:server_home=/opt/bgutil/server",
+        # bgutil's HTTP provider runs locally on 127.0.0.1:4416.
+        # The plugin prioritises HTTP when it is available.
+        "--extractor-args", "youtube:player_client=mweb;fetch_pot=always",
     ]
 
     cookie_file = get_writable_cookie_file()
@@ -85,7 +101,7 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
         "--dump-single-json",
         "--skip-download",
         *base_ytdlp_args(),
-        "-f", FORMAT_SELECTOR,
+        "-f", STREAM_FORMAT,
         watch_url,
     ]
 
@@ -98,7 +114,7 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             env=env,
-            timeout=55,
+            timeout=60,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -107,14 +123,14 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
     stderr = (completed.stderr or "").strip()
     if completed.returncode != 0:
         if stderr:
-            print("yt-dlp resolver error:", stderr[-4000:], flush=True)
-        raise RuntimeError(stderr[-1800:] or f"yt-dlp exited with code {completed.returncode}")
+            print("yt-dlp resolver error:", stderr[-5000:], flush=True)
+        raise RuntimeError(stderr[-2000:] or f"yt-dlp exited with code {completed.returncode}")
 
     try:
         info = json.loads(completed.stdout)
     except Exception as exc:
         if stderr:
-            print("yt-dlp non-JSON stderr:", stderr[-2000:], flush=True)
+            print("yt-dlp non-JSON stderr:", stderr[-2500:], flush=True)
         raise RuntimeError("yt-dlp returned invalid JSON metadata") from exc
 
     if not info or not isinstance(info, dict):
@@ -168,90 +184,59 @@ async def resolve_video(video_id: str, force_refresh: bool = False) -> dict[str,
         return info
 
 
-def content_type_for(info: dict[str, Any]) -> str:
-    ext = str(info.get("ext") or "").lower()
-    acodec = str(info.get("acodec") or "").lower()
-
-    if ext == "webm" or "opus" in acodec:
-        return "audio/webm"
-    if ext in ("m4a", "mp4"):
-        return "audio/mp4"
-    if ext == "mp3":
-        return "audio/mpeg"
-    if ext == "ogg":
-        return "audio/ogg"
-    return "application/octet-stream"
-
-
-async def log_process_stderr(process: asyncio.subprocess.Process, video_id: str) -> None:
+async def drain_stderr(
+    process: asyncio.subprocess.Process,
+    video_id: str,
+    tail: list[str],
+) -> None:
     if process.stderr is None:
         return
-    tail: list[str] = []
+
     while True:
         line = await process.stderr.readline()
         if not line:
             break
+
         text = line.decode("utf-8", errors="replace").rstrip()
-        if text:
-            tail.append(text)
-            if len(tail) > 40:
-                tail.pop(0)
-    if process.returncode not in (None, 0) and tail:
-        print(
-            "yt-dlp stream stderr",
-            json.dumps({"videoId": video_id, "tail": tail[-20:]}),
-            flush=True,
-        )
+        if not text:
+            continue
+
+        tail.append(text)
+        if len(tail) > 80:
+            del tail[:-80]
 
 
-async def close_stream_process(process: asyncio.subprocess.Process, stderr_task: asyncio.Task | None) -> None:
-    try:
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=4)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-    finally:
-        if stderr_task:
-            try:
-                await asyncio.wait_for(stderr_task, timeout=2)
-            except Exception:
-                stderr_task.cancel()
+async def terminate_process(
+    process: asyncio.subprocess.Process,
+    stderr_task: asyncio.Task | None,
+) -> None:
+    if process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=4)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+    if stderr_task:
+        try:
+            await asyncio.wait_for(stderr_task, timeout=2)
+        except Exception:
+            stderr_task.cancel()
 
 
-async def stream_process_stdout(process: asyncio.subprocess.Process, video_id: str):
-    assert process.stdout is not None
-    total = 0
-    try:
-        while True:
-            chunk = await process.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            yield chunk
-    finally:
-        print(
-            "yt-dlp stream ended",
-            json.dumps({
-                "videoId": video_id,
-                "bytesSent": total,
-                "returnCode": process.returncode,
-            }),
-            flush=True,
-        )
-
-
-async def start_ytdlp_stream(video_id: str) -> tuple[asyncio.subprocess.Process, asyncio.Task]:
+async def start_ytdlp_stream(
+    video_id: str,
+) -> tuple[asyncio.subprocess.Process, asyncio.Task, list[str]]:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
     cmd = [
         "yt-dlp",
         "-o", "-",
         "--no-progress",
         "--no-part",
         *base_ytdlp_args(),
-        "-f", FORMAT_SELECTOR,
+        "-f", STREAM_FORMAT,
         watch_url,
     ]
 
@@ -260,7 +245,12 @@ async def start_ytdlp_stream(video_id: str) -> tuple[asyncio.subprocess.Process,
 
     print(
         "yt-dlp stream start",
-        json.dumps({"videoId": video_id, "transport": "stdout"}),
+        json.dumps({
+            "videoId": video_id,
+            "transport": "stdout",
+            "format": STREAM_FORMAT,
+            "potHttpReady": pot_http_server_ready(),
+        }),
         flush=True,
     )
 
@@ -271,8 +261,107 @@ async def start_ytdlp_stream(video_id: str) -> tuple[asyncio.subprocess.Process,
         env=env,
     )
 
-    stderr_task = asyncio.create_task(log_process_stderr(process, video_id))
-    return process, stderr_task
+    stderr_tail: list[str] = []
+    stderr_task = asyncio.create_task(
+        drain_stderr(process, video_id, stderr_tail)
+    )
+
+    return process, stderr_task, stderr_tail
+
+
+async def get_first_stream_chunk(
+    process: asyncio.subprocess.Process,
+    stderr_task: asyncio.Task,
+    stderr_tail: list[str],
+    video_id: str,
+) -> bytes:
+    assert process.stdout is not None
+
+    try:
+        first_chunk = await asyncio.wait_for(
+            process.stdout.read(PREBUFFER_BYTES),
+            timeout=PREBUFFER_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        print(
+            "yt-dlp stream prebuffer timeout",
+            json.dumps({
+                "videoId": video_id,
+                "stderrTail": stderr_tail[-20:],
+            }),
+            flush=True,
+        )
+        await terminate_process(process, stderr_task)
+        raise HTTPException(
+            status_code=504,
+            detail="yt-dlp did not produce audio bytes before the prebuffer timeout",
+        )
+
+    if not first_chunk:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
+
+        print(
+            "yt-dlp stream produced no bytes",
+            json.dumps({
+                "videoId": video_id,
+                "returnCode": process.returncode,
+                "stderrTail": stderr_tail[-30:],
+            }),
+            flush=True,
+        )
+
+        await terminate_process(process, stderr_task)
+        raise HTTPException(
+            status_code=502,
+            detail="yt-dlp produced no audio bytes",
+        )
+
+    print(
+        "yt-dlp stream prebuffer ready",
+        json.dumps({
+            "videoId": video_id,
+            "bytes": len(first_chunk),
+        }),
+        flush=True,
+    )
+
+    return first_chunk
+
+
+async def stream_stdout(
+    process: asyncio.subprocess.Process,
+    first_chunk: bytes,
+    video_id: str,
+) -> AsyncIterator[bytes]:
+    assert process.stdout is not None
+
+    total = 0
+
+    try:
+        total += len(first_chunk)
+        yield first_chunk
+
+        while True:
+            chunk = await process.stdout.read(64 * 1024)
+            if not chunk:
+                break
+
+            total += len(chunk)
+            yield chunk
+
+    finally:
+        print(
+            "yt-dlp stream body finished",
+            json.dumps({
+                "videoId": video_id,
+                "bytesSent": total,
+                "returnCode": process.returncode,
+            }),
+            flush=True,
+        )
 
 
 @app.get("/health")
@@ -286,26 +375,34 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v12",
+        "service": "veeb-youtube-resolver-v13",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClient": "mweb",
         "poTokenProvider": "bgutil",
         "poTokenProviderVersion": pot_version,
-        "poTokenServerPresent": os.path.isdir("/opt/bgutil/server"),
+        "poTokenHttpServerReady": pot_http_server_ready(),
         "cookieFileConfigured": bool(YOUTUBE_COOKIE_FILE),
         "cookieFilePresent": os.path.isfile(YOUTUBE_COOKIE_FILE),
         "cookieFilePath": YOUTUBE_COOKIE_FILE,
         "writableCookieFilePath": WRITABLE_COOKIE_FILE,
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
-        "streamTransport": "yt-dlp-stdout",
+        "streamTransport": "yt-dlp-stdout-prebuffered",
+        "streamFormat": STREAM_FORMAT,
+        "streamContentType": STREAM_CONTENT_TYPE,
+        "prebufferBytes": PREBUFFER_BYTES,
+        "prebufferTimeoutSeconds": PREBUFFER_TIMEOUT_SECONDS,
         "rangeSeeking": False,
     }
 
 
 @app.get("/resolve/{video_id}")
-async def resolve_endpoint(video_id: str, authorization: str | None = Header(default=None)) -> JSONResponse:
+async def resolve_endpoint(
+    video_id: str,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
     require_auth(authorization)
     validate_video_id(video_id)
+
     info = await resolve_video(video_id)
 
     return JSONResponse(
@@ -332,36 +429,35 @@ async def stream_endpoint(
     require_auth(authorization)
     validate_video_id(video_id)
 
-    # Resolve first so an unavailable/private/dead ID returns a real 502 before
-    # we commit a 200 streaming response to the browser.
-    info = await resolve_video(video_id)
-
     headers = {
-        "Content-Type": content_type_for(info),
+        "Content-Type": STREAM_CONTENT_TYPE,
         "Cache-Control": "private, no-store, max-age=0",
-        "X-Veeb-Resolver": "yt-dlp-stdout",
-        # V12 intentionally does not advertise byte ranges. yt-dlp owns the
-        # upstream media request so its PO-token/session state stays intact.
+        "X-Veeb-Resolver": "yt-dlp-stdout-v13",
         "Accept-Ranges": "none",
     }
 
     if request.method == "HEAD":
         return Response(status_code=200, headers=headers)
 
-    process, stderr_task = await start_ytdlp_stream(video_id)
+    process, stderr_task, stderr_tail = await start_ytdlp_stream(video_id)
 
-    # Give yt-dlp a brief chance to fail before headers are committed.
-    await asyncio.sleep(0.35)
-    if process.returncode is not None and process.returncode != 0:
-        try:
-            await asyncio.wait_for(stderr_task, timeout=1)
-        except Exception:
-            pass
-        raise HTTPException(status_code=502, detail="yt-dlp failed to start audio stream")
+    # V13 does not send HTTP 200 until yt-dlp has actually produced media bytes.
+    # This prevents Cloudflare/browser from opening a body that then sits empty
+    # while YouTube JS/PO-token work is still happening.
+    first_chunk = await get_first_stream_chunk(
+        process,
+        stderr_task,
+        stderr_tail,
+        video_id,
+    )
 
     return StreamingResponse(
-        stream_process_stdout(process, video_id),
+        stream_stdout(process, first_chunk, video_id),
         status_code=200,
         headers=headers,
-        background=BackgroundTask(close_stream_process, process, stderr_task),
+        background=BackgroundTask(
+            terminate_process,
+            process,
+            stderr_task,
+        ),
     )

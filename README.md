@@ -1,34 +1,35 @@
-# Veeb Render Resolver V12
+# Veeb Render Resolver V13
 
-V12 keeps the existing Render + yt-dlp + mweb + bgutil + cookies setup, but removes
-the custom second-stage HTTP downloader.
+V13 fixes two issues exposed by V12:
 
-Playback flow:
+1. It actually builds and starts bgutil's local HTTP PO-token server.
+2. It prebuffers real yt-dlp audio bytes before returning HTTP 200.
 
-Veeb -> Cloudflare Worker -> Render -> yt-dlp -> stdout -> Render -> Veeb
+It also forces YouTube audio-only itag 251 (Opus/WebM) so Veeb does not silently
+fall back to muxed MP4/video format 18.
 
-yt-dlp now owns both extraction and media downloading so its YouTube request state
-stays together.
-
-## Keep these existing Render settings
+## Existing Render settings to keep
 
 - `RESOLVER_SECRET`
 - Secret file: `youtube-cookies.txt`
 
-## Health check
+No Cloudflare changes are required.
 
-`/health` should report:
+## Expected /health
 
-- `service`: `veeb-youtube-resolver-v12`
+- `service`: `veeb-youtube-resolver-v13`
+- `poTokenHttpServerReady`: true
 - `cookieFilePresent`: true
 - `writableCookieFilePresent`: true
-- `streamTransport`: `yt-dlp-stdout`
+- `streamTransport`: `yt-dlp-stdout-prebuffered`
+- `streamFormat`: `251`
 - `rangeSeeking`: false
 
-## Important
+## Expected successful playback logs
 
-V12 intentionally disables byte-range seeking for the first playback proof.
-Play, pause, next and normal continuous playback are the target. Seeking can be
-added after stdout playback is proven.
+- `yt-dlp stream start ... "potHttpReady": true`
+- `yt-dlp stream prebuffer ready ...`
+- HTTP `GET /stream/<id>` 200
+- `yt-dlp stream body finished ... "bytesSent": <non-zero>`
 
-Do not commit `youtube-cookies.txt` or Python `.pyc` files.
+Seeking is still intentionally disabled until continuous playback is proven.
