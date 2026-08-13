@@ -1,6 +1,4 @@
 import asyncio
-import http.cookiejar
-import urllib.request
 import os
 import re
 import time
@@ -10,13 +8,9 @@ import shutil
 import importlib.metadata
 from typing import Any
 
-
-import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
 
 app = FastAPI(title="Veeb YouTube Resolver", docs_url=None, redoc_url=None)
 
@@ -25,9 +19,8 @@ VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE_TTL_SECONDS = int(os.environ.get("RESOLVER_CACHE_TTL", "600"))
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
 WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
-MAX_UPSTREAM_CHUNK_BYTES = int(os.environ.get("MAX_UPSTREAM_CHUNK_BYTES", str(8 * 1024 * 1024)))
+FORMAT_SELECTOR = "bestaudio[protocol^=http][vcodec=none]/bestaudio[protocol^=http]/bestaudio/best"
 
-# Cache only yt-dlp's resolved media metadata. The media itself is never stored.
 _resolve_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _cache_lock = asyncio.Lock()
 
@@ -47,10 +40,6 @@ def validate_video_id(video_id: str) -> str:
 
 
 def get_writable_cookie_file() -> str | None:
-    # Render mounts Secret Files under /etc/secrets as read-only. yt-dlp reads
-    # cookies and then saves its cookie jar on exit, so passing the mounted file
-    # directly causes Errno 30. Copy it once to /tmp and let yt-dlp update that
-    # private, writable runtime copy for the lifetime of this resolver process.
     if not os.path.isfile(YOUTUBE_COOKIE_FILE):
         return None
 
@@ -69,17 +58,9 @@ def get_writable_cookie_file() -> str | None:
     return WRITABLE_COOKIE_FILE
 
 
-def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # V10 keeps the V9 mweb + bgutil + chunked relay setup, but passes yt-dlp
-    # a writable /tmp copy of Render's read-only Secret File.
-    cookie_file = get_writable_cookie_file()
-    cmd = [
-        "yt-dlp",
-        "--dump-single-json",
+def base_ytdlp_args() -> list[str]:
+    args = [
         "--no-playlist",
-        "--skip-download",
         "--no-warnings",
         "--socket-timeout", "20",
         "--retries", "2",
@@ -89,13 +70,24 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
         "--extractor-args", "youtubepot-bgutilscript:server_home=/opt/bgutil/server",
     ]
 
+    cookie_file = get_writable_cookie_file()
     if cookie_file:
-        cmd.extend(["--cookies", cookie_file])
+        args.extend(["--cookies", cookie_file])
 
-    cmd.extend([
-        "-f", "bestaudio[protocol^=http][vcodec=none]/bestaudio[protocol^=http]/bestaudio/best",
+    return args
+
+
+def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--skip-download",
+        *base_ytdlp_args(),
+        "-f", FORMAT_SELECTOR,
         watch_url,
-    ])
+    ]
 
     env = os.environ.copy()
     env.setdefault("TOKEN_TTL", "6")
@@ -128,14 +120,6 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
     if not info or not isinstance(info, dict):
         raise RuntimeError("yt-dlp returned no media information")
 
-    media_url = info.get("url")
-    if not isinstance(media_url, str) or not media_url.startswith(("http://", "https://")):
-        raise RuntimeError("yt-dlp did not return a direct HTTP media URL")
-
-    headers = info.get("http_headers") or {}
-    if not isinstance(headers, dict):
-        headers = {}
-
     print(
         "yt-dlp resolved",
         json.dumps({
@@ -157,8 +141,6 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
         "ext": info.get("ext"),
         "acodec": info.get("acodec"),
         "abr": info.get("abr"),
-        "url": media_url,
-        "http_headers": {str(k): str(v) for k, v in headers.items() if v is not None},
     }
 
 
@@ -170,7 +152,6 @@ async def resolve_video(video_id: str, force_refresh: bool = False) -> dict[str,
         if cached and cached[0] > now:
             return cached[1]
 
-    # Avoid duplicate extraction work when several range requests arrive together.
     async with _cache_lock:
         now = time.monotonic()
         if not force_refresh:
@@ -180,8 +161,6 @@ async def resolve_video(video_id: str, force_refresh: bool = False) -> dict[str,
 
         try:
             info = await asyncio.to_thread(extract_with_ytdlp, video_id)
-        except DownloadError as exc:
-            raise HTTPException(status_code=502, detail=f"YouTube resolver failed: {exc}") from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"YouTube resolver failed: {exc}") from exc
 
@@ -189,120 +168,111 @@ async def resolve_video(video_id: str, force_refresh: bool = False) -> dict[str,
         return info
 
 
-async def close_upstream(client: httpx.AsyncClient, response: httpx.Response) -> None:
-    try:
-        await response.aclose()
-    finally:
-        await client.aclose()
+def content_type_for(info: dict[str, Any]) -> str:
+    ext = str(info.get("ext") or "").lower()
+    acodec = str(info.get("acodec") or "").lower()
+
+    if ext == "webm" or "opus" in acodec:
+        return "audio/webm"
+    if ext in ("m4a", "mp4"):
+        return "audio/mp4"
+    if ext == "mp3":
+        return "audio/mpeg"
+    if ext == "ogg":
+        return "audio/ogg"
+    return "application/octet-stream"
 
 
-def clamp_range_header(range_header: str | None) -> str | None:
-    if not range_header:
-        return f"bytes=0-{MAX_UPSTREAM_CHUNK_BYTES - 1}"
-
-    match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header.strip())
-    if not match:
-        return range_header
-
-    start = int(match.group(1))
-    raw_end = match.group(2)
-    requested_end = int(raw_end) if raw_end else None
-    max_end = start + MAX_UPSTREAM_CHUNK_BYTES - 1
-    end = min(requested_end, max_end) if requested_end is not None else max_end
-    return f"bytes={start}-{end}"
-
-def get_media_cookie_header(media_url: str) -> str:
-    cookie_path = "/tmp/veeb-youtube-cookies.txt"
-
-    if not os.path.isfile(cookie_path):
-        return ""
-
-    try:
-        jar = http.cookiejar.MozillaCookieJar(cookie_path)
-
-        jar.load(
-            ignore_discard=True,
-            ignore_expires=True,
-        )
-
-        cookie_request = urllib.request.Request(media_url)
-
-        jar.add_cookie_header(cookie_request)
-
-        return cookie_request.get_header("Cookie") or ""
-
-    except Exception as exc:
+async def log_process_stderr(process: asyncio.subprocess.Process, video_id: str) -> None:
+    if process.stderr is None:
+        return
+    tail: list[str] = []
+    while True:
+        line = await process.stderr.readline()
+        if not line:
+            break
+        text = line.decode("utf-8", errors="replace").rstrip()
+        if text:
+            tail.append(text)
+            if len(tail) > 40:
+                tail.pop(0)
+    if process.returncode not in (None, 0) and tail:
         print(
-            "media cookie load failed",
-            {
-                "error": str(exc),
-                "cookiePath": cookie_path,
-            },
+            "yt-dlp stream stderr",
+            json.dumps({"videoId": video_id, "tail": tail[-20:]}),
             flush=True,
         )
 
-        return ""
 
-async def open_media_stream(
-    info: dict[str, Any],
-    range_header: str | None,
-    method: str,
-) -> tuple[httpx.AsyncClient, httpx.Response]:
-    upstream_headers = dict(info.get("http_headers") or {})
-    cookie_header = get_media_cookie_header(info["url"])
+async def close_stream_process(process: asyncio.subprocess.Process, stderr_task: asyncio.Task | None) -> None:
+    try:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+    finally:
+        if stderr_task:
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2)
+            except Exception:
+                stderr_task.cancel()
 
-    if cookie_header:
-        upstream_headers["Cookie"] = cookie_header
+
+async def stream_process_stdout(process: asyncio.subprocess.Process, video_id: str):
+    assert process.stdout is not None
+    total = 0
+    try:
+        while True:
+            chunk = await process.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            yield chunk
+    finally:
+        print(
+            "yt-dlp stream ended",
+            json.dumps({
+                "videoId": video_id,
+                "bytesSent": total,
+                "returnCode": process.returncode,
+            }),
+            flush=True,
+        )
+
+
+async def start_ytdlp_stream(video_id: str) -> tuple[asyncio.subprocess.Process, asyncio.Task]:
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    cmd = [
+        "yt-dlp",
+        "-o", "-",
+        "--no-progress",
+        "--no-part",
+        *base_ytdlp_args(),
+        "-f", FORMAT_SELECTOR,
+        watch_url,
+    ]
+
+    env = os.environ.copy()
+    env.setdefault("TOKEN_TTL", "6")
 
     print(
-        "media auth",
-        {
-            "cookieHeaderPresent": bool(cookie_header),
-            "cookieHeaderLength": len(cookie_header),
-            "headerNames": sorted(upstream_headers.keys()),
-        },
-        flush=True,
-    )
-    upstream_headers.setdefault("Accept", "*/*")
-
-    safe_range = clamp_range_header(range_header)
-    if safe_range:
-        upstream_headers["Range"] = safe_range
-
-    print(
-        "media fetch",
-        json.dumps({
-            "videoId": info.get("id"),
-            "method": method,
-            "browserRange": range_header,
-            "upstreamRange": safe_range,
-            "formatId": info.get("format_id"),
-            "ext": info.get("ext"),
-        }),
+        "yt-dlp stream start",
+        json.dumps({"videoId": video_id, "transport": "stdout"}),
         flush=True,
     )
 
-    client = httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0),
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
 
-    request = client.build_request(method, info["url"], headers=upstream_headers)
-    response = await client.send(request, stream=True)
-
-    print(
-        "media upstream",
-        json.dumps({
-            "videoId": info.get("id"),
-            "status": response.status_code,
-            "contentType": response.headers.get("content-type"),
-            "contentLength": response.headers.get("content-length"),
-            "contentRange": response.headers.get("content-range"),
-        }),
-        flush=True,
-    )
-
-    return client, response
+    stderr_task = asyncio.create_task(log_process_stderr(process, video_id))
+    return process, stderr_task
 
 
 @app.get("/health")
@@ -312,9 +282,11 @@ async def health() -> dict[str, Any]:
     except importlib.metadata.PackageNotFoundError:
         pot_version = None
 
+    get_writable_cookie_file()
+
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v10",
+        "service": "veeb-youtube-resolver-v12",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClient": "mweb",
         "poTokenProvider": "bgutil",
@@ -325,7 +297,8 @@ async def health() -> dict[str, Any]:
         "cookieFilePath": YOUTUBE_COOKIE_FILE,
         "writableCookieFilePath": WRITABLE_COOKIE_FILE,
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
-        "maxUpstreamChunkBytes": MAX_UPSTREAM_CHUNK_BYTES,
+        "streamTransport": "yt-dlp-stdout",
+        "rangeSeeking": False,
     }
 
 
@@ -335,8 +308,6 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     validate_video_id(video_id)
     info = await resolve_video(video_id)
 
-    # Never expose Google's short-lived media URL to the caller. The resolver must
-    # fetch the bytes itself so resolution and media fetch originate from one host.
     return JSONResponse(
         {
             "id": info.get("id"),
@@ -361,50 +332,36 @@ async def stream_endpoint(
     require_auth(authorization)
     validate_video_id(video_id)
 
-    range_header = request.headers.get("range")
-    method = request.method
+    # Resolve first so an unavailable/private/dead ID returns a real 502 before
+    # we commit a 200 streaming response to the browser.
     info = await resolve_video(video_id)
 
-    client, upstream = await open_media_stream(info, range_header, method)
-
-    # A cached Google media URL can expire or become unusable. Refresh it once.
-    if upstream.status_code in (401, 403, 410):
-        await close_upstream(client, upstream)
-        _resolve_cache.pop(video_id, None)
-        info = await resolve_video(video_id, force_refresh=True)
-        client, upstream = await open_media_stream(info, range_header, method)
-
-    if upstream.status_code >= 400:
-        body = await upstream.aread()
-        status = upstream.status_code
-        await close_upstream(client, upstream)
-        detail = body[:500].decode("utf-8", errors="replace")
-        raise HTTPException(status_code=502, detail=f"YouTube media origin returned {status}: {detail}")
-
-    passthrough = {
-        "content-type",
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "etag",
-        "last-modified",
+    headers = {
+        "Content-Type": content_type_for(info),
+        "Cache-Control": "private, no-store, max-age=0",
+        "X-Veeb-Resolver": "yt-dlp-stdout",
+        # V12 intentionally does not advertise byte ranges. yt-dlp owns the
+        # upstream media request so its PO-token/session state stays intact.
+        "Accept-Ranges": "none",
     }
-    headers: dict[str, str] = {}
-    for name, value in upstream.headers.items():
-        if name.lower() in passthrough:
-            headers[name] = value
 
-    headers["Cache-Control"] = "private, no-store, max-age=0"
-    headers["X-Veeb-Resolver"] = "yt-dlp"
-    headers.setdefault("Accept-Ranges", "bytes")
+    if request.method == "HEAD":
+        return Response(status_code=200, headers=headers)
 
-    if method == "HEAD":
-        await close_upstream(client, upstream)
-        return Response(status_code=upstream.status_code, headers=headers)
+    process, stderr_task = await start_ytdlp_stream(video_id)
+
+    # Give yt-dlp a brief chance to fail before headers are committed.
+    await asyncio.sleep(0.35)
+    if process.returncode is not None and process.returncode != 0:
+        try:
+            await asyncio.wait_for(stderr_task, timeout=1)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail="yt-dlp failed to start audio stream")
 
     return StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=upstream.status_code,
+        stream_process_stdout(process, video_id),
+        status_code=200,
         headers=headers,
-        background=BackgroundTask(close_upstream, client, upstream),
+        background=BackgroundTask(close_stream_process, process, stderr_task),
     )
