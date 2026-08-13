@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import socket
 import time
@@ -45,7 +46,11 @@ CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
 PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "1")))
 FILE_CHUNK_BYTES = 256 * 1024
 FOREGROUND_READY_BYTES = max(64 * 1024, int(os.environ.get("VEEB_FOREGROUND_READY_BYTES", str(128 * 1024))))
-FOREGROUND_FAST_CLIENT = os.environ.get("YOUTUBE_FAST_CLIENT", "android").strip() or "android"
+PLAYBACK_WAIT_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_PLAYBACK_WAIT", "0")))
+
+# V22 uses only the authenticated mweb client. Android/iOS clients do not
+# support account cookies, which makes them a poor fast lane on this Render IP.
+FOREGROUND_FAST_CLIENT = ""
 
 _cache_tasks: dict[str, asyncio.Task] = {}
 _prefetch_started: set[str] = set()
@@ -111,6 +116,16 @@ def youtube_extractor_args(client: str) -> str:
     # the client-config network request. We keep webpage + JS because format 18
     # still needs the normal player/signature path on this account/IP.
     args.append("player_skip=configs")
+
+    # Veeb only requests progressive format 18, so HLS/DASH manifest discovery
+    # is unnecessary work. yt-dlp supports skipping both manifest families.
+    args.append("skip=hls,dash")
+
+    # yt-dlp's YouTube extractor otherwise has a playback wait between
+    # extraction and download. mweb's ad playback context is already enabled,
+    # so V22 explicitly starts with zero additional wait. Set the env var back
+    # to 6 if YouTube begins rejecting immediately-started format 18 requests.
+    args.append(f"playback_wait={PLAYBACK_WAIT_SECONDS:g}")
 
     return "youtube:" + ";".join(args)
 
@@ -264,6 +279,19 @@ async def drain_stderr(
         if len(tail) > 180:
             del tail[:-180]
 
+        if "sleeping" in text.lower() or "wait" in text.lower():
+            print(
+                "cold yt-dlp wait",
+                json.dumps({
+                    "videoId": video_id,
+                    "purpose": purpose,
+                    "client": client,
+                    "elapsedSeconds": round(time.monotonic() - attempt_started, 2),
+                    "message": text[:600],
+                }),
+                flush=True,
+            )
+
         phase = classify_startup_phase(text)
         if phase and phase not in seen_phases:
             seen_phases.add(phase)
@@ -281,18 +309,39 @@ async def drain_stderr(
 
 
 async def terminate_process(process: asyncio.subprocess.Process, stderr_task: asyncio.Task | None) -> None:
+    """Terminate the whole yt-dlp | ffmpeg pipeline, not just its bash wrapper."""
     if process.returncode is None:
-        process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=4)
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1.25)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.25)
+            except Exception:
+                pass
 
     if stderr_task:
         try:
-            await asyncio.wait_for(stderr_task, timeout=2)
-        except Exception:
+            await asyncio.wait_for(stderr_task, timeout=0.5)
+        except BaseException:
             stderr_task.cancel()
 
 
@@ -320,6 +369,7 @@ async def start_attempt(video_id: str, purpose: str, client: str, attempt_number
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        start_new_session=True,
     )
 
     stderr_tail: list[str] = []
@@ -671,7 +721,7 @@ async def build_cache(video_id: str) -> bool:
 
 
 async def build_cache_foreground(video_id: str) -> bool:
-    """Build a cold playback cache immediately, bypassing speculative queueing."""
+    """Build the selected track immediately with the known-good mweb path."""
     if cache_is_valid(video_id):
         return True
 
@@ -694,7 +744,7 @@ async def build_cache_foreground(video_id: str) -> bool:
             first_chunk,
             client,
             _,
-        ) = await open_foreground_race(video_id)
+        ) = await open_stream_with_fallback(video_id, "live")
 
         assert process.stdout is not None
         with open(temp_path, "wb") as handle:
@@ -976,16 +1026,18 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v21",
+        "service": "veeb-youtube-resolver-v22",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
         "jsRuntime": JSC_RUNTIME,
-        "foregroundFastClient": FOREGROUND_FAST_CLIENT,
+        "foregroundFastClient": None,
         "foregroundReliableClient": PRIMARY_CLIENT,
         "foregroundReadyBytes": FOREGROUND_READY_BYTES,
-        "foregroundRace": True,
+        "foregroundRace": False,
         "playerSkip": ["configs"],
+        "manifestSkip": ["hls", "dash"],
+        "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
         "streamStartTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
         "premiumAccountMode": YOUTUBE_PREMIUM_ACCOUNT,
         "mwebAdPlaybackContext": not YOUTUBE_PREMIUM_ACCOUNT,
@@ -998,7 +1050,7 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "foreground-race-android-vs-mweb-cache-first",
+        "streamTransport": "foreground-priority-mweb-zero-wait-cache-first",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
@@ -1070,17 +1122,31 @@ async def stream_endpoint(
             },
         )
 
-    # Never cancel a different running prefetch on a tap. V20.1 proved that
-    # subprocess cancellation can take several seconds and delay the selected
-    # track. Foreground playback now starts immediately and bypasses the
-    # speculative semaphore.
+    # Foreground owns the Render CPU. Cancel every unrelated speculative task
+    # and yield once so cancellation reaches terminate_process(), which now
+    # kills the entire yt-dlp/ffmpeg process group rather than only bash.
+    preempted = []
+    for other_id, other_task in list(_cache_tasks.items()):
+        if other_id != video_id and not other_task.done():
+            preempted.append(other_id)
+            other_task.cancel()
+
+    if preempted:
+        print(
+            "audio preempting speculative work",
+            json.dumps({"videoId": video_id, "preempted": sorted(preempted)}),
+            flush=True,
+        )
+        await asyncio.sleep(0)
+
     task = start_foreground_build(video_id)
     print(
         "audio foreground build started",
         json.dumps({
             "videoId": video_id,
-            "runningSpeculativePrefetches": sorted(_prefetch_started),
-            "raceClients": [FOREGROUND_FAST_CLIENT, PRIMARY_CLIENT],
+            "preemptedSpeculativePrefetches": sorted(preempted),
+            "client": PRIMARY_CLIENT,
+            "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
         }),
         flush=True,
     )

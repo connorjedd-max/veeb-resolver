@@ -1,37 +1,16 @@
-# Veeb Render Resolver V21
+# Veeb Render Resolver V22
 
-V21 targets the interaction lag visible in the V20.1 logs.
+V22 is a foreground-priority latency build.
 
-## What changed
+Changes from V21:
+- removes the Android race because current yt-dlp does not support account cookies on Android and the Render IP is bot-challenged
+- selected playback hard-preempts unrelated speculative prefetch work
+- subprocess cancellation kills the entire yt-dlp + ffmpeg process group
+- uses mweb only for foreground playback
+- explicitly sets YouTube playback_wait=0 while mweb ad playback context is enabled
+- skips HLS and DASH manifest discovery because Veeb only requests progressive format 18
+- logs any yt-dlp sleep/wait line so remaining server-imposed waits are visible
+- keeps completed local cache + byte ranges
 
-- Foreground playback no longer waits for cancellation of unrelated speculative prefetch jobs.
-- A tapped cold track bypasses the speculative prefetch semaphore and starts immediately.
-- If the same track was only queued, it is promoted to foreground instead of waiting behind another track.
-- Foreground cold playback races the public `android` client against the known-good authenticated `mweb` client.
-- The race is parallel, not serial, so a failed Android attempt does not add a V19-style timeout penalty.
-- Android is useful as a fast lane because current yt-dlp marks it as not requiring the JS player.
-- A race candidate must produce 128 KiB before it can win, preventing a client from winning with only an ffmpeg MP4 header and then failing.
-- Completed audio is still served from the normal V20.1 seekable cache with Range support.
-
-## Keep existing configuration
-
-Keep the same `RESOLVER_SECRET` and Render Secret File `youtube-cookies.txt`.
-No new required environment variables.
-
-Optional tuning:
-
-- `YOUTUBE_FAST_CLIENT=android`
-- `VEEB_FOREGROUND_READY_BYTES=131072`
-- `VEEB_PREFETCH_CONCURRENCY=1`
-
-## Healthy deployment
-
-`/health` should report:
-
-- `service`: `veeb-youtube-resolver-v21`
-- `foregroundFastClient`: `android`
-- `foregroundReliableClient`: `mweb`
-- `foregroundRace`: `true`
-- `streamTransport`: `foreground-race-android-vs-mweb-cache-first`
-
-The most useful log is `foreground race winner`. If Android works from the current Render egress, it should beat mweb without a JS-player challenge. If it does not work, mweb was already running in parallel and remains the fallback.
+If zero playback wait causes media-origin failures, set YOUTUBE_PLAYBACK_WAIT=6 in Render.
+Keep the same RESOLVER_SECRET and youtube-cookies.txt.
