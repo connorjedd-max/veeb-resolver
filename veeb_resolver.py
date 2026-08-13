@@ -249,7 +249,7 @@ async def open_media_stream(
     method: str,
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
     upstream_headers = dict(info.get("http_headers") or {})
-        cookie_header = get_media_cookie_header(info["url"])
+    cookie_header = get_media_cookie_header(info["url"])
 
     if cookie_header:
         upstream_headers["Cookie"] = cookie_header
