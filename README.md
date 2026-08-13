@@ -1,16 +1,15 @@
-# Veeb Render Resolver V22
+# Veeb Render Resolver V23
 
-V22 is a foreground-priority latency build.
+V23 targets the remaining cold-play latency and V22 reliability problems.
 
-Changes from V21:
-- removes the Android race because current yt-dlp does not support account cookies on Android and the Render IP is bot-challenged
-- selected playback hard-preempts unrelated speculative prefetch work
-- subprocess cancellation kills the entire yt-dlp + ffmpeg process group
-- uses mweb only for foreground playback
-- explicitly sets YouTube playback_wait=0 while mweb ad playback context is enabled
-- skips HLS and DASH manifest discovery because Veeb only requests progressive format 18
-- logs any yt-dlp sleep/wait line so remaining server-imposed waits are visible
-- keeps completed local cache + byte ranges
+- Uvicorn does not start until the bgutil POT HTTP server answers `/ping`.
+- Speculative prefetch never queues more than one track.
+- Strong user intent can replace a weak speculative prefetch.
+- Young prefetches are promoted to foreground instead of trapping a click.
+- Foreground races a cookie-authenticated `web_safari` HLS no-JS lane against the reliable mweb lane.
+- The fast lane uses `player_skip=configs,js` and a pre-merged HLS rendition.
+- mweb remains the fallback and starts in parallel, so a failed Safari lane does not add a serial timeout.
+- Every concurrent yt-dlp attempt receives its own temporary cookie jar copy.
+- Completed playback remains cache-first with Content-Length and byte ranges.
 
-If zero playback wait causes media-origin failures, set YOUTUBE_PLAYBACK_WAIT=6 in Render.
-Keep the same RESOLVER_SECRET and youtube-cookies.txt.
+Keep the existing `RESOLVER_SECRET` and `/etc/secrets/youtube-cookies.txt`.

@@ -50,10 +50,12 @@ PLAYBACK_WAIT_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_PLAYBACK_WAIT", "
 
 # V22 uses only the authenticated mweb client. Android/iOS clients do not
 # support account cookies, which makes them a poor fast lane on this Render IP.
-FOREGROUND_FAST_CLIENT = ""
+FOREGROUND_FAST_CLIENT = "web_safari_hls"
 
 _cache_tasks: dict[str, asyncio.Task] = {}
 _prefetch_started: set[str] = set()
+_prefetch_started_at: dict[str, float] = {}
+_process_cookie_files: dict[int, str] = {}
 _foreground_tasks: dict[str, asyncio.Task] = {}
 _prefetch_semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
@@ -104,30 +106,48 @@ def client_plan() -> list[str]:
 
 
 def youtube_extractor_args(client: str) -> str:
+    # Fast foreground lane: Safari HLS with account cookies but no JS player.
+    # Current yt-dlp exposes pre-merged HLS formats for web_safari on some
+    # logged-in/trusted sessions. If this lane cannot produce media, mweb is
+    # already racing in parallel as the reliable fallback.
+    if client == "web_safari_hls":
+        return (
+            "youtube:player_client=web_safari;fetch_pot=auto;"
+            "player_skip=configs,js;skip=dash;playback_wait=0"
+        )
+
     args = [f"player_client={client}", "fetch_pot=auto"]
 
-    # yt-dlp documents use_ad_playback_context specifically for mweb and
-    # web_music. It removes the mandatory preroll wait. It must not be used
-    # with Premium cookies because it can remove Premium formats.
     if client in {"mweb", "web_music"} and not YOUTUBE_PREMIUM_ACCOUNT:
         args.append("use_ad_playback_context=true")
 
-    # Safe request reduction: yt-dlp documents player_skip=configs as skipping
-    # the client-config network request. We keep webpage + JS because format 18
-    # still needs the normal player/signature path on this account/IP.
     args.append("player_skip=configs")
-
-    # Veeb only requests progressive format 18, so HLS/DASH manifest discovery
-    # is unnecessary work. yt-dlp supports skipping both manifest families.
     args.append("skip=hls,dash")
-
-    # yt-dlp's YouTube extractor otherwise has a playback wait between
-    # extraction and download. mweb's ad playback context is already enabled,
-    # so V22 explicitly starts with zero additional wait. Set the env var back
-    # to 6 if YouTube begins rejecting immediately-started format 18 requests.
     args.append(f"playback_wait={PLAYBACK_WAIT_SECONDS:g}")
 
     return "youtube:" + ";".join(args)
+
+
+def format_selector_for_client(client: str) -> str:
+    if client == "web_safari_hls":
+        # Prefer the smallest pre-merged HLS rendition that still has audio.
+        # Video is stripped by ffmpeg immediately after yt-dlp.
+        return "worst[protocol^=m3u8][acodec!=none]"
+    return SOURCE_FORMAT
+
+
+def make_attempt_cookie_file(client: str) -> str | None:
+    if not client_uses_cookies(client):
+        return None
+
+    master = get_writable_cookie_file()
+    if not master:
+        return None
+
+    path = f"/tmp/veeb-youtube-cookies-{uuid.uuid4().hex}.txt"
+    shutil.copyfile(master, path)
+    os.chmod(path, 0o600)
+    return path
 
 
 def cache_path(video_id: str) -> Path:
@@ -189,9 +209,8 @@ def client_uses_cookies(client: str) -> bool:
     return client not in {"android", "android_vr", "ios", "visionos"}
 
 
-def build_pipeline(video_id: str, client: str) -> str:
+def build_pipeline(video_id: str, client: str, cookie_file: str | None = None) -> str:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    cookie_file = get_writable_cookie_file() if client_uses_cookies(client) else None
 
     ytdlp = [
         "yt-dlp",
@@ -210,7 +229,7 @@ def build_pipeline(video_id: str, client: str) -> str:
     if cookie_file:
         ytdlp.extend(["--cookies", cookie_file])
 
-    ytdlp.extend(["-f", SOURCE_FORMAT, watch_url])
+    ytdlp.extend(["-f", format_selector_for_client(client), watch_url])
 
     ffmpeg = [
         "ffmpeg",
@@ -344,9 +363,17 @@ async def terminate_process(process: asyncio.subprocess.Process, stderr_task: as
         except BaseException:
             stderr_task.cancel()
 
+    cookie_path = _process_cookie_files.pop(process.pid, None)
+    if cookie_path:
+        try:
+            os.unlink(cookie_path)
+        except OSError:
+            pass
+
 
 async def start_attempt(video_id: str, purpose: str, client: str, attempt_number: int):
-    pipeline = build_pipeline(video_id, client)
+    attempt_cookie_file = make_attempt_cookie_file(client)
+    pipeline = build_pipeline(video_id, client, attempt_cookie_file)
     env = os.environ.copy()
     attempt_started = time.monotonic()
 
@@ -357,20 +384,31 @@ async def start_attempt(video_id: str, purpose: str, client: str, attempt_number
             "purpose": purpose,
             "attempt": attempt_number,
             "client": client,
-            "sourceFormat": SOURCE_FORMAT,
+            "sourceFormat": format_selector_for_client(client),
             "extractorArgs": youtube_extractor_args(client),
             "potHttpReady": pot_http_server_ready(),
         }),
         flush=True,
     )
 
-    process = await asyncio.create_subprocess_exec(
-        "bash", "-o", "pipefail", "-c", pipeline,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        start_new_session=True,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "bash", "-o", "pipefail", "-c", pipeline,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception:
+        if attempt_cookie_file:
+            try:
+                os.unlink(attempt_cookie_file)
+            except OSError:
+                pass
+        raise
+
+    if attempt_cookie_file:
+        _process_cookie_files[process.pid] = attempt_cookie_file
 
     stderr_tail: list[str] = []
     stderr_task = asyncio.create_task(
@@ -654,8 +692,10 @@ async def build_cache(video_id: str) -> bool:
 
     async with _prefetch_semaphore:
         _prefetch_started.add(video_id)
+        _prefetch_started_at[video_id] = time.monotonic()
         if cache_is_valid(video_id):
             _prefetch_started.discard(video_id)
+            _prefetch_started_at.pop(video_id, None)
             return True
 
         process = None
@@ -718,6 +758,7 @@ async def build_cache(video_id: str) -> bool:
             if process is not None:
                 await terminate_process(process, stderr_task)
             _prefetch_started.discard(video_id)
+            _prefetch_started_at.pop(video_id, None)
 
 
 async def build_cache_foreground(video_id: str) -> bool:
@@ -744,7 +785,7 @@ async def build_cache_foreground(video_id: str) -> bool:
             first_chunk,
             client,
             _,
-        ) = await open_stream_with_fallback(video_id, "live")
+        ) = await open_foreground_race(video_id)
 
         assert process.stdout is not None
         with open(temp_path, "wb") as handle:
@@ -836,13 +877,38 @@ def _task_finished(video_id: str, task: asyncio.Task) -> None:
         )
 
 
-def start_prefetch(video_id: str) -> tuple[str, asyncio.Task | None]:
+def start_prefetch(video_id: str, *, intent: bool = False) -> tuple[str, asyncio.Task | None]:
     if cache_is_valid(video_id):
         return "cached", None
+
+    foreground = _foreground_tasks.get(video_id)
+    if foreground and not foreground.done():
+        return "foreground", foreground
 
     existing = _cache_tasks.get(video_id)
     if existing and not existing.done():
         return "warming", existing
+
+    # Never build a speculative queue. Queued prefetches were the source of
+    # 40-60 second apparent waits in V22. There may be one speculative track
+    # only. A strong hover/touch intent may replace that one; weak automatic
+    # page guesses simply back off while the resolver is busy.
+    active_other = [
+        (other_id, task)
+        for other_id, task in _cache_tasks.items()
+        if other_id != video_id and not task.done()
+    ]
+
+    if active_other:
+        if not intent:
+            return "busy", None
+        for other_id, task in active_other:
+            print(
+                "audio replacing speculative prefetch for user intent",
+                json.dumps({"fromVideoId": other_id, "toVideoId": video_id}),
+                flush=True,
+            )
+            task.cancel()
 
     task = asyncio.create_task(build_cache(video_id))
     _cache_tasks[video_id] = task
@@ -911,7 +977,7 @@ def cached_headers(path: Path) -> dict[str, str]:
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
         "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v21",
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v23",
         "X-Veeb-Cache": "HIT",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
     }
@@ -1026,15 +1092,15 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v22",
+        "service": "veeb-youtube-resolver-v23",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
         "jsRuntime": JSC_RUNTIME,
-        "foregroundFastClient": None,
+        "foregroundFastClient": "web_safari_hls",
         "foregroundReliableClient": PRIMARY_CLIENT,
         "foregroundReadyBytes": FOREGROUND_READY_BYTES,
-        "foregroundRace": False,
+        "foregroundRace": True,
         "playerSkip": ["configs"],
         "manifestSkip": ["hls", "dash"],
         "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
@@ -1050,7 +1116,7 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "foreground-priority-mweb-zero-wait-cache-first",
+        "streamTransport": "safari-hls-nojs-race-mweb-cache-first",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
@@ -1065,12 +1131,14 @@ async def health() -> dict[str, Any]:
 @app.post("/prefetch/{video_id}")
 async def prefetch_endpoint(
     video_id: str,
+    request: Request,
     authorization: str | None = Header(default=None),
 ):
     require_auth(authorization)
     validate_video_id(video_id)
 
-    status, _ = start_prefetch(video_id)
+    intent = request.query_params.get("intent") in {"1", "true", "yes"}
+    status, _ = start_prefetch(video_id, intent=intent)
     return JSONResponse(
         {"ok": True, "videoId": video_id, "status": status},
         status_code=200 if status == "cached" else 202,
@@ -1093,22 +1161,38 @@ async def stream_endpoint(
 
     active = _cache_tasks.get(video_id)
     if active and not active.done() and video_id in _prefetch_started:
-        # This exact track is already genuinely running, so reuse the work.
-        print("audio reusing active prefetch", json.dumps({"videoId": video_id}), flush=True)
-        try:
-            await active
-        except Exception:
-            pass
+        elapsed = time.monotonic() - _prefetch_started_at.get(video_id, time.monotonic())
 
-        if cache_is_valid(video_id):
-            print("audio cache hit after active prefetch", json.dumps({"videoId": video_id}), flush=True)
-            return await serve_cached(cache_path(video_id), request)
+        # Reuse mature prefetch work. For a very young speculative extraction,
+        # foreground starts the Safari-HLS/mweb race instead of being trapped
+        # behind a slow path that the user never explicitly chose.
+        if elapsed >= 8.0:
+            print(
+                "audio reusing mature active prefetch",
+                json.dumps({"videoId": video_id, "elapsedSeconds": round(elapsed, 2)}),
+                flush=True,
+            )
+            try:
+                await active
+            except Exception:
+                pass
+
+            if cache_is_valid(video_id):
+                print("audio cache hit after active prefetch", json.dumps({"videoId": video_id}), flush=True)
+                return await serve_cached(cache_path(video_id), request)
+        else:
+            print(
+                "audio promoting young prefetch to foreground race",
+                json.dumps({"videoId": video_id, "elapsedSeconds": round(elapsed, 2)}),
+                flush=True,
+            )
+            active.cancel()
+            await asyncio.sleep(0)
 
     elif active and not active.done():
-        # The task exists but is only queued behind another speculative job.
-        # Canceling it is cheap because no yt-dlp subprocess has started yet.
         print("audio promoting queued prefetch to foreground", json.dumps({"videoId": video_id}), flush=True)
         active.cancel()
+        await asyncio.sleep(0)
 
     if request.method == "HEAD":
         return Response(
@@ -1117,7 +1201,7 @@ async def stream_endpoint(
                 "Content-Type": STREAM_CONTENT_TYPE,
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-cache-first-v21",
+                "X-Veeb-Resolver": "yt-dlp-cache-first-v23",
                 "X-Veeb-Cache": "MISS",
             },
         )
@@ -1145,7 +1229,7 @@ async def stream_endpoint(
         json.dumps({
             "videoId": video_id,
             "preemptedSpeculativePrefetches": sorted(preempted),
-            "client": PRIMARY_CLIENT,
+            "raceClients": [FOREGROUND_FAST_CLIENT, PRIMARY_CLIENT],
             "playbackWaitSeconds": PLAYBACK_WAIT_SECONDS,
         }),
         flush=True,

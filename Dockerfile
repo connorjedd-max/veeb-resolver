@@ -34,4 +34,4 @@ COPY veeb_resolver.py /app/veeb_resolver.py
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "deno eval '1+1' >/dev/null 2>&1 || true; node /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn veeb_resolver:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["sh", "-c", "deno eval '1+1' >/dev/null 2>&1 || true; node /opt/bgutil/server/build/main.js --port 4416 & until curl -fsS http://127.0.0.1:4416/ping >/dev/null 2>&1; do sleep 0.2; done; echo POT server ready before app startup; exec uvicorn veeb_resolver:app --host 0.0.0.0 --port ${PORT:-10000}"]
