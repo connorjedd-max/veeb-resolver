@@ -1,43 +1,17 @@
-# Veeb Render Resolver V20 - FAST COLD START
+# Veeb Render Resolver V20.1
 
-V20 is built directly from the V19 timing logs. V19 showed that `tv_downgraded`
-added 12 seconds before the known-good mweb path even started, and the largest
-remaining delay was YouTube's JavaScript challenge stage.
+Playback reliability hotfix on top of V20.
 
-## V20 changes
+The V20 logs proved YouTube extraction and the AAC/MP4 pipeline were succeeding,
+but the browser could still reject the first cold, chunked fragmented-MP4 response.
 
-1. **No tv_downgraded attempt.** It goes straight to mweb.
-2. **Native Deno 2.8.1 for EJS.** yt-dlp currently recommends Deno for YouTube
-   JavaScript challenge solving. Node remains installed only for the bgutil POT server.
-3. **`player_skip=configs`.** Removes the client-config network request while keeping
-   the webpage and JS steps required by the working format-18 path.
-4. **Foreground playback priority.** A cold live play cancels unrelated speculative
-   prefetch tasks so Render CPU is spent on the song the user actually tapped.
-5. Keeps V18/V19 cache, prefetch and byte-range serving.
-6. Prefetch concurrency defaults to 1 to avoid two EJS challenges fighting for the
-   limited CPU on the free Render instance.
+V20.1 changes cold playback to cache-first:
 
-## Keep existing Render settings
+1. resolve YouTube with the same V20 fast mweb + Deno path
+2. finish the ~1 second AAC media transfer into /tmp
+3. serve the browser the completed MP4 with Content-Length + byte ranges
 
-- `RESOLVER_SECRET`
-- Secret file: `youtube-cookies.txt`
+Prefetched and cached tracks are still immediate.
 
-No new secret is required.
-
-## Expected health
-
-- `service`: `veeb-youtube-resolver-v20`
-- `youtubeClient`: `mweb`
-- `jsRuntime`: `deno`
-- `playerSkip`: `["configs"]`
-- `poTokenHttpServerReady`: `true`
-- `streamTransport`: `format18-mweb-deno-fast-cold-cache-prefetch`
-
-## Logs to compare
-
-The key number is:
-
-`cold first media bytes ... totalColdElapsedSeconds`
-
-Compare that directly with V19's 48.42 seconds and the earlier mweb-only ~20-30 second
-starts. The `tv_downgraded` 12-second penalty should be completely gone.
+Keep the same Render secret and youtube-cookies.txt secret file.
+No new environment variables are required.

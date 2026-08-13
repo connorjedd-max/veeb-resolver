@@ -725,7 +725,7 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v20",
+        "service": "veeb-youtube-resolver-v20.1",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
@@ -743,7 +743,7 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "format18-mweb-deno-fast-cold-cache-prefetch",
+        "streamTransport": "format18-mweb-deno-cache-first-playback",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
@@ -801,47 +801,59 @@ async def stream_endpoint(
             status_code=200,
             headers={
                 "Content-Type": STREAM_CONTENT_TYPE,
-                "Accept-Ranges": "none",
+                "Accept-Ranges": "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v20-fast-cold",
+                "X-Veeb-Resolver": "yt-dlp-cache-first-v20.1",
                 "X-Veeb-Cache": "MISS",
             },
         )
 
-    # Foreground audio always wins over speculative warming. Render's free CPU
-    # is limited, so do not let an unrelated yt-dlp/EJS prefetch steal cycles
-    # from the track the user actually tapped.
+    # V20.1 reliability fix:
+    # On a cold miss, finish the ~1 second media transfer into Render's local
+    # cache before sending the browser its response. The browser then receives
+    # a normal seekable MP4 with Content-Length and proper Range semantics,
+    # rather than the first request being a chunked live fragmented-MP4 stream.
+    #
+    # The expensive YouTube extraction phase is unchanged, so this only adds
+    # roughly the media-transfer time on a truly cold track. Prefetched/cached
+    # tracks remain immediate.
     for other_id, other_task in list(_cache_tasks.items()):
         if other_id != video_id and not other_task.done():
             print(
-                "audio prefetch cancelled for live priority",
-                json.dumps({"videoId": other_id, "liveVideoId": video_id}),
+                "audio prefetch cancelled for foreground priority",
+                json.dumps({"videoId": other_id, "foregroundVideoId": video_id}),
                 flush=True,
             )
             other_task.cancel()
 
-    (
-        process,
-        stderr_task,
-        _,
-        first_chunk,
-        client,
-        _,
-    ) = await open_live_stream(video_id)
+    status, task = start_prefetch(video_id)
 
-    headers = {
-        "Content-Type": STREAM_CONTENT_TYPE,
-        "Cache-Control": "private, max-age=3600",
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-audio-v20-fast-cold",
-        "X-Veeb-Source-Format": SOURCE_FORMAT,
-        "X-Veeb-Cold-Client": client,
-        "X-Veeb-Cache": "MISS",
-        "Accept-Ranges": "none",
-    }
+    if task is not None:
+        print(
+            "audio cold cache build for playback",
+            json.dumps({"videoId": video_id, "status": status}),
+            flush=True,
+        )
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise HTTPException(status_code=503, detail="Playback preparation was cancelled")
+        except Exception as exc:
+            print(
+                "audio cold cache build error",
+                json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
+                flush=True,
+            )
 
-    return StreamingResponse(
-        live_stream_and_cache(process, first_chunk, video_id, client),
-        status_code=200,
-        headers=headers,
-        background=BackgroundTask(terminate_process, process, stderr_task),
+    if not cache_is_valid(video_id):
+        raise HTTPException(status_code=502, detail="Audio preparation completed without a playable cache file")
+
+    print(
+        "audio cold cache ready for playback",
+        json.dumps({
+            "videoId": video_id,
+            "bytes": cache_path(video_id).stat().st_size,
+        }),
+        flush=True,
     )
+    return await serve_cached(cache_path(video_id), request)
