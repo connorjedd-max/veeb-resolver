@@ -1,4 +1,6 @@
 import asyncio
+import http.cookiejar
+import urllib.request
 import os
 import re
 import time
@@ -7,6 +9,7 @@ import subprocess
 import shutil
 import importlib.metadata
 from typing import Any
+
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -208,6 +211,37 @@ def clamp_range_header(range_header: str | None) -> str | None:
     end = min(requested_end, max_end) if requested_end is not None else max_end
     return f"bytes={start}-{end}"
 
+def get_media_cookie_header(media_url: str) -> str:
+    cookie_path = "/tmp/veeb-youtube-cookies.txt"
+
+    if not os.path.isfile(cookie_path):
+        return ""
+
+    try:
+        jar = http.cookiejar.MozillaCookieJar(cookie_path)
+
+        jar.load(
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+
+        cookie_request = urllib.request.Request(media_url)
+
+        jar.add_cookie_header(cookie_request)
+
+        return cookie_request.get_header("Cookie") or ""
+
+    except Exception as exc:
+        print(
+            "media cookie load failed",
+            {
+                "error": str(exc),
+                "cookiePath": cookie_path,
+            },
+            flush=True,
+        )
+
+        return ""
 
 async def open_media_stream(
     info: dict[str, Any],
@@ -215,6 +249,20 @@ async def open_media_stream(
     method: str,
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
     upstream_headers = dict(info.get("http_headers") or {})
+        cookie_header = get_media_cookie_header(info["url"])
+
+    if cookie_header:
+        upstream_headers["Cookie"] = cookie_header
+
+    print(
+        "media auth",
+        {
+            "cookieHeaderPresent": bool(cookie_header),
+            "cookieHeaderLength": len(cookie_header),
+            "headerNames": sorted(upstream_headers.keys()),
+        },
+        flush=True,
+    )
     upstream_headers.setdefault("Accept", "*/*")
 
     safe_range = clamp_range_header(range_header)
