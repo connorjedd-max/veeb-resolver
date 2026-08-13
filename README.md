@@ -1,17 +1,37 @@
-# Veeb Render Resolver V20.1
+# Veeb Render Resolver V21
 
-Playback reliability hotfix on top of V20.
+V21 targets the interaction lag visible in the V20.1 logs.
 
-The V20 logs proved YouTube extraction and the AAC/MP4 pipeline were succeeding,
-but the browser could still reject the first cold, chunked fragmented-MP4 response.
+## What changed
 
-V20.1 changes cold playback to cache-first:
+- Foreground playback no longer waits for cancellation of unrelated speculative prefetch jobs.
+- A tapped cold track bypasses the speculative prefetch semaphore and starts immediately.
+- If the same track was only queued, it is promoted to foreground instead of waiting behind another track.
+- Foreground cold playback races the public `android` client against the known-good authenticated `mweb` client.
+- The race is parallel, not serial, so a failed Android attempt does not add a V19-style timeout penalty.
+- Android is useful as a fast lane because current yt-dlp marks it as not requiring the JS player.
+- A race candidate must produce 128 KiB before it can win, preventing a client from winning with only an ffmpeg MP4 header and then failing.
+- Completed audio is still served from the normal V20.1 seekable cache with Range support.
 
-1. resolve YouTube with the same V20 fast mweb + Deno path
-2. finish the ~1 second AAC media transfer into /tmp
-3. serve the browser the completed MP4 with Content-Length + byte ranges
+## Keep existing configuration
 
-Prefetched and cached tracks are still immediate.
+Keep the same `RESOLVER_SECRET` and Render Secret File `youtube-cookies.txt`.
+No new required environment variables.
 
-Keep the same Render secret and youtube-cookies.txt secret file.
-No new environment variables are required.
+Optional tuning:
+
+- `YOUTUBE_FAST_CLIENT=android`
+- `VEEB_FOREGROUND_READY_BYTES=131072`
+- `VEEB_PREFETCH_CONCURRENCY=1`
+
+## Healthy deployment
+
+`/health` should report:
+
+- `service`: `veeb-youtube-resolver-v21`
+- `foregroundFastClient`: `android`
+- `foregroundReliableClient`: `mweb`
+- `foregroundRace`: `true`
+- `streamTransport`: `foreground-race-android-vs-mweb-cache-first`
+
+The most useful log is `foreground race winner`. If Android works from the current Render egress, it should beat mweb without a JS-player challenge. If it does not work, mweb was already running in parallel and remains the fallback.

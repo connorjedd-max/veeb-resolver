@@ -44,8 +44,12 @@ CACHE_TTL_SECONDS = int(os.environ.get("VEEB_AUDIO_CACHE_TTL", str(6 * 60 * 60))
 CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
 PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "1")))
 FILE_CHUNK_BYTES = 256 * 1024
+FOREGROUND_READY_BYTES = max(64 * 1024, int(os.environ.get("VEEB_FOREGROUND_READY_BYTES", str(128 * 1024))))
+FOREGROUND_FAST_CLIENT = os.environ.get("YOUTUBE_FAST_CLIENT", "android").strip() or "android"
 
 _cache_tasks: dict[str, asyncio.Task] = {}
+_prefetch_started: set[str] = set()
+_foreground_tasks: dict[str, asyncio.Task] = {}
 _prefetch_semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
 
@@ -163,9 +167,16 @@ def cleanup_cache() -> None:
             pass
 
 
+def client_uses_cookies(client: str) -> bool:
+    # Current yt-dlp client metadata marks mweb/web/tv families as cookie-capable.
+    # Android is intentionally run as a public fast lane so it can avoid the
+    # logged-in mweb JS-player path.
+    return client not in {"android", "android_vr", "ios", "visionos"}
+
+
 def build_pipeline(video_id: str, client: str) -> str:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    cookie_file = get_writable_cookie_file()
+    cookie_file = get_writable_cookie_file() if client_uses_cookies(client) else None
 
     ytdlp = [
         "yt-dlp",
@@ -337,6 +348,148 @@ async def read_first_chunk(process: asyncio.subprocess.Process, timeout_seconds:
     return await process.stdout.read(64 * 1024)
 
 
+async def read_until_ready(
+    process: asyncio.subprocess.Process,
+    minimum_bytes: int,
+) -> bytes:
+    """Buffer enough output to prove the candidate is carrying real media.
+
+    ffmpeg can emit a tiny fragmented-MP4 header before yt-dlp has actually
+    downloaded playable media. Waiting for a larger threshold prevents the
+    foreground race from choosing a client that only emitted an MP4 header and
+    then failed with a media-origin error.
+    """
+    assert process.stdout is not None
+    data = bytearray()
+
+    while len(data) < minimum_bytes:
+        chunk = await process.stdout.read(min(64 * 1024, minimum_bytes - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+
+    return bytes(data)
+
+
+async def open_foreground_race(video_id: str):
+    """Race a JS-free public client against the known-good mweb path.
+
+    This is foreground-only. The key point is that mweb starts at the same time,
+    so a failed or slow Android attempt cannot add a serial penalty like V19 did.
+    """
+    clients = []
+    for client in (FOREGROUND_FAST_CLIENT, PRIMARY_CLIENT):
+        if client and client not in clients:
+            clients.append(client)
+
+    started_total = time.monotonic()
+    candidates = []
+
+    for index, client in enumerate(clients, start=1):
+        process, stderr_task, stderr_tail, attempt_started = await start_attempt(
+            video_id,
+            "live-race",
+            client,
+            index,
+        )
+        read_task = asyncio.create_task(
+            read_until_ready(process, FOREGROUND_READY_BYTES)
+        )
+        candidates.append({
+            "client": client,
+            "process": process,
+            "stderrTask": stderr_task,
+            "stderrTail": stderr_tail,
+            "attemptStarted": attempt_started,
+            "readTask": read_task,
+        })
+
+    pending = {item["readTask"] for item in candidates}
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in done:
+                candidate = next(item for item in candidates if item["readTask"] is task)
+                client = candidate["client"]
+
+                try:
+                    buffered = task.result()
+                except Exception as exc:
+                    buffered = b""
+                    print(
+                        "foreground race candidate read error",
+                        json.dumps({
+                            "videoId": video_id,
+                            "client": client,
+                            "error": str(exc)[:800],
+                        }),
+                        flush=True,
+                    )
+
+                if len(buffered) >= FOREGROUND_READY_BYTES:
+                    print(
+                        "foreground race winner",
+                        json.dumps({
+                            "videoId": video_id,
+                            "client": client,
+                            "bufferedBytes": len(buffered),
+                            "elapsedSeconds": round(time.monotonic() - started_total, 2),
+                        }),
+                        flush=True,
+                    )
+
+                    for other in candidates:
+                        if other is candidate:
+                            continue
+                        if not other["readTask"].done():
+                            other["readTask"].cancel()
+                        # Do not wait for loser teardown before letting the winner
+                        # continue. Cleanup happens independently.
+                        asyncio.create_task(
+                            terminate_process(other["process"], other["stderrTask"])
+                        )
+
+                    return (
+                        candidate["process"],
+                        candidate["stderrTask"],
+                        candidate["stderrTail"],
+                        buffered,
+                        client,
+                        started_total,
+                    )
+
+                print(
+                    "foreground race candidate failed",
+                    json.dumps({
+                        "videoId": video_id,
+                        "client": client,
+                        "bufferedBytes": len(buffered),
+                        "returnCode": candidate["process"].returncode,
+                        "elapsedSeconds": round(time.monotonic() - candidate["attemptStarted"], 2),
+                        "stderrTail": candidate["stderrTail"][-12:],
+                    }),
+                    flush=True,
+                )
+                asyncio.create_task(
+                    terminate_process(candidate["process"], candidate["stderrTask"])
+                )
+
+        raise HTTPException(status_code=502, detail="No foreground YouTube client produced playable media")
+    except asyncio.CancelledError:
+        for candidate in candidates:
+            if not candidate["readTask"].done():
+                candidate["readTask"].cancel()
+            asyncio.create_task(
+                terminate_process(candidate["process"], candidate["stderrTask"])
+            )
+        raise
+
+
 async def open_stream_with_fallback(video_id: str, purpose: str):
     plans = client_plan()
     last_tail: list[str] = []
@@ -450,7 +603,9 @@ async def build_cache(video_id: str) -> bool:
     started = time.monotonic()
 
     async with _prefetch_semaphore:
+        _prefetch_started.add(video_id)
         if cache_is_valid(video_id):
+            _prefetch_started.discard(video_id)
             return True
 
         process = None
@@ -512,6 +667,102 @@ async def build_cache(video_id: str) -> bool:
                     pass
             if process is not None:
                 await terminate_process(process, stderr_task)
+            _prefetch_started.discard(video_id)
+
+
+async def build_cache_foreground(video_id: str) -> bool:
+    """Build a cold playback cache immediately, bypassing speculative queueing."""
+    if cache_is_valid(video_id):
+        return True
+
+    ensure_cache_dir()
+    final_path = cache_path(video_id)
+    temp_path = CACHE_DIR / f".{video_id}.{uuid.uuid4().hex}.live.part"
+    started = time.monotonic()
+    process = None
+    stderr_task = None
+    total = 0
+    success = False
+    client = None
+    stderr_tail: list[str] = []
+
+    try:
+        (
+            process,
+            stderr_task,
+            stderr_tail,
+            first_chunk,
+            client,
+            _,
+        ) = await open_foreground_race(video_id)
+
+        assert process.stdout is not None
+        with open(temp_path, "wb") as handle:
+            handle.write(first_chunk)
+            total += len(first_chunk)
+
+            while True:
+                chunk = await process.stdout.read(FILE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                total += len(chunk)
+
+        await process.wait()
+
+        if process.returncode == 0 and total >= 1024:
+            os.replace(temp_path, final_path)
+            success = True
+            cleanup_cache()
+
+        print(
+            "foreground cache build finished",
+            json.dumps({
+                "videoId": video_id,
+                "ok": success,
+                "client": client,
+                "bytes": total,
+                "elapsedSeconds": round(time.monotonic() - started, 2),
+                "returnCode": process.returncode,
+                "stderrTail": [] if success else stderr_tail[-20:],
+            }),
+            flush=True,
+        )
+        return success
+    finally:
+        if not success:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        if process is not None:
+            await terminate_process(process, stderr_task)
+
+
+def _foreground_task_finished(video_id: str, task: asyncio.Task) -> None:
+    current = _foreground_tasks.get(video_id)
+    if current is task:
+        _foreground_tasks.pop(video_id, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print(
+            "foreground cache task error",
+            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
+            flush=True,
+        )
+
+
+def start_foreground_build(video_id: str) -> asyncio.Task:
+    existing = _foreground_tasks.get(video_id)
+    if existing and not existing.done():
+        return existing
+    task = asyncio.create_task(build_cache_foreground(video_id))
+    _foreground_tasks[video_id] = task
+    task.add_done_callback(lambda done: _foreground_task_finished(video_id, done))
+    return task
 
 
 def _task_finished(video_id: str, task: asyncio.Task) -> None:
@@ -610,7 +861,7 @@ def cached_headers(path: Path) -> dict[str, str]:
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
         "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
-        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v20",
+        "X-Veeb-Resolver": "yt-dlp-ffmpeg-cache-v21",
         "X-Veeb-Cache": "HIT",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
     }
@@ -725,11 +976,15 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v20.1",
+        "service": "veeb-youtube-resolver-v21",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClients": client_plan(),
         "youtubeClient": PRIMARY_CLIENT,
         "jsRuntime": JSC_RUNTIME,
+        "foregroundFastClient": FOREGROUND_FAST_CLIENT,
+        "foregroundReliableClient": PRIMARY_CLIENT,
+        "foregroundReadyBytes": FOREGROUND_READY_BYTES,
+        "foregroundRace": True,
         "playerSkip": ["configs"],
         "streamStartTimeoutSeconds": STREAM_START_TIMEOUT_SECONDS,
         "premiumAccountMode": YOUTUBE_PREMIUM_ACCOUNT,
@@ -743,7 +998,7 @@ async def health() -> dict[str, Any]:
         "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "sourceFormat": SOURCE_FORMAT,
         "streamContentType": STREAM_CONTENT_TYPE,
-        "streamTransport": "format18-mweb-deno-cache-first-playback",
+        "streamTransport": "foreground-race-android-vs-mweb-cache-first",
         "audioCodec": "aac-copy",
         "cacheDir": str(CACHE_DIR),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
@@ -785,16 +1040,23 @@ async def stream_endpoint(
         return await serve_cached(cache_path(video_id), request)
 
     active = _cache_tasks.get(video_id)
-    if active and not active.done():
-        print("audio waiting for prefetch", json.dumps({"videoId": video_id}), flush=True)
+    if active and not active.done() and video_id in _prefetch_started:
+        # This exact track is already genuinely running, so reuse the work.
+        print("audio reusing active prefetch", json.dumps({"videoId": video_id}), flush=True)
         try:
             await active
         except Exception:
             pass
 
         if cache_is_valid(video_id):
-            print("audio cache hit after prefetch", json.dumps({"videoId": video_id}), flush=True)
+            print("audio cache hit after active prefetch", json.dumps({"videoId": video_id}), flush=True)
             return await serve_cached(cache_path(video_id), request)
+
+    elif active and not active.done():
+        # The task exists but is only queued behind another speculative job.
+        # Canceling it is cheap because no yt-dlp subprocess has started yet.
+        print("audio promoting queued prefetch to foreground", json.dumps({"videoId": video_id}), flush=True)
+        active.cancel()
 
     if request.method == "HEAD":
         return Response(
@@ -803,47 +1065,36 @@ async def stream_endpoint(
                 "Content-Type": STREAM_CONTENT_TYPE,
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-cache-first-v20.1",
+                "X-Veeb-Resolver": "yt-dlp-cache-first-v21",
                 "X-Veeb-Cache": "MISS",
             },
         )
 
-    # V20.1 reliability fix:
-    # On a cold miss, finish the ~1 second media transfer into Render's local
-    # cache before sending the browser its response. The browser then receives
-    # a normal seekable MP4 with Content-Length and proper Range semantics,
-    # rather than the first request being a chunked live fragmented-MP4 stream.
-    #
-    # The expensive YouTube extraction phase is unchanged, so this only adds
-    # roughly the media-transfer time on a truly cold track. Prefetched/cached
-    # tracks remain immediate.
-    for other_id, other_task in list(_cache_tasks.items()):
-        if other_id != video_id and not other_task.done():
-            print(
-                "audio prefetch cancelled for foreground priority",
-                json.dumps({"videoId": other_id, "foregroundVideoId": video_id}),
-                flush=True,
-            )
-            other_task.cancel()
+    # Never cancel a different running prefetch on a tap. V20.1 proved that
+    # subprocess cancellation can take several seconds and delay the selected
+    # track. Foreground playback now starts immediately and bypasses the
+    # speculative semaphore.
+    task = start_foreground_build(video_id)
+    print(
+        "audio foreground build started",
+        json.dumps({
+            "videoId": video_id,
+            "runningSpeculativePrefetches": sorted(_prefetch_started),
+            "raceClients": [FOREGROUND_FAST_CLIENT, PRIMARY_CLIENT],
+        }),
+        flush=True,
+    )
 
-    status, task = start_prefetch(video_id)
-
-    if task is not None:
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=503, detail="Playback preparation was cancelled")
+    except Exception as exc:
         print(
-            "audio cold cache build for playback",
-            json.dumps({"videoId": video_id, "status": status}),
+            "audio foreground build error",
+            json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
             flush=True,
         )
-        try:
-            await task
-        except asyncio.CancelledError:
-            raise HTTPException(status_code=503, detail="Playback preparation was cancelled")
-        except Exception as exc:
-            print(
-                "audio cold cache build error",
-                json.dumps({"videoId": video_id, "error": str(exc)[:1200]}),
-                flush=True,
-            )
 
     if not cache_is_valid(video_id):
         raise HTTPException(status_code=502, detail="Audio preparation completed without a playable cache file")
