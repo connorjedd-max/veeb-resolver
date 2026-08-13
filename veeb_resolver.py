@@ -20,6 +20,7 @@ RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE_TTL_SECONDS = int(os.environ.get("RESOLVER_CACHE_TTL", "600"))
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
+MAX_UPSTREAM_CHUNK_BYTES = int(os.environ.get("MAX_UPSTREAM_CHUNK_BYTES", str(8 * 1024 * 1024)))
 
 # Cache only yt-dlp's resolved media metadata. The media itself is never stored.
 _resolve_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -108,6 +109,19 @@ def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
     if not isinstance(headers, dict):
         headers = {}
 
+    print(
+        "yt-dlp resolved",
+        json.dumps({
+            "videoId": video_id,
+            "title": info.get("title"),
+            "formatId": info.get("format_id"),
+            "ext": info.get("ext"),
+            "acodec": info.get("acodec"),
+            "duration": info.get("duration"),
+        }),
+        flush=True,
+    )
+
     return {
         "id": video_id,
         "title": info.get("title"),
@@ -155,6 +169,22 @@ async def close_upstream(client: httpx.AsyncClient, response: httpx.Response) ->
         await client.aclose()
 
 
+def clamp_range_header(range_header: str | None) -> str | None:
+    if not range_header:
+        return f"bytes=0-{MAX_UPSTREAM_CHUNK_BYTES - 1}"
+
+    match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header.strip())
+    if not match:
+        return range_header
+
+    start = int(match.group(1))
+    raw_end = match.group(2)
+    requested_end = int(raw_end) if raw_end else None
+    max_end = start + MAX_UPSTREAM_CHUNK_BYTES - 1
+    end = min(requested_end, max_end) if requested_end is not None else max_end
+    return f"bytes={start}-{end}"
+
+
 async def open_media_stream(
     info: dict[str, Any],
     range_header: str | None,
@@ -162,8 +192,23 @@ async def open_media_stream(
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
     upstream_headers = dict(info.get("http_headers") or {})
     upstream_headers.setdefault("Accept", "*/*")
-    if range_header:
-        upstream_headers["Range"] = range_header
+
+    safe_range = clamp_range_header(range_header)
+    if safe_range:
+        upstream_headers["Range"] = safe_range
+
+    print(
+        "media fetch",
+        json.dumps({
+            "videoId": info.get("id"),
+            "method": method,
+            "browserRange": range_header,
+            "upstreamRange": safe_range,
+            "formatId": info.get("format_id"),
+            "ext": info.get("ext"),
+        }),
+        flush=True,
+    )
 
     client = httpx.AsyncClient(
         follow_redirects=True,
@@ -172,6 +217,19 @@ async def open_media_stream(
 
     request = client.build_request(method, info["url"], headers=upstream_headers)
     response = await client.send(request, stream=True)
+
+    print(
+        "media upstream",
+        json.dumps({
+            "videoId": info.get("id"),
+            "status": response.status_code,
+            "contentType": response.headers.get("content-type"),
+            "contentLength": response.headers.get("content-length"),
+            "contentRange": response.headers.get("content-range"),
+        }),
+        flush=True,
+    )
+
     return client, response
 
 
@@ -184,7 +242,7 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v8",
+        "service": "veeb-youtube-resolver-v9",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClient": "mweb",
         "poTokenProvider": "bgutil",
@@ -193,6 +251,7 @@ async def health() -> dict[str, Any]:
         "cookieFileConfigured": bool(YOUTUBE_COOKIE_FILE),
         "cookieFilePresent": os.path.isfile(YOUTUBE_COOKIE_FILE),
         "cookieFilePath": YOUTUBE_COOKIE_FILE,
+        "maxUpstreamChunkBytes": MAX_UPSTREAM_CHUNK_BYTES,
     }
 
 
