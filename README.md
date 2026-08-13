@@ -1,41 +1,35 @@
-# Veeb Render Resolver V15
+# Veeb Render Resolver V16
 
-V15 is based on what the logs proved:
+V16 removes the failed format-251 attempt entirely.
 
-- Format 251 (Opus/WebM audio-only) is consistently returning HTTP 403 from YouTube's media server.
-- V12 successfully pushed 6.3 MB through the full pipeline on at least one request.
-- V12 was allowed to fall back to format 18 (MP4), so V15 reproduces that behavior deliberately.
+The logs proved format 18 is the working path on this Render setup, so V16 goes
+straight to format 18 and avoids wasting ~20-25 seconds trying format 251 first.
 
-## Strategy
+## Playback path
 
-1. Try format 251 first.
-2. If yt-dlp produces no bytes / returns 403, retry the same video with format 18.
-3. Stream whichever format actually produces bytes.
+Veeb -> Cloudflare Worker -> Render -> yt-dlp format 18 -> stdout -> Veeb
 
-This keeps the working bgutil HTTP PO-token server and cookie setup.
+## Keep existing Render settings
 
-## Existing Render settings to keep
+- `RESOLVER_SECRET`
+- Secret file: `youtube-cookies.txt`
 
-- RESOLVER_SECRET
-- Secret file: youtube-cookies.txt
+No Cloudflare changes are required.
 
-No Cloudflare changes required.
+## Expected /health
 
-## Expected health
+- `service`: `veeb-youtube-resolver-v16`
+- `poTokenHttpServerReady`: true
+- `streamFormat`: `18`
+- `streamTransport`: `yt-dlp-stdout-direct-format18`
+- `streamStartTimeoutSeconds`: 0
 
-- service: veeb-youtube-resolver-v15
-- poTokenHttpServerReady: true
-- primaryFormat: 251
-- fallbackFormat: 18
+## Expected successful logs
 
-## Success logs
+- `yt-dlp stream start ... "format":"18"`
+- `Generating POT ...`
+- `yt-dlp first media bytes ... "format":"18","bytes":<non-zero>`
+- `GET /stream/<id> 200 OK`
+- `yt-dlp stream body finished ... "bytesSent":<non-zero>`
 
-You may see:
-
-yt-dlp format failed ... "format":"251" ... 403
-yt-dlp stream attempt ... "format":"18"
-yt-dlp first audio bytes ... "format":"18","bytes":<non-zero>
-GET /stream/<id> 200
-yt-dlp stream body finished ... "bytesSent":<non-zero>
-
-Format 18 is muxed MP4, but Veeb still never shows the YouTube video UI. This is a playback compatibility fallback.
+Seeking remains disabled until playback startup and track transitions are stable.
