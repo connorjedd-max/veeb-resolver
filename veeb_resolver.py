@@ -4,6 +4,7 @@ import re
 import time
 import json
 import subprocess
+import shutil
 import importlib.metadata
 from typing import Any
 
@@ -20,6 +21,7 @@ RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE_TTL_SECONDS = int(os.environ.get("RESOLVER_CACHE_TTL", "600"))
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
+WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
 MAX_UPSTREAM_CHUNK_BYTES = int(os.environ.get("MAX_UPSTREAM_CHUNK_BYTES", str(8 * 1024 * 1024)))
 
 # Cache only yt-dlp's resolved media metadata. The media itself is never stored.
@@ -41,13 +43,35 @@ def validate_video_id(video_id: str) -> str:
     return video_id
 
 
+def get_writable_cookie_file() -> str | None:
+    # Render mounts Secret Files under /etc/secrets as read-only. yt-dlp reads
+    # cookies and then saves its cookie jar on exit, so passing the mounted file
+    # directly causes Errno 30. Copy it once to /tmp and let yt-dlp update that
+    # private, writable runtime copy for the lifetime of this resolver process.
+    if not os.path.isfile(YOUTUBE_COOKIE_FILE):
+        return None
+
+    if not os.path.isfile(WRITABLE_COOKIE_FILE):
+        shutil.copyfile(YOUTUBE_COOKIE_FILE, WRITABLE_COOKIE_FILE)
+        os.chmod(WRITABLE_COOKIE_FILE, 0o600)
+        print(
+            "cookie runtime copy ready",
+            json.dumps({
+                "source": YOUTUBE_COOKIE_FILE,
+                "runtime": WRITABLE_COOKIE_FILE,
+            }),
+            flush=True,
+        )
+
+    return WRITABLE_COOKIE_FILE
+
+
 def extract_with_ytdlp(video_id: str) -> dict[str, Any]:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Veeb V8 keeps V7's mweb + bgutil PO-token setup and, when present,
-    # supplies a dedicated YouTube cookies.txt secret file to yt-dlp. The file
-    # is expected to be mounted at runtime by Render and is never committed.
-    cookie_file = YOUTUBE_COOKIE_FILE if os.path.isfile(YOUTUBE_COOKIE_FILE) else None
+    # V10 keeps the V9 mweb + bgutil + chunked relay setup, but passes yt-dlp
+    # a writable /tmp copy of Render's read-only Secret File.
+    cookie_file = get_writable_cookie_file()
     cmd = [
         "yt-dlp",
         "--dump-single-json",
@@ -242,7 +266,7 @@ async def health() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "service": "veeb-youtube-resolver-v9",
+        "service": "veeb-youtube-resolver-v10",
         "secretConfigured": bool(RESOLVER_SECRET),
         "youtubeClient": "mweb",
         "poTokenProvider": "bgutil",
@@ -251,6 +275,8 @@ async def health() -> dict[str, Any]:
         "cookieFileConfigured": bool(YOUTUBE_COOKIE_FILE),
         "cookieFilePresent": os.path.isfile(YOUTUBE_COOKIE_FILE),
         "cookieFilePath": YOUTUBE_COOKIE_FILE,
+        "writableCookieFilePath": WRITABLE_COOKIE_FILE,
+        "writableCookieFilePresent": os.path.isfile(WRITABLE_COOKIE_FILE),
         "maxUpstreamChunkBytes": MAX_UPSTREAM_CHUNK_BYTES,
     }
 

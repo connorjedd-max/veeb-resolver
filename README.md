@@ -1,15 +1,15 @@
-# Veeb Render Resolver V9
+# Veeb Render Resolver V10
 
-V9 is a drop-in replacement for V7. Veeb, the Cloudflare Worker, the Render URL, and `RESOLVER_SECRET` all stay unchanged.
+V10 is a drop-in replacement for V7. Veeb, the Cloudflare Worker, the Render URL, and `RESOLVER_SECRET` all stay unchanged.
 
-V9 keeps:
+V10 keeps:
 - yt-dlp
 - Node 22 / EJS
 - `mweb` YouTube client
 - `bgutil-ytdlp-pot-provider` 1.3.1
 - the local bgutil provider script
 
-V9 adds support for one runtime-only YouTube cookie file:
+V10 adds support for one runtime-only YouTube cookie file:
 
 `/etc/secrets/youtube-cookies.txt`
 
@@ -28,7 +28,7 @@ In the existing Render service, add a Secret File with:
 - Filename: `youtube-cookies.txt`
 - Contents: your Netscape-format YouTube cookies export
 
-Render mounts secret files under `/etc/secrets/`, so V9 will read:
+Render mounts secret files under `/etc/secrets/`, so V10 will read:
 
 `/etc/secrets/youtube-cookies.txt`
 
@@ -56,7 +56,7 @@ Expected key values:
 ```json
 {
   "ok": true,
-  "service": "veeb-youtube-resolver-v9",
+  "service": "veeb-youtube-resolver-v10",
   "secretConfigured": true,
   "youtubeClient": "mweb",
   "poTokenProvider": "bgutil",
@@ -75,5 +75,10 @@ If `cookieFilePresent` is false, Render has not mounted the secret file under th
 Use a dedicated YouTube/Google account for this resolver, not your primary account. Treat `youtube-cookies.txt` like a password. Anyone with a valid session cookie file may be able to act as that account until the session is revoked or expires.
 
 
-## V9 playback change
-V9 caps each Google media request to 8 MiB even when the browser sends an open-ended Range such as `bytes=0-`. yt-dlp documents that YouTube throttles requests with an HTTP chunk size above 10 MiB. The browser can request the next range normally. V9 also logs `yt-dlp resolved`, `media fetch`, and `media upstream` lines so silent playback stalls can be diagnosed.
+## V10 playback change
+V10 caps each Google media request to 8 MiB even when the browser sends an open-ended Range such as `bytes=0-`. yt-dlp documents that YouTube throttles requests with an HTTP chunk size above 10 MiB. The browser can request the next range normally. V10 also logs `yt-dlp resolved`, `media fetch`, and `media upstream` lines so silent playback stalls can be diagnosed.
+
+
+## V10 fix: Render Secret Files are read-only
+
+Render mounts `/etc/secrets/youtube-cookies.txt` read-only. yt-dlp saves its cookie jar on exit, so V9 could resolve far enough to reach cookie handling and then fail with `OSError: [Errno 30] Read-only file system`. V10 copies the secret file once per resolver process to `/tmp/veeb-youtube-cookies.txt`, chmods it to `0600`, and passes that writable runtime copy to yt-dlp. The original Render secret file remains untouched.
