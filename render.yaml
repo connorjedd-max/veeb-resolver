@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: veeb-resolver
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: RESOLVER_SECRET
+        sync: false
+      - key: RESOLVER_CACHE_TTL
+        value: "600"
+      - key: TOKEN_TTL
+        value: "6"
