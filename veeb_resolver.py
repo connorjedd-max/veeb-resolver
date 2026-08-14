@@ -686,65 +686,138 @@ async def warm_session_gvs_pot() -> None:
 
 
 async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
-    """Fast mweb resolver: PLAYER POT(video) + cached GVS POT(session) + /player + probe."""
+    """Adaptive mweb resolver for current WebPO binding experiments.
+
+    Current yt-dlp can observe GVS proofs bound either to authenticated session
+    Data Sync state or, under rollout experiments, directly to the video ID.
+    Do not hard-code one interpretation. Generate both proof candidates, race
+    small authenticated /player requests, then probe the signed media URL with
+    both GVS proof candidates. First verified media wins.
+    """
     global _visitor_data
     started = time.monotonic()
     context = mweb_context()
 
-    # The authenticated GVS proof is session/Data-Sync bound and reusable.
-    # Generate it in parallel with the per-video PLAYER proof if startup warming
-    # has not completed yet.
-    gvs_task = asyncio.create_task(get_session_gvs_pot())
-    player_task = asyncio.create_task(get_bgutil_pot(video_id, context, "player-video"))
+    session_task = asyncio.create_task(get_session_gvs_pot())
+    video_task = asyncio.create_task(get_bgutil_pot(video_id, context, "gvs-video-candidate"))
     try:
-        (gvs_pot, _data_sync_binding), (player_pot, player_binding, _player_expiry) = await asyncio.gather(gvs_task, player_task)
+        (session_pot, _data_sync_binding), (video_pot, video_binding, _video_expiry) = await asyncio.gather(
+            session_task, video_task
+        )
     except Exception:
-        for task in (gvs_task, player_task):
+        for task in (session_task, video_task):
             if not task.done():
                 task.cancel()
         raise
-    if player_binding and player_binding != video_id:
-        raise RuntimeError("bgutil returned an unexpected PLAYER content binding")
+    if video_binding and video_binding != video_id:
+        raise RuntimeError("bgutil returned an unexpected video-bound content binding")
 
-    payload: dict[str, Any] = {
-        "context": context,
-        "videoId": video_id,
-        "contentCheckOk": True,
-        "racyCheckOk": True,
-        # PLAYER WebPO is video-bound. GVS WebPO is not sent here.
-        "serviceIntegrityDimensions": {"poToken": player_pot},
-        "playbackContext": {
-            "contentPlaybackContext": {
-                "html5Preference": "HTML5_PREF_WANTS",
-                "lactMilliseconds": "-1",
-            }
-        },
-    }
     client = get_http_client()
-    player_started = time.monotonic()
-    response = await client.post(
-        INNERTUBE_PLAYER_URL,
-        params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
-        headers=mweb_headers(),
-        json=payload,
-        timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"mweb /player returned HTTP {response.status_code}")
-    data = response.json()
-    visitor = ((data.get("responseContext") or {}).get("visitorData"))
-    if isinstance(visitor, str) and visitor:
-        _visitor_data = visitor
-    fmt = select_direct_format(data)
-    if not fmt:
-        raise RuntimeError("mweb /player returned no usable signed format: " + (playability_error(data) or "unknown"))
 
-    # GVS WebPO is attached to the actual googlevideo request. For an
-    # authenticated web client yt-dlp binds this proof to Data Sync ID.
-    media_url = append_query_param(str(fmt["url"]), "pot", gvs_pot)
+    async def call_player(label: str, include_video_proof: bool) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "context": context,
+            "videoId": video_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS",
+                    "lactMilliseconds": "-1",
+                }
+            },
+        }
+        # mweb currently requires GVS proof. A PLAYER proof is not universally
+        # required, but during YouTube experiments a video-bound proof can be
+        # relevant to the player transaction. Race both forms instead of
+        # forcing one global interpretation.
+        if include_video_proof:
+            payload["serviceIntegrityDimensions"] = {"poToken": video_pot}
+        player_started = time.monotonic()
+        response = await client.post(
+            INNERTUBE_PLAYER_URL,
+            params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
+            headers=mweb_headers(),
+            json=payload,
+            timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"{label} mweb /player returned HTTP {response.status_code}")
+        data = response.json()
+        visitor = ((data.get("responseContext") or {}).get("visitorData"))
+        if isinstance(visitor, str) and visitor:
+            _visitor_data = visitor
+        fmt = select_direct_format(data)
+        if not fmt:
+            raise RuntimeError(f"{label} mweb /player returned no usable signed format: " + (playability_error(data) or "unknown"))
+        print("v36.2 mweb player candidate ready", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "candidate": label,
+            "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+            "elapsedSeconds": round(time.monotonic() - player_started, 3),
+        }), flush=True)
+        return label, data, fmt
+
+    player_tasks = {
+        asyncio.create_task(call_player("plain", False)),
+        asyncio.create_task(call_player("video-proof", True)),
+    }
+    player_errors: list[str] = []
+    player_result: tuple[str, dict[str, Any], dict[str, Any]] | None = None
+    try:
+        for done in asyncio.as_completed(player_tasks):
+            try:
+                player_result = await done
+                break
+            except Exception as exc:
+                player_errors.append(str(exc))
+    finally:
+        if player_result is not None:
+            for task in player_tasks:
+                if not task.done():
+                    task.cancel()
+    if player_result is None:
+        raise RuntimeError("adaptive mweb /player failed: " + " || ".join(player_errors)[-1800:])
+
+    player_label, data, fmt = player_result
+    raw_url = str(fmt["url"])
     user_agent = str(MWEB_DIRECT_CONFIG["userAgent"])
-    probe_started = time.monotonic()
-    await probe_direct_media(media_url, user_agent)
+
+    async def probe_candidate(label: str, token: str) -> tuple[str, str]:
+        candidate_url = append_query_param(raw_url, "pot", token)
+        probe_started = time.monotonic()
+        await probe_direct_media(candidate_url, user_agent)
+        print("v36.2 GVS proof candidate verified", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "binding": label,
+            "probeSeconds": round(time.monotonic() - probe_started, 3),
+        }), flush=True)
+        return label, candidate_url
+
+    probe_tasks = {
+        asyncio.create_task(probe_candidate("video", video_pot)),
+        asyncio.create_task(probe_candidate("session", session_pot)),
+    }
+    probe_errors: list[str] = []
+    media_url: str | None = None
+    winning_binding = ""
+    try:
+        for done in asyncio.as_completed(probe_tasks):
+            try:
+                winning_binding, media_url = await done
+                break
+            except Exception as exc:
+                probe_errors.append(str(exc))
+    finally:
+        if media_url:
+            for task in probe_tasks:
+                if not task.done():
+                    task.cancel()
+    if not media_url:
+        raise RuntimeError("adaptive GVS proof probes failed: " + " || ".join(probe_errors)[-1800:])
+
     mime = str(fmt.get("mimeType") or "")
     mime_base = mime.split(";", 1)[0].strip() or None
     details = data.get("videoDetails") or {}
@@ -763,14 +836,14 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         title=str(details.get("title")) if details.get("title") is not None else None,
         resolved_at=time.time(),
         expires_at=resolved_expiry(media_url),
-        resolver_path="mweb-session-gvs-direct-v36.1",
+        resolver_path="mweb-adaptive-gvs-direct-v36.2",
     )
-    print("v36.1 direct mweb resolve success", json.dumps({
+    print("v36.2 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "purpose": purpose,
+        "playerCandidate": player_label,
+        "gvsBinding": winning_binding,
         "formatId": media.format_id,
-        "playerSeconds": round(time.monotonic() - player_started, 3),
-        "probeSeconds": round(time.monotonic() - probe_started, 3),
         "elapsedSeconds": round(time.monotonic() - started, 3),
     }), flush=True)
     return media
@@ -1214,12 +1287,18 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
     if task and not task.done():
         existing_purpose = _resolve_task_purpose.get(video_id, "")
         if purpose == "live" and existing_purpose == "prefetch":
-            print("foreground bypassing speculative resolve", json.dumps({
+            print("foreground promoting speculative resolve to single-flight", json.dumps({
                 "videoId": video_id
             }), flush=True)
             async def foreground_runner() -> ResolvedMedia:
                 return await resolve_media_uncached(video_id, "live")
             foreground = asyncio.create_task(foreground_runner())
+            # Replace the speculative registry entry immediately. Any duplicate
+            # browser GET/Range request for this same track now joins this exact
+            # foreground task instead of starting a second expensive resolve.
+            _resolve_tasks[video_id] = foreground
+            _resolve_task_purpose[video_id] = "live"
+            foreground.add_done_callback(lambda done: resolve_task_finished(video_id, done))
             return await asyncio.shield(foreground), "MISS-FOREGROUND"
         return await asyncio.shield(task), "WAIT"
     task = start_resolve_task(video_id, purpose)
@@ -1246,7 +1325,7 @@ def build_downstream_headers(upstream: httpx.Response, media: ResolvedMedia, cac
     headers.setdefault("Content-Type", media.content_type or "video/mp4")
     headers.setdefault("Accept-Ranges", "bytes")
     headers["Cache-Control"] = "private, no-store"
-    headers["X-Veeb-Resolver"] = "session-pot-v36.1"
+    headers["X-Veeb-Resolver"] = "adaptive-pot-v36.2"
     headers["X-Veeb-Resolved-Cache"] = cache_state
     headers["X-Veeb-Playback-Client"] = media.client
     headers["X-Veeb-Source-Format"] = media.format_id or SOURCE_FORMAT
@@ -1287,7 +1366,7 @@ async def proxy_media(request: Request, video_id: str):
             "client": media.client,
             "resolverPath": rejected_path,
         }), flush=True)
-        if rejected_path in {"innertube-direct", "mweb-bgutil-direct-v36", "mweb-session-gvs-direct-v36.1"}:
+        if rejected_path in {"innertube-direct", "mweb-bgutil-direct-v36", "mweb-adaptive-gvs-direct-v36.2"}:
             media = await resolve_ytdlp_foreground_v35(video_id, "live-gvs-fallback")
             _resolved_cache[video_id] = media
         else:
@@ -1350,7 +1429,7 @@ async def shutdown_http_client() -> None:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.1-session-pot"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v36.2-adaptive-pot"}
 
 
 @app.get("/health")
@@ -1364,7 +1443,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.1-session-pot",
+        "version": "v36.2-adaptive-pot",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -1384,7 +1463,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             if until > time.time()
         },
         "heavyPrefetch": HEAVY_PREFETCH,
-        "architecture": "v36.1-player-pot-plus-session-gvs-direct-with-ytdlp-safety-fallback",
+        "architecture": "v36.2-adaptive-gvs-binding-plus-single-flight-with-ytdlp-safety-fallback",
     }
 
 
@@ -1394,7 +1473,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.1-session-pot-resolver",
+        "provider": "veeb-v36.2-adaptive-pot-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
