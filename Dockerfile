@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 RUN git clone --depth 1 --branch 1.3.1 \
       https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
-    && sed -i 's/host: "::"/host: "127.0.0.1"/g; s/host: "0.0.0.0"/host: "127.0.0.1"/g' /opt/bgutil/server/src/main.ts \
+    && sed -i 's/host: "::"/host: "127.0.0.1"/g; s/host: "0.0.0.0"/host: "127.0.0.1"/g; s/address \[::\]/address 127.0.0.1/g; s/on \[::\]/on 127.0.0.1/g; s/address 0.0.0.0/address 127.0.0.1/g' /opt/bgutil/server/src/main.ts \
     && cd /opt/bgutil/server \
     && npm ci \
     && npx tsc

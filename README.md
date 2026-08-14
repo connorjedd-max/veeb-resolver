@@ -1,27 +1,37 @@
-# Veeb Render Resolver V36.13.1 - TV-variant cipher path
+# Veeb Render Resolver V36.14 - Innertube bootstrapless
 
-This is a full Render deploy package.
+Cold-path experiment focused only on true first-ever video IDs.
 
-Changes from V36.12:
+## What changed
 
-- Keeps the proven authenticated mweb Innertube path and format 18.
-- After bootstrap, prefers only the session-bound `session-sts` candidate for deciphering.
-- Converts the prescribed webpage player URL to the same-version TV player JS variant for SIG/N solving (`VEEB_JSC_PLAYER_VARIANT=tv` by default).
-- Keeps the full yt-dlp mweb+POT resolver as fallback.
-- Patches bgutil 1.3.1 at Docker build time so its HTTP server binds to `127.0.0.1:4416` instead of `[::]:4416`; this prevents Render from treating the internal POT service as another public service port.
-- Explicitly pins yt-dlp-ejs 0.8.0 and Deno 2.8.1.
+- Media discovery remains direct authenticated mweb Innertube `/youtubei/v1/player`.
+- The per-video `/watch` page is no longer a normal dependency. It was returning HTTP 429 and preventing cipher startup.
+- At app startup the resolver discovers the current global YouTube player build from `/iframe_api` and caches the TV player JS URL.
+- A cold song starts the Innertube format-18 request, the video-bound bgutil GVS POT request, and player metadata lookup in parallel.
+- The first ciphered itag-18 candidate is deciphered once using the cached TV player JS.
+- The old `/watch` bootstrap is emergency-only if global player discovery fails.
+- The broken startup session-GVS warm request is disabled. It was producing HTTP 400 and was not needed for the proven video-bound POT path.
+- bgutil remains bound to 127.0.0.1:4416 inside the Render container.
+- `SOURCE_FORMAT=18` remains unchanged.
+- Full yt-dlp remains the safety fallback.
 
-Expected decisive cold-path logs:
+## Expected cold-path logs
 
-- `v36.13 mweb player candidate ready ... candidate=session-sts ... urlMode=cipher`
-- `v36.13 cipher solve started ... playerVariant=tv`
-- `v36.13 cipher challenge solve returned ... resultCount=2`
-- `v36.13 cipher solved`
-- `v36.13 direct mweb resolve success`
+At startup:
 
-The internal POT server should log loopback startup, and Render should no longer announce `New primary port detected: 4416`.
+```
+v36.14 global player bootstrap ready {...}
+```
 
+On a truly unseen video ID:
 
-## V36.13.1 startup fix
-- Installs `httpx[http2]`, which includes the `h2` dependency required by the resolver's shared `httpx.AsyncClient(http2=True)`.
-- No resolver logic or front-end behavior changed from V36.13.
+```
+v36.14 mweb player candidate ready {... "formatId":"18", "urlMode":"cipher" ...}
+v36.14 cipher solve started {... "playerUrlSource":"iframe-api" ...}
+v36.14 POT ready {...}
+v36.14 cipher challenge solve returned {...}
+v36.14 cipher solved {...}
+v36.14 direct mweb resolve success {...}
+```
+
+If `global player bootstrap ready` is absent or the cipher solver fails, the full yt-dlp fallback is still retained.

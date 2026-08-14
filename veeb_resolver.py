@@ -22,7 +22,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.13", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.14", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -169,6 +169,10 @@ _session_gvs_task: asyncio.Task[tuple[str, str]] | None = None
 _session_gvs_lock = asyncio.Lock()
 
 _player_sts_cache: dict[str, int] = {}
+_global_player_bootstrap: dict[str, Any] | None = None
+_global_player_bootstrap_expires_at = 0.0
+_global_player_bootstrap_lock = asyncio.Lock()
+GLOBAL_PLAYER_BOOTSTRAP_TTL_SECONDS = max(60, int(os.environ.get("VEEB_GLOBAL_PLAYER_TTL", "900")))
 _mweb_bootstrap_lock = asyncio.Lock()
 
 
@@ -480,6 +484,23 @@ def player_url_from_response(data: dict[str, Any]) -> str | None:
     ):
         if result := normalize_player_url(value):
             return result
+
+    # Some Innertube responses bury the player URL outside the historical
+    # assets/js fields. Walk the response once before falling back to global
+    # player discovery. This keeps the media request itself Innertube-only.
+    stack: list[Any] = [data]
+    seen = 0
+    while stack and seen < 5000:
+        value = stack.pop()
+        seen += 1
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, str) and '/s/player/' in value and ('.js' in value or 'base.js' in value):
+            match = re.search(r'((?:https?:)?//[^\"\s]+/s/player/[^\"\s]+\.js[^\"\s]*|/s/player/[^\"\s]+\.js[^\"\s]*)', value.replace('\\/', '/'))
+            if match and (result := normalize_player_url(match.group(1))):
+                return result
     return None
 
 
@@ -729,7 +750,7 @@ async def get_bgutil_pot(content_binding: str, context: dict[str, Any], label: s
     else:
         raise RuntimeError(f"bgutil returned unsupported expiresAt type: {type(raw_expires_at).__name__}")
 
-    print("v36.13 POT ready", json.dumps({
+    print("v36.14 POT ready", json.dumps({
         "bindingType": label,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "bindingMatches": str(returned_binding) == content_binding,
@@ -810,6 +831,120 @@ def _consume_simple_task(task: asyncio.Task[Any], label: str, video_id: str) -> 
         print(label + " background task failed", json.dumps({
             "videoId": video_id,
             "error": str(exc)[-1000:],
+        }), flush=True)
+
+
+async def fetch_global_player_bootstrap(video_id: str | None = None, force: bool = False) -> dict[str, Any]:
+    """Discover the active YouTube player without depending on /watch.
+
+    /iframe_api is a tiny global script and is not video-specific. It exposes the
+    active player build id. If that route is unavailable, an embed page is used as
+    a last-resort metadata source. Neither route is used to resolve media formats;
+    all media discovery still comes from the direct Innertube /player response.
+    """
+    global _global_player_bootstrap, _global_player_bootstrap_expires_at
+    now = time.time()
+    if (
+        not force
+        and _global_player_bootstrap
+        and now < _global_player_bootstrap_expires_at
+    ):
+        return dict(_global_player_bootstrap)
+
+    async with _global_player_bootstrap_lock:
+        now = time.time()
+        if (
+            not force
+            and _global_player_bootstrap
+            and now < _global_player_bootstrap_expires_at
+        ):
+            return dict(_global_player_bootstrap)
+
+        started = time.monotonic()
+        client = get_http_client()
+        headers = {
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': str(MWEB_DIRECT_CONFIG['userAgent']),
+        }
+        errors: list[str] = []
+        player_url: str | None = None
+        source = None
+
+        try:
+            response = await client.get(
+                'https://www.youtube.com/iframe_api',
+                headers=headers,
+                timeout=4.0,
+            )
+            if response.status_code == 200:
+                text = response.text.replace('\\/', '/')
+                match = re.search(r'/s/player/([A-Za-z0-9_-]{8,})/', text)
+                if match:
+                    player_id = match.group(1)
+                    player_url = f'https://www.youtube.com/s/player/{player_id}/tv-player-ias.vflset/tv-player-ias.js'
+                    source = 'iframe-api'
+                else:
+                    errors.append('iframe-api:no-player-id')
+            else:
+                errors.append(f'iframe-api:http-{response.status_code}')
+        except Exception as exc:
+            errors.append('iframe-api:' + str(exc)[-300:])
+
+        if not player_url and video_id:
+            try:
+                response = await client.get(
+                    f'https://www.youtube.com/embed/{video_id}',
+                    params={'hl': 'en'},
+                    headers={**headers, 'Accept': 'text/html,application/xhtml+xml'},
+                    timeout=4.0,
+                )
+                if response.status_code == 200:
+                    text = response.text.replace('\\/', '/')
+                    match = re.search(
+                        r'(?:(?:"jsUrl"|"PLAYER_JS_URL"|"js")\s*:\s*")([^"\\]+/s/player/[^"\\]+\.js[^"\\]*)',
+                        text,
+                    )
+                    if not match:
+                        match = re.search(r'(/s/player/[A-Za-z0-9_-]+/[^"\\]+\.js[^"\\]*)', text)
+                    if match:
+                        actual = normalize_player_url(match.group(1))
+                        if actual:
+                            player_url = jsc_player_url(actual)
+                            source = 'embed'
+                    if not player_url:
+                        errors.append('embed:no-player-url')
+                else:
+                    errors.append(f'embed:http-{response.status_code}')
+            except Exception as exc:
+                errors.append('embed:' + str(exc)[-300:])
+
+        if not player_url:
+            raise RuntimeError('global player discovery failed: ' + ' || '.join(errors)[-1200:])
+
+        result = {
+            'playerUrl': player_url,
+            'playerId': (re.search(r'/s/player/([A-Za-z0-9_-]{8,})/', player_url) or [None, None])[1],
+            'source': source,
+        }
+        _global_player_bootstrap = result
+        _global_player_bootstrap_expires_at = time.time() + GLOBAL_PLAYER_BOOTSTRAP_TTL_SECONDS
+        print('v36.14 global player bootstrap ready', json.dumps({
+            'source': source,
+            'playerId': result.get('playerId'),
+            'playerVariant': JSC_PLAYER_VARIANT,
+            'elapsedSeconds': round(time.monotonic() - started, 3),
+            'ttlSeconds': GLOBAL_PLAYER_BOOTSTRAP_TTL_SECONDS,
+        }), flush=True)
+        return dict(result)
+
+
+async def warm_global_player_bootstrap() -> None:
+    try:
+        await fetch_global_player_bootstrap()
+    except Exception as exc:
+        print('v36.14 global player warm missed', json.dumps({
+            'error': str(exc)[-1200:],
         }), flush=True)
 
 
@@ -905,7 +1040,7 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
         "visitorData": visitor,
         "dataSyncId": data_sync_id,
     }
-    print("v36.13 mweb bootstrap ready", json.dumps({
+    print("v36.14 mweb bootstrap ready", json.dumps({
         "videoId": video_id,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "hasSts": sts is not None,
@@ -917,281 +1052,161 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
 
 
 async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
-    """Direct mweb resolver mirroring yt-dlp's successful /player context."""
+    """Bootstrap-free direct mweb resolver.
+
+    Media discovery is one direct authenticated mweb Innertube /player request.
+    Player JS metadata is global infrastructure state discovered from iframe_api,
+    not from the per-video /watch page. The selected itag is deciphered once and
+    raced in parallel with the video-bound GVS PO token.
+    """
     global _visitor_data
     started = time.monotonic()
     context = mweb_context()
     client = get_http_client()
 
-    async def call_player(
-        label: str, po_token: str | None = None, sts: int | None = None,
-        data_sync_id: str | None = None, visitor_data: str | None = None,
-    ):
-        # Match current yt-dlp's generated player context: html5 preference + optional STS.
-        # V36.11 still carried an old lactMilliseconds field that yt-dlp no longer sends here.
-        content_playback: dict[str, Any] = {
-            "html5Preference": "HTML5_PREF_WANTS",
-        }
-        if sts is not None:
-            content_playback["signatureTimestamp"] = sts
+    async def call_plain_player():
         payload: dict[str, Any] = {
-            "context": context,
-            "videoId": video_id,
-            "contentCheckOk": True,
-            "racyCheckOk": True,
-            "playbackContext": {
-                "contentPlaybackContext": content_playback,
-                "adPlaybackContext": {"pyv": True},
+            'context': context,
+            'videoId': video_id,
+            'contentCheckOk': True,
+            'racyCheckOk': True,
+            'playbackContext': {
+                'contentPlaybackContext': {
+                    'html5Preference': 'HTML5_PREF_WANTS',
+                },
+                'adPlaybackContext': {'pyv': True},
             },
         }
-        if po_token:
-            payload["serviceIntegrityDimensions"] = {"poToken": po_token}
         t0 = time.monotonic()
         response = await client.post(
             INNERTUBE_PLAYER_URL,
-            params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
-            headers=mweb_headers(data_sync_id=data_sync_id, visitor_data=visitor_data),
+            params={'key': INNERTUBE_API_KEY, 'prettyPrint': 'false'},
+            headers=mweb_headers(),
             json=payload,
             timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"{label} mweb /player returned HTTP {response.status_code}")
+            raise RuntimeError(f'plain mweb /player returned HTTP {response.status_code}')
         data = response.json()
-        visitor = ((data.get("responseContext") or {}).get("visitorData"))
+        visitor = ((data.get('responseContext') or {}).get('visitorData'))
         if isinstance(visitor, str) and visitor:
             _visitor_data = visitor
         fmt = select_direct_format(data)
         if not fmt:
-            streaming = data.get("streamingData") or {}
+            streaming = data.get('streamingData') or {}
             diagnostics = {
-                "status": ((data.get("playabilityStatus") or {}).get("status")),
-                "formats": len(streaming.get("formats") or []),
-                "adaptiveFormats": len(streaming.get("adaptiveFormats") or []),
-                "hasHls": bool(streaming.get("hlsManifestUrl")),
-                "hasDash": bool(streaming.get("dashManifestUrl")),
-                "hasServerAbr": bool(streaming.get("serverAbrStreamingUrl")),
-                "directUrls": sum(1 for f in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])) if isinstance(f, dict) and isinstance(f.get("url"), str)),
-                "ciphered": sum(1 for f in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])) if isinstance(f, dict) and (f.get("signatureCipher") or f.get("cipher"))),
-                "hasPlayerJs": bool(player_url_from_response(data)),
-                "itag18Present": any(str(f.get("itag")) == SOURCE_FORMAT for f in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])) if isinstance(f, dict)),
+                'status': ((data.get('playabilityStatus') or {}).get('status')),
+                'formats': len(streaming.get('formats') or []),
+                'adaptiveFormats': len(streaming.get('adaptiveFormats') or []),
+                'hasServerAbr': bool(streaming.get('serverAbrStreamingUrl')),
+                'itag18Present': any(
+                    str(f.get('itag')) == SOURCE_FORMAT
+                    for f in (list(streaming.get('formats') or []) + list(streaming.get('adaptiveFormats') or []))
+                    if isinstance(f, dict)
+                ),
             }
-            raise RuntimeError(f"{label} mweb /player returned no usable signed format: {playability_error(data) or 'unknown'} diagnostics={json.dumps(diagnostics, separators=(',', ':'))}")
-        direct_url = isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http")
-        print("v36.13 mweb player candidate ready", json.dumps({
-            "videoId": video_id, "purpose": purpose, "candidate": label,
-            "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
-            "urlMode": "direct" if direct_url else "cipher",
-            "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
-            "sessionBoundAuth": bool(data_sync_id),
-            "elapsedSeconds": round(time.monotonic() - t0, 3), "sts": sts,
-        }), flush=True)
-        return label, data, fmt, player_url_from_response(data)
-
-    bootstrap_task = asyncio.create_task(fetch_mweb_player_bootstrap(video_id))
-    plain_task = asyncio.create_task(call_player("plain"))
-    video_task = asyncio.create_task(get_bgutil_pot(video_id, context, "gvs-video-candidate"))
-
-    players: list[tuple[str, dict[str, Any], dict[str, Any], str | None]] = []
-    early_cipher_tasks: dict[str, asyncio.Task[str]] = {}
-    errors: list[str] = []
-
-    def maybe_start_cipher(candidate: tuple[str, dict[str, Any], dict[str, Any], str | None], fallback_player_url: str | None = None) -> None:
-        label, _data, fmt, response_player_url = candidate
-        player_url = response_player_url or fallback_player_url
-        if (
-            player_url
-            and not (isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http"))
-            and not early_cipher_tasks
-        ):
-            decipher_player_url = jsc_player_url(player_url)
-            early_cipher_tasks[label] = asyncio.create_task(
-                solve_direct_format_url(video_id, fmt, decipher_player_url)
+            raise RuntimeError(
+                'plain mweb /player returned no usable format: '
+                + (playability_error(data) or 'unknown')
+                + ' diagnostics=' + json.dumps(diagnostics, separators=(',', ':'))
             )
-            print("v36.13 cipher solve started", json.dumps({
-                "videoId": video_id, "playerCandidate": label,
-                "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
-                "playerUrlSource": "response" if response_player_url else "bootstrap",
-                "playerVariant": JSC_PLAYER_VARIANT,
-                "actualPlayerUrl": player_url[-110:],
-                "decipherPlayerUrl": decipher_player_url[-110:],
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-
-    def register_player(candidate: tuple[str, dict[str, Any], dict[str, Any], str | None]) -> None:
-        players.append(candidate)
-        maybe_start_cipher(candidate)
-
-    try:
-        register_player(await plain_task)
-    except Exception as exc:
-        errors.append("plain-player: " + str(exc))
-        print("v36.13 plain mweb player missed", json.dumps({
-            "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-            "error": str(exc)[-1400:],
+        response_player_url = player_url_from_response(data)
+        direct_url = isinstance(fmt.get('url'), str) and fmt.get('url', '').startswith('http')
+        print('v36.14 mweb player candidate ready', json.dumps({
+            'videoId': video_id,
+            'purpose': purpose,
+            'candidate': 'plain',
+            'formatId': str(fmt.get('itag')) if fmt.get('itag') is not None else None,
+            'urlMode': 'direct' if direct_url else 'cipher',
+            'hasSignatureCipher': bool(fmt.get('signatureCipher') or fmt.get('cipher')),
+            'hasResponsePlayerUrl': bool(response_player_url),
+            'elapsedSeconds': round(time.monotonic() - t0, 3),
         }), flush=True)
+        return data, fmt, response_player_url
 
-    bootstrap: dict[str, Any] = {}
-    try:
-        bootstrap = await bootstrap_task
-    except Exception as exc:
-        errors.append("bootstrap: " + str(exc))
-        print("v36.13 mweb bootstrap missed", json.dumps({
-            "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-            "error": str(exc)[-1200:],
-        }), flush=True)
+    player_task = asyncio.create_task(call_plain_player())
+    pot_task = asyncio.create_task(get_bgutil_pot(video_id, context, 'gvs-video-candidate'))
+    global_player_task = asyncio.create_task(fetch_global_player_bootstrap(video_id))
 
-    bootstrap_player_url_early = bootstrap.get("playerUrl") if bootstrap else None
-    sts = bootstrap.get("sts") if bootstrap else None
-    bootstrap_data_sync_id = bootstrap.get("dataSyncId") if bootstrap else None
-    bootstrap_visitor_data = bootstrap.get("visitorData") if bootstrap else None
+    data, fmt, response_player_url = await player_task
 
-    # The pre-bootstrap request is useful because it is extremely fast, but it is not
-    # equivalent to yt-dlp's authenticated player request. yt-dlp binds SAPISID auth to
-    # the Data Sync user-session ID it learned from the webpage. Always make one exact
-    # post-bootstrap request and prefer it when it yields a direct URL.
-    session_candidate = None
-    if sts is not None:
+    direct_url = fmt.get('url') if isinstance(fmt.get('url'), str) and fmt.get('url', '').startswith('http') else None
+    player_url = response_player_url
+    player_source = 'innertube-response' if player_url else None
+
+    if not direct_url and not player_url:
         try:
-            session_candidate = await call_player(
-                "session-sts", sts=sts, data_sync_id=bootstrap_data_sync_id,
-                visitor_data=bootstrap_visitor_data,
-            )
-            register_player(session_candidate)
-            # Once the authenticated session-bound response exists, it is the only
-            # candidate worth deciphering. Do not spend a JSC solve on the earlier
-            # pre-bootstrap response.
-            if not (isinstance(session_candidate[2].get("url"), str) and session_candidate[2].get("url", "").startswith("http")):
-                for task in early_cipher_tasks.values():
-                    task.cancel()
-                early_cipher_tasks.clear()
-                players = [session_candidate]
+            global_player = await global_player_task
+            player_url = global_player.get('playerUrl')
+            player_source = global_player.get('source') or 'global'
         except Exception as exc:
-            errors.append("session-sts-player: " + str(exc))
-            print("v36.13 session-sts mweb player missed", json.dumps({
-                "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-                "error": str(exc)[-1400:],
+            # /watch is emergency-only now. A 429 here can no longer block the fast
+            # path when iframe/global metadata is healthy.
+            print('v36.14 global player bootstrap missed', json.dumps({
+                'videoId': video_id,
+                'error': str(exc)[-1000:],
+                'elapsedSeconds': round(time.monotonic() - started, 3),
             }), flush=True)
-
-    # Do not invoke the fragile JSC path if the session-bound player response already
-    # gave us a usable direct URL. Only decipher when every candidate is still ciphered.
-    direct_players = [
-        candidate for candidate in players
-        if isinstance(candidate[2].get("url"), str) and candidate[2].get("url", "").startswith("http")
-    ]
-    if direct_players:
-        players = direct_players
-        print("v36.13 session-auth direct URL available", json.dumps({
-            "videoId": video_id,
-            "candidateCount": len(direct_players),
-            "elapsedSeconds": round(time.monotonic() - started, 3),
-        }), flush=True)
-    elif bootstrap_player_url_early:
-        for candidate in list(players):
-            maybe_start_cipher(candidate, bootstrap_player_url_early)
-
-    proofs: list[tuple[str, str]] = []
-    try:
-        video_token, returned_binding, expires_at = await video_task
-        if returned_binding and returned_binding != video_id:
-            raise RuntimeError("bgutil returned unexpected video binding")
-        proofs.append(("video", video_token))
-        print("v36.13 POT ready", json.dumps({
-            "bindingType": "gvs-video-candidate",
-            "elapsedSeconds": round(time.monotonic() - started, 3),
-            "bindingMatches": not returned_binding or returned_binding == video_id,
-            "expiresInSeconds": max(0, round(expires_at - time.time())),
-        }), flush=True)
-        try:
-            if players:
-                raise RuntimeError("player candidate already available; skipping redundant video-proof /player")
-            video_candidate = await call_player("video-proof-sts", po_token=video_token, sts=sts)
-            register_player(video_candidate)
-            if bootstrap_player_url_early:
-                maybe_start_cipher(video_candidate, bootstrap_player_url_early)
-        except Exception as exc:
-            errors.append("video-proof-player: " + str(exc))
-            print("v36.13 video-proof mweb player missed", json.dumps({
-                "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-                "error": str(exc)[-1400:],
-            }), flush=True)
-    except Exception as exc:
-        errors.append("video-pot: " + str(exc))
-        print("v36.13 video GVS proof missed", json.dumps({
-            "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-            "error": str(exc)[-1200:],
-        }), flush=True)
-
-    data_sync_id = bootstrap.get("dataSyncId") if bootstrap else None
-    if data_sync_id:
-        try:
-            session_token, returned_binding, _ = await get_bgutil_pot(data_sync_id, context, "gvs-session-bootstrap")
-            if not returned_binding or returned_binding == data_sync_id:
-                proofs.append(("session", session_token))
-                print("v36.13 session GVS candidate ready", json.dumps({
-                    "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-                }), flush=True)
-        except Exception as exc:
-            errors.append("session-pot: " + str(exc))
-            print("v36.13 session GVS unavailable, continuing", json.dumps({
-                "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-                "error": str(exc)[-1000:],
-            }), flush=True)
-
-    if not players:
-        raise RuntimeError("no direct mweb player candidate: " + " || ".join(errors)[-2200:])
-
-    probe_tasks: list[asyncio.Task[ResolvedMedia]] = []
-    bootstrap_player_url = bootstrap.get("playerUrl") if bootstrap else None
-    for player_label, data, fmt, response_player_url in players:
-        player_url = response_player_url or bootstrap_player_url
-        if not player_url and not (isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http")):
-            errors.append(f"{player_label}: ciphered format had no player JS URL")
-            print("v36.13 cipher candidate missing player URL", json.dumps({
-                "videoId": video_id, "playerCandidate": player_label,
-                "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
-                "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
-            }), flush=True)
-            continue
-        async def prepare_base(f=fmt, pu=player_url, pl=player_label):
-            if isinstance(f.get("url"), str) and f.get("url", "").startswith("http"):
-                return f["url"]
-            if pl in early_cipher_tasks:
-                return await early_cipher_tasks[pl]
-            assert pu is not None
-            return await solve_direct_format_url(video_id, f, jsc_player_url(pu))
-        base_task = asyncio.create_task(prepare_base())
-        for proof_label, proof in proofs or [("none", "")]:
-            async def verify(bt=base_task, pl=player_label, pr=proof_label, f=fmt, pot=proof):
-                base_url = await bt
-                url = add_query_param(base_url, "pot", pot) if pot else base_url
-                await probe_media_url(
-                    url,
-                    mweb_headers(data_sync_id=bootstrap_data_sync_id, visitor_data=bootstrap_visitor_data),
-                    video_id, f"v36.13-{pl}-{pr}",
-                )
-                media = resolved_from_direct_format(video_id, url, f, "mweb", f"mweb-direct-v36.13-{pl}-{pr}")
-                print("v36.13 direct mweb resolve success", json.dumps({
-                    "videoId": video_id, "playerCandidate": pl, "proofCandidate": pr,
-                    "formatId": media.format_id, "elapsedSeconds": round(time.monotonic() - started, 3),
-                }), flush=True)
-                return media
-            probe_tasks.append(asyncio.create_task(verify()))
-
-    if not probe_tasks:
-        raise RuntimeError("direct mweb produced no probeable URL")
-    pending = set(probe_tasks)
-    probe_errors: list[str] = []
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
             try:
-                winner = task.result()
-                for loser in pending:
-                    loser.cancel()
-                return winner
-            except Exception as exc:
-                probe_errors.append(str(exc))
-    raise RuntimeError("all direct mweb media probes failed: " + " || ".join(probe_errors)[-1800:])
+                legacy = await fetch_mweb_player_bootstrap(video_id)
+                player_url = legacy.get('playerUrl')
+                player_source = 'watch-emergency'
+            except Exception as legacy_exc:
+                raise RuntimeError(
+                    'ciphered Innertube format had no usable player JS metadata: '
+                    + str(legacy_exc)[-800:]
+                ) from legacy_exc
+
+    if direct_url:
+        base_task = asyncio.create_task(asyncio.sleep(0, result=direct_url))
+    else:
+        if not player_url:
+            raise RuntimeError('ciphered Innertube format had no player JS URL')
+        decipher_player_url = jsc_player_url(player_url)
+        print('v36.14 cipher solve started', json.dumps({
+            'videoId': video_id,
+            'playerCandidate': 'plain',
+            'formatId': str(fmt.get('itag')) if fmt.get('itag') is not None else None,
+            'playerUrlSource': player_source,
+            'playerVariant': JSC_PLAYER_VARIANT,
+            'decipherPlayerUrl': decipher_player_url[-120:],
+            'elapsedSeconds': round(time.monotonic() - started, 3),
+        }), flush=True)
+        base_task = asyncio.create_task(solve_direct_format_url(video_id, fmt, decipher_player_url))
+
+    video_token, returned_binding, expires_at = await pot_task
+    if returned_binding and returned_binding != video_id:
+        raise RuntimeError('bgutil returned unexpected video binding')
+    print('v36.14 POT ready', json.dumps({
+        'bindingType': 'gvs-video-candidate',
+        'elapsedSeconds': round(time.monotonic() - started, 3),
+        'bindingMatches': not returned_binding or returned_binding == video_id,
+        'expiresInSeconds': max(0, round(expires_at - time.time())),
+    }), flush=True)
+
+    base_url = await base_task
+    media_url = add_query_param(base_url, 'pot', video_token)
+    await probe_media_url(
+        media_url,
+        mweb_headers(),
+        video_id,
+        'v36.14-plain-video',
+    )
+    media = resolved_from_direct_format(
+        video_id,
+        media_url,
+        fmt,
+        'mweb',
+        'mweb-innertube-bootstrapless-v36.14',
+    )
+    print('v36.14 direct mweb resolve success', json.dumps({
+        'videoId': video_id,
+        'playerCandidate': 'plain',
+        'proofCandidate': 'video',
+        'formatId': media.format_id,
+        'elapsedSeconds': round(time.monotonic() - started, 3),
+    }), flush=True)
+    return media
 
 
 class JscDiagnosticLogger:
@@ -1228,7 +1243,7 @@ class JscDiagnosticLogger:
         with self._lock:
             self._recent.append(f"{level}: {text}")
             self._recent = self._recent[-12:]
-        print("v36.13 jsc yt-dlp", json.dumps({
+        print("v36.14 jsc yt-dlp", json.dumps({
             "level": level,
             "message": text,
         }), flush=True)
@@ -1329,7 +1344,7 @@ class DirectCipherSolver:
                 "supportedTypes": self._supported_types(provider),
                 "runtimePath": str(runtime_path) if runtime_path else None,
             })
-        print("v36.13 JSC provider snapshot", json.dumps({
+        print("v36.14 JSC provider snapshot", json.dumps({
             "reason": reason,
             "runtime": JSC_RUNTIME,
             "runtimeBinary": shutil.which(JSC_RUNTIME),
@@ -1378,7 +1393,7 @@ class DirectCipherSolver:
                         ),
                     ))
                 else:
-                    print("v36.13 SIG permutation cache hit", json.dumps({
+                    print("v36.14 SIG permutation cache hit", json.dumps({
                         "videoId": video_id,
                         "signatureLength": len(encrypted_sig),
                     }), flush=True)
@@ -1393,18 +1408,18 @@ class DirectCipherSolver:
             if requests:
                 self._provider_snapshot("before-solve", requests)
                 player_load_started = time.monotonic()
-                print("v36.13 cipher player load started", json.dumps({
+                print("v36.14 cipher player load started", json.dumps({
                     "videoId": video_id,
                     "playerUrl": player_url[-120:],
                 }), flush=True)
                 self.ie._load_player(video_id=video_id, player_url=player_url, fatal=True)
-                print("v36.13 cipher player loaded", json.dumps({
+                print("v36.14 cipher player loaded", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(time.monotonic() - player_load_started, 3),
                 }), flush=True)
 
                 challenge_started = time.monotonic()
-                print("v36.13 cipher challenge solve entered", json.dumps({
+                print("v36.14 cipher challenge solve entered", json.dumps({
                     "videoId": video_id,
                     "hasSig": bool(encrypted_sig),
                     "hasN": bool(n_challenge),
@@ -1412,7 +1427,7 @@ class DirectCipherSolver:
                 }), flush=True)
                 results = self.ie._jsc_director.bulk_solve(requests)
                 challenge_elapsed = time.monotonic() - challenge_started
-                print("v36.13 cipher challenge solve returned", json.dumps({
+                print("v36.14 cipher challenge solve returned", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(challenge_elapsed, 3),
                     "resultCount": len(results),
@@ -1443,7 +1458,7 @@ class DirectCipherSolver:
                             raise RuntimeError("signature permutation contained an out-of-range index")
                         assert sig_spec_key is not None
                         self._sig_spec_cache[sig_spec_key] = sig_spec
-                        print("v36.13 SIG permutation cached", json.dumps({
+                        print("v36.14 SIG permutation cached", json.dumps({
                             "videoId": video_id,
                             "signatureLength": len(encrypted_sig),
                             "specLength": len(sig_spec),
@@ -1483,7 +1498,7 @@ async def solve_direct_format_url(video_id: str, fmt: dict[str, Any], player_url
     assert _direct_cipher_solver is not None
     started = time.monotonic()
     url = await asyncio.to_thread(_direct_cipher_solver.solve, video_id, fmt, player_url)
-    print("v36.13 cipher solved", json.dumps({
+    print("v36.14 cipher solved", json.dumps({
         "videoId": video_id,
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "hadSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1833,7 +1848,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
                 return winner
             except Exception as exc:
                 errors.append(str(exc))
-                print("v36.13 direct head-start path failed", json.dumps({
+                print("v36.14 direct head-start path failed", json.dumps({
                     "videoId": video_id,
                     "path": "generic-direct" if task is generic_direct else "direct-pot",
                     "error": str(exc)[-1200:],
@@ -1865,7 +1880,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.13 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+            print("v36.14 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
     raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
@@ -2067,8 +2082,9 @@ async def startup_session() -> None:
     init_ytdlp_pools()
     init_direct_cipher_solver()
     global _session_gvs_task
-    _session_gvs_task = asyncio.create_task(warm_session_gvs_pot())
-    print("v36.13 resolver stack warm", json.dumps({
+    _session_gvs_task = None
+    await warm_global_player_bootstrap()
+    print("v36.14 resolver stack warm", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
         "foregroundPotEngines": YTDLP_FG_POT_ENGINES,
@@ -2094,7 +2110,7 @@ async def shutdown_http_client() -> None:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.13-session-auth"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v36.14-innertube-bootstrapless"}
 
 
 @app.get("/health")
@@ -2108,7 +2124,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.13-session-auth",
+        "version": "v36.14-innertube-bootstrapless",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -2138,7 +2154,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.13-session-auth-resolver",
+        "provider": "veeb-v36.14-innertube-bootstrapless-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
