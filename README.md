@@ -1,35 +1,22 @@
-# Veeb Render Resolver V28
+# Veeb Render Resolver V36.13 - TV-variant cipher path
 
-V28 changes the playback architecture from download/remux/cache to resolve/proxy.
+This is a full Render deploy package.
 
-## Hot path
+Changes from V36.12:
 
-1. yt-dlp resolves the selected YouTube format to a signed Google Video media URL.
-2. The URL, required request headers and its expiry are cached in memory.
-3. `/stream/:videoId` forwards the browser's HTTP Range request directly to that media URL.
-4. Render streams the upstream bytes straight back to Veeb. There is no ffmpeg process, whole-song download or audio temp file.
+- Keeps the proven authenticated mweb Innertube path and format 18.
+- After bootstrap, prefers only the session-bound `session-sts` candidate for deciphering.
+- Converts the prescribed webpage player URL to the same-version TV player JS variant for SIG/N solving (`VEEB_JSC_PLAYER_VARIANT=tv` by default).
+- Keeps the full yt-dlp mweb+POT resolver as fallback.
+- Patches bgutil 1.3.1 at Docker build time so its HTTP server binds to `127.0.0.1:4416` instead of `[::]:4416`; this prevents Render from treating the internal POT service as another public service port.
+- Explicitly pins yt-dlp-ejs 0.8.0 and Deno 2.8.1.
 
-## Prefetch
+Expected decisive cold-path logs:
 
-`POST /prefetch/:videoId` resolves and caches only the signed media URL. It does not download the song.
+- `v36.13 mweb player candidate ready ... candidate=session-sts ... urlMode=cipher`
+- `v36.13 cipher solve started ... playerVariant=tv`
+- `v36.13 cipher challenge solve returned ... resultCount=2`
+- `v36.13 cipher solved`
+- `v36.13 direct mweb resolve success`
 
-## Required secrets / variables
-
-Keep the same:
-
-- `RESOLVER_SECRET`
-- `/etc/secrets/youtube-cookies.txt` if you currently use cookies
-
-The existing bgutil PO-token provider remains installed.
-
-## Optional variables
-
-- `YOUTUBE_STREAM_FORMAT=18`
-- `YOUTUBE_CLIENTS=mweb,android_vr,web_embedded`
-- `VEEB_RESOLVED_URL_TTL=1800`
-- `VEEB_RESOLVED_URL_EXPIRY_MARGIN=120`
-- `VEEB_RESOLVE_TIMEOUT=45`
-
-## Important
-
-Deploy the matching V28 Cloudflare Worker as well. V28 forwards Range headers end-to-end and intentionally bypasses Cloudflare's full-object audio cache.
+The internal POT server should log loopback startup, and Render should no longer announce `New primary port detected: 4416`.
