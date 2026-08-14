@@ -35,12 +35,12 @@ CLIENTS = [
     value.strip()
     for value in os.environ.get(
         "YOUTUBE_CLIENTS",
-        os.environ.get("YOUTUBE_CLIENT", "mweb") + ",android_vr,web_embedded",
+        "android_vr,web_embedded," + os.environ.get("YOUTUBE_CLIENT", "mweb"),
     ).split(",")
     if value.strip()
 ]
 if not CLIENTS:
-    CLIENTS = ["mweb"]
+    CLIENTS = ["android_vr", "web_embedded", "mweb"]
 
 RESOLVED_URL_FALLBACK_TTL_SECONDS = max(
     60,
@@ -142,9 +142,13 @@ def client_uses_cookies(client: str) -> bool:
 
 
 def youtube_extractor_args(client: str) -> str:
-    args = [f"player_client={client}", "fetch_pot=auto"]
-    if client in {"mweb", "web_music"} and not YOUTUBE_PREMIUM_ACCOUNT:
-        args.append("use_ad_playback_context=true")
+    # Fast clients first. Do not wake the BotGuard/PO-token provider unless the
+    # selected client actually needs it. mweb remains the compatibility fallback.
+    args = [f"player_client={client}"]
+    if client in {"mweb", "web_music"}:
+        args.append("fetch_pot=auto")
+        if not YOUTUBE_PREMIUM_ACCOUNT:
+            args.append("use_ad_playback_context=true")
     args.append("player_skip=configs")
     args.append("skip=hls,dash")
     args.append(f"playback_wait={PLAYBACK_WAIT_SECONDS:g}")
@@ -412,7 +416,20 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
 
     task = _resolve_tasks.get(video_id)
     if task and not task.done():
-        return await task, "WAIT"
+        try:
+            # Shield the shared resolver task from cancellation of this HTTP
+            # request. A browser retry/abort must not destroy useful resolution
+            # work for the next request.
+            return await asyncio.shield(task), "WAIT"
+        except asyncio.CancelledError:
+            if purpose != "live":
+                raise
+            # A legacy/speculative cancellation may race a foreground request.
+            # Foreground playback retries cleanly rather than leaking a 500.
+            if _resolve_tasks.get(video_id) is task:
+                _resolve_tasks.pop(video_id, None)
+            if _prefetch_tasks.get(video_id) is task:
+                _prefetch_tasks.pop(video_id, None)
 
     if purpose == "live":
         # Foreground playback wins over wrong speculative work. The URL resolver
@@ -428,7 +445,7 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
                 prefetch_task.cancel()
 
     task = start_resolve_task(video_id, purpose)
-    return await task, "MISS"
+    return await asyncio.shield(task), "MISS"
 
 
 def get_http_client() -> httpx.AsyncClient:
@@ -495,7 +512,7 @@ def build_downstream_headers(
     headers.setdefault("Content-Type", "video/mp4")
     headers.setdefault("Accept-Ranges", "bytes")
     headers["Cache-Control"] = "private, no-store"
-    headers["X-Veeb-Resolver"] = "direct-url-proxy-v28"
+    headers["X-Veeb-Resolver"] = "direct-url-proxy-v29"
     headers["X-Veeb-Resolved-Cache"] = cache_state
     headers["X-Veeb-Playback-Client"] = media.client
     headers["X-Veeb-Source-Format"] = media.format_id or SOURCE_FORMAT
@@ -606,7 +623,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v28-direct-url-proxy",
+        "version": "v29-direct-url-proxy",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "clients": CLIENTS,
@@ -666,14 +683,15 @@ async def prefetch_endpoint(
     if active_other and not intent:
         return JSONResponse({"ok": True, "status": "busy", "videoId": video_id}, status_code=202)
 
-    if intent:
-        for other_id, task in active_other:
-            print(
-                "intent prefetch replacing speculative url resolve",
-                json.dumps({"fromVideoId": other_id, "toVideoId": video_id}),
-                flush=True,
-            )
-            task.cancel()
+    if active_other:
+        # Pointer hover/down can fire rapidly while a user browses. Never throw
+        # away 5-15 seconds of useful extraction just because another card was
+        # touched. Only an actual /stream foreground request is allowed to
+        # preempt the speculative job.
+        return JSONResponse(
+            {"ok": True, "status": "busy", "videoId": video_id},
+            status_code=202,
+        )
 
     start_resolve_task(video_id, "prefetch")
     return JSONResponse({"ok": True, "status": "warming", "videoId": video_id}, status_code=202)
