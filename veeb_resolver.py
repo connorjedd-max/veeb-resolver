@@ -22,7 +22,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.7", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.8", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -667,7 +667,7 @@ async def get_bgutil_pot(content_binding: str, context: dict[str, Any], label: s
     else:
         raise RuntimeError(f"bgutil returned unsupported expiresAt type: {type(raw_expires_at).__name__}")
 
-    print("v36.7 POT ready", json.dumps({
+    print("v36.8 POT ready", json.dumps({
         "bindingType": label,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "bindingMatches": str(returned_binding) == content_binding,
@@ -843,7 +843,7 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
         "visitorData": visitor,
         "dataSyncId": data_sync_id,
     }
-    print("v36.7 mweb bootstrap ready", json.dumps({
+    print("v36.8 mweb bootstrap ready", json.dumps({
         "videoId": video_id,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "hasSts": sts is not None,
@@ -910,7 +910,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 "itag18Present": any(str(f.get("itag")) == SOURCE_FORMAT for f in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])) if isinstance(f, dict)),
             }
             raise RuntimeError(f"{label} mweb /player returned no usable signed format: {playability_error(data) or 'unknown'} diagnostics={json.dumps(diagnostics, separators=(',', ':'))}")
-        print("v36.7 mweb player candidate ready", json.dumps({
+        print("v36.8 mweb player candidate ready", json.dumps({
             "videoId": video_id, "purpose": purpose, "candidate": label,
             "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
             "elapsedSeconds": round(time.monotonic() - t0, 3), "sts": sts,
@@ -925,9 +925,9 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     early_cipher_tasks: dict[str, asyncio.Task[str]] = {}
     errors: list[str] = []
 
-    def register_player(candidate: tuple[str, dict[str, Any], dict[str, Any], str | None]) -> None:
-        players.append(candidate)
-        label, _data, fmt, player_url = candidate
+    def maybe_start_cipher(candidate: tuple[str, dict[str, Any], dict[str, Any], str | None], fallback_player_url: str | None = None) -> None:
+        label, _data, fmt, response_player_url = candidate
+        player_url = response_player_url or fallback_player_url
         if (
             player_url
             and not (isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http"))
@@ -936,17 +936,22 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             early_cipher_tasks[label] = asyncio.create_task(
                 solve_direct_format_url(video_id, fmt, player_url)
             )
-            print("v36.7 cipher solve started", json.dumps({
+            print("v36.8 cipher solve started", json.dumps({
                 "videoId": video_id, "playerCandidate": label,
                 "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+                "playerUrlSource": "response" if response_player_url else "bootstrap",
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }), flush=True)
+
+    def register_player(candidate: tuple[str, dict[str, Any], dict[str, Any], str | None]) -> None:
+        players.append(candidate)
+        maybe_start_cipher(candidate)
 
     try:
         register_player(await plain_task)
     except Exception as exc:
         errors.append("plain-player: " + str(exc))
-        print("v36.7 plain mweb player missed", json.dumps({
+        print("v36.8 plain mweb player missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1400:],
         }), flush=True)
@@ -956,18 +961,26 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         bootstrap = await bootstrap_task
     except Exception as exc:
         errors.append("bootstrap: " + str(exc))
-        print("v36.7 mweb bootstrap missed", json.dumps({
+        print("v36.8 mweb bootstrap missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1200:],
         }), flush=True)
 
+    bootstrap_player_url_early = bootstrap.get("playerUrl") if bootstrap else None
+    if bootstrap_player_url_early:
+        for candidate in list(players):
+            maybe_start_cipher(candidate, bootstrap_player_url_early)
+
     sts = bootstrap.get("sts") if bootstrap else None
     if sts is not None:
         try:
-            register_player(await call_player("sts", sts=sts))
+            sts_candidate = await call_player("sts", sts=sts)
+            register_player(sts_candidate)
+            if bootstrap_player_url_early:
+                maybe_start_cipher(sts_candidate, bootstrap_player_url_early)
         except Exception as exc:
             errors.append("sts-player: " + str(exc))
-            print("v36.7 sts mweb player missed", json.dumps({
+            print("v36.8 sts mweb player missed", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1400:],
             }), flush=True)
@@ -978,23 +991,26 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         if returned_binding and returned_binding != video_id:
             raise RuntimeError("bgutil returned unexpected video binding")
         proofs.append(("video", video_token))
-        print("v36.7 POT ready", json.dumps({
+        print("v36.8 POT ready", json.dumps({
             "bindingType": "gvs-video-candidate",
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "bindingMatches": not returned_binding or returned_binding == video_id,
             "expiresInSeconds": max(0, round(expires_at - time.time())),
         }), flush=True)
         try:
-            register_player(await call_player("video-proof-sts", po_token=video_token, sts=sts))
+            video_candidate = await call_player("video-proof-sts", po_token=video_token, sts=sts)
+            register_player(video_candidate)
+            if bootstrap_player_url_early:
+                maybe_start_cipher(video_candidate, bootstrap_player_url_early)
         except Exception as exc:
             errors.append("video-proof-player: " + str(exc))
-            print("v36.7 video-proof mweb player missed", json.dumps({
+            print("v36.8 video-proof mweb player missed", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1400:],
             }), flush=True)
     except Exception as exc:
         errors.append("video-pot: " + str(exc))
-        print("v36.7 video GVS proof missed", json.dumps({
+        print("v36.8 video GVS proof missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1200:],
         }), flush=True)
@@ -1005,12 +1021,12 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             session_token, returned_binding, _ = await get_bgutil_pot(data_sync_id, context, "gvs-session-bootstrap")
             if not returned_binding or returned_binding == data_sync_id:
                 proofs.append(("session", session_token))
-                print("v36.7 session GVS candidate ready", json.dumps({
+                print("v36.8 session GVS candidate ready", json.dumps({
                     "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 }), flush=True)
         except Exception as exc:
             errors.append("session-pot: " + str(exc))
-            print("v36.7 session GVS unavailable, continuing", json.dumps({
+            print("v36.8 session GVS unavailable, continuing", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1000:],
             }), flush=True)
@@ -1024,7 +1040,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         player_url = response_player_url or bootstrap_player_url
         if not player_url and not (isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http")):
             errors.append(f"{player_label}: ciphered format had no player JS URL")
-            print("v36.7 cipher candidate missing player URL", json.dumps({
+            print("v36.8 cipher candidate missing player URL", json.dumps({
                 "videoId": video_id, "playerCandidate": player_label,
                 "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
                 "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1042,9 +1058,9 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             async def verify(bt=base_task, pl=player_label, pr=proof_label, f=fmt, pot=proof):
                 base_url = await bt
                 url = add_query_param(base_url, "pot", pot) if pot else base_url
-                await probe_media_url(url, mweb_headers(), video_id, f"v36.7-{pl}-{pr}")
-                media = resolved_from_direct_format(video_id, url, f, "mweb", f"mweb-direct-v36.7-{pl}-{pr}")
-                print("v36.7 direct mweb resolve success", json.dumps({
+                await probe_media_url(url, mweb_headers(), video_id, f"v36.8-{pl}-{pr}")
+                media = resolved_from_direct_format(video_id, url, f, "mweb", f"mweb-direct-v36.8-{pl}-{pr}")
+                print("v36.8 direct mweb resolve success", json.dumps({
                     "videoId": video_id, "playerCandidate": pl, "proofCandidate": pr,
                     "formatId": media.format_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 }), flush=True)
@@ -1160,7 +1176,7 @@ async def solve_direct_format_url(video_id: str, fmt: dict[str, Any], player_url
     assert _direct_cipher_solver is not None
     started = time.monotonic()
     url = await asyncio.to_thread(_direct_cipher_solver.solve, video_id, fmt, player_url)
-    print("v36.7 cipher solved", json.dumps({
+    print("v36.8 cipher solved", json.dumps({
         "videoId": video_id,
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "hadSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1485,7 +1501,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
 
     # Let pure HTTP resolution win without immediately competing for CPU with
     # yt-dlp/Deno. This head start is intentionally tiny compared with V35's 12s.
-    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "1.25")))
+    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "2.25")))
     if head_start:
         done, _ = await asyncio.wait({generic_direct, direct_pot}, timeout=head_start, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -1503,7 +1519,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
                 return winner
             except Exception as exc:
                 errors.append(str(exc))
-                print("v36.7 direct head-start path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+                print("v36.8 direct head-start path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
 
     fallback = asyncio.create_task(resolve_ytdlp_foreground_v35(video_id, purpose))
     tasks = {generic_direct, direct_pot, fallback}
@@ -1527,7 +1543,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.7 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+            print("v36.8 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
     raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
@@ -1729,7 +1745,7 @@ async def startup_session() -> None:
     init_ytdlp_pools()
     global _session_gvs_task
     _session_gvs_task = asyncio.create_task(warm_session_gvs_pot())
-    print("v36.7 resolver stack warm", json.dumps({
+    print("v36.8 resolver stack warm", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
         "foregroundPotEngines": YTDLP_FG_POT_ENGINES,
@@ -1751,7 +1767,7 @@ async def shutdown_http_client() -> None:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.7-mweb-sts"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v36.8-mweb-sts"}
 
 
 @app.get("/health")
@@ -1765,7 +1781,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.7-mweb-sts",
+        "version": "v36.8-mweb-sts",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -1795,7 +1811,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.7-mweb-sts-resolver",
+        "provider": "veeb-v36.8-mweb-sts-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
