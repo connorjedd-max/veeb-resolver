@@ -22,7 +22,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.9", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.10", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -667,7 +667,7 @@ async def get_bgutil_pot(content_binding: str, context: dict[str, Any], label: s
     else:
         raise RuntimeError(f"bgutil returned unsupported expiresAt type: {type(raw_expires_at).__name__}")
 
-    print("v36.9 POT ready", json.dumps({
+    print("v36.10 POT ready", json.dumps({
         "bindingType": label,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "bindingMatches": str(returned_binding) == content_binding,
@@ -843,7 +843,7 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
         "visitorData": visitor,
         "dataSyncId": data_sync_id,
     }
-    print("v36.9 mweb bootstrap ready", json.dumps({
+    print("v36.10 mweb bootstrap ready", json.dumps({
         "videoId": video_id,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "hasSts": sts is not None,
@@ -910,7 +910,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 "itag18Present": any(str(f.get("itag")) == SOURCE_FORMAT for f in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])) if isinstance(f, dict)),
             }
             raise RuntimeError(f"{label} mweb /player returned no usable signed format: {playability_error(data) or 'unknown'} diagnostics={json.dumps(diagnostics, separators=(',', ':'))}")
-        print("v36.9 mweb player candidate ready", json.dumps({
+        print("v36.10 mweb player candidate ready", json.dumps({
             "videoId": video_id, "purpose": purpose, "candidate": label,
             "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
             "elapsedSeconds": round(time.monotonic() - t0, 3), "sts": sts,
@@ -936,7 +936,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             early_cipher_tasks[label] = asyncio.create_task(
                 solve_direct_format_url(video_id, fmt, player_url)
             )
-            print("v36.9 cipher solve started", json.dumps({
+            print("v36.10 cipher solve started", json.dumps({
                 "videoId": video_id, "playerCandidate": label,
                 "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
                 "playerUrlSource": "response" if response_player_url else "bootstrap",
@@ -951,7 +951,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         register_player(await plain_task)
     except Exception as exc:
         errors.append("plain-player: " + str(exc))
-        print("v36.9 plain mweb player missed", json.dumps({
+        print("v36.10 plain mweb player missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1400:],
         }), flush=True)
@@ -961,7 +961,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         bootstrap = await bootstrap_task
     except Exception as exc:
         errors.append("bootstrap: " + str(exc))
-        print("v36.9 mweb bootstrap missed", json.dumps({
+        print("v36.10 mweb bootstrap missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1200:],
         }), flush=True)
@@ -980,7 +980,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 maybe_start_cipher(sts_candidate, bootstrap_player_url_early)
         except Exception as exc:
             errors.append("sts-player: " + str(exc))
-            print("v36.9 sts mweb player missed", json.dumps({
+            print("v36.10 sts mweb player missed", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1400:],
             }), flush=True)
@@ -991,7 +991,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         if returned_binding and returned_binding != video_id:
             raise RuntimeError("bgutil returned unexpected video binding")
         proofs.append(("video", video_token))
-        print("v36.9 POT ready", json.dumps({
+        print("v36.10 POT ready", json.dumps({
             "bindingType": "gvs-video-candidate",
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "bindingMatches": not returned_binding or returned_binding == video_id,
@@ -1006,13 +1006,13 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 maybe_start_cipher(video_candidate, bootstrap_player_url_early)
         except Exception as exc:
             errors.append("video-proof-player: " + str(exc))
-            print("v36.9 video-proof mweb player missed", json.dumps({
+            print("v36.10 video-proof mweb player missed", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1400:],
             }), flush=True)
     except Exception as exc:
         errors.append("video-pot: " + str(exc))
-        print("v36.9 video GVS proof missed", json.dumps({
+        print("v36.10 video GVS proof missed", json.dumps({
             "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1200:],
         }), flush=True)
@@ -1023,12 +1023,12 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             session_token, returned_binding, _ = await get_bgutil_pot(data_sync_id, context, "gvs-session-bootstrap")
             if not returned_binding or returned_binding == data_sync_id:
                 proofs.append(("session", session_token))
-                print("v36.9 session GVS candidate ready", json.dumps({
+                print("v36.10 session GVS candidate ready", json.dumps({
                     "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 }), flush=True)
         except Exception as exc:
             errors.append("session-pot: " + str(exc))
-            print("v36.9 session GVS unavailable, continuing", json.dumps({
+            print("v36.10 session GVS unavailable, continuing", json.dumps({
                 "videoId": video_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1000:],
             }), flush=True)
@@ -1042,7 +1042,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         player_url = response_player_url or bootstrap_player_url
         if not player_url and not (isinstance(fmt.get("url"), str) and fmt.get("url", "").startswith("http")):
             errors.append(f"{player_label}: ciphered format had no player JS URL")
-            print("v36.9 cipher candidate missing player URL", json.dumps({
+            print("v36.10 cipher candidate missing player URL", json.dumps({
                 "videoId": video_id, "playerCandidate": player_label,
                 "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
                 "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1062,7 +1062,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 url = add_query_param(base_url, "pot", pot) if pot else base_url
                 await probe_media_url(url, mweb_headers(), video_id, f"v36.8-{pl}-{pr}")
                 media = resolved_from_direct_format(video_id, url, f, "mweb", f"mweb-direct-v36.8-{pl}-{pr}")
-                print("v36.9 direct mweb resolve success", json.dumps({
+                print("v36.10 direct mweb resolve success", json.dumps({
                     "videoId": video_id, "playerCandidate": pl, "proofCandidate": pr,
                     "formatId": media.format_id, "elapsedSeconds": round(time.monotonic() - started, 3),
                 }), flush=True)
@@ -1087,7 +1087,12 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
 
 
 class DirectCipherSolver:
-    """Use yt-dlp's current JS challenge providers only for one already-discovered format."""
+    """Use yt-dlp's current JS challenge providers only for one already-discovered format.
+
+    yt-dlp's SIG provider solves a reusable permutation specification, not the
+    encrypted signature text itself. Cache that spec per player JS + signature
+    length and apply it locally to each track's encrypted ``s`` value.
+    """
 
     def __init__(self) -> None:
         opts: dict[str, Any] = {
@@ -1103,6 +1108,7 @@ class DirectCipherSolver:
         self.ie = self.ydl.get_info_extractor("Youtube")
         self.ie.initialize()
         self.lock = threading.Lock()
+        self._sig_spec_cache: dict[tuple[str, int], list[int]] = {}
 
     def solve(self, video_id: str, fmt: dict[str, Any], player_url: str) -> str:
         with self.lock:
@@ -1126,12 +1132,31 @@ class DirectCipherSolver:
             query = parse_qs(parsed.query, keep_blank_values=True)
             n_challenge = (query.get("n") or [None])[0]
             requests: list[JsChallengeRequest] = []
+            sig_spec_key: tuple[str, int] | None = None
+            synthetic_sig_challenge: str | None = None
+            cached_sig_spec: list[int] | None = None
             if encrypted_sig:
-                requests.append(JsChallengeRequest(
-                    type=JsChallengeType.SIG,
-                    video_id=video_id,
-                    input=SigChallengeInput(player_url=player_url, challenges=[encrypted_sig]),
-                ))
+                sig_spec_key = (player_url, len(encrypted_sig))
+                cached_sig_spec = self._sig_spec_cache.get(sig_spec_key)
+                if cached_sig_spec is None:
+                    # Match yt-dlp exactly: ask the JS challenge provider for the
+                    # signature permutation using a synthetic sequence whose
+                    # character codes are 0..N-1. The provider response is then
+                    # converted back to integer indices and applied to the real s.
+                    synthetic_sig_challenge = ''.join(map(chr, range(len(encrypted_sig))))
+                    requests.append(JsChallengeRequest(
+                        type=JsChallengeType.SIG,
+                        video_id=video_id,
+                        input=SigChallengeInput(
+                            player_url=player_url,
+                            challenges=[synthetic_sig_challenge],
+                        ),
+                    ))
+                else:
+                    print("v36.10 SIG permutation cache hit", json.dumps({
+                        "videoId": video_id,
+                        "signatureLength": len(encrypted_sig),
+                    }), flush=True)
             if n_challenge:
                 requests.append(JsChallengeRequest(
                     type=JsChallengeType.N,
@@ -1141,22 +1166,22 @@ class DirectCipherSolver:
 
             if requests:
                 player_load_started = time.monotonic()
-                print("v36.9 cipher player load started", json.dumps({
+                print("v36.10 cipher player load started", json.dumps({
                     "videoId": video_id, "playerUrl": player_url[-120:],
                 }), flush=True)
                 self.ie._load_player(video_id=video_id, player_url=player_url, fatal=True)
-                print("v36.9 cipher player loaded", json.dumps({
+                print("v36.10 cipher player loaded", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(time.monotonic() - player_load_started, 3),
                 }), flush=True)
                 challenge_started = time.monotonic()
-                print("v36.9 cipher challenge solve entered", json.dumps({
+                print("v36.10 cipher challenge solve entered", json.dumps({
                     "videoId": video_id,
                     "hasSig": bool(encrypted_sig),
                     "hasN": bool(n_challenge),
                 }), flush=True)
                 results = self.ie._jsc_director.bulk_solve(requests)
-                print("v36.9 cipher challenge solve returned", json.dumps({
+                print("v36.10 cipher challenge solve returned", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(time.monotonic() - challenge_started, 3),
                     "resultCount": len(results),
@@ -1165,11 +1190,26 @@ class DirectCipherSolver:
                 for request, response in results:
                     for challenge, result in response.output.results.items():
                         solved[(request.type.value, challenge)] = result
+
                 if encrypted_sig:
-                    sig = solved.get((JsChallengeType.SIG.value, encrypted_sig))
-                    if not sig:
-                        raise RuntimeError("signature challenge was not solved")
+                    sig_spec = cached_sig_spec
+                    if sig_spec is None:
+                        raw_spec = solved.get((JsChallengeType.SIG.value, synthetic_sig_challenge or ''))
+                        if not raw_spec:
+                            raise RuntimeError("signature permutation challenge was not solved")
+                        sig_spec = [ord(char) for char in raw_spec]
+                        if any(index < 0 or index >= len(encrypted_sig) for index in sig_spec):
+                            raise RuntimeError("signature permutation contained an out-of-range index")
+                        assert sig_spec_key is not None
+                        self._sig_spec_cache[sig_spec_key] = sig_spec
+                        print("v36.10 SIG permutation cached", json.dumps({
+                            "videoId": video_id,
+                            "signatureLength": len(encrypted_sig),
+                            "specLength": len(sig_spec),
+                        }), flush=True)
+                    sig = ''.join(encrypted_sig[index] for index in sig_spec)
                     query[sp] = [sig]
+
                 if n_challenge:
                     n_result = solved.get((JsChallengeType.N.value, n_challenge))
                     if not n_result:
@@ -1198,7 +1238,7 @@ async def solve_direct_format_url(video_id: str, fmt: dict[str, Any], player_url
     assert _direct_cipher_solver is not None
     started = time.monotonic()
     url = await asyncio.to_thread(_direct_cipher_solver.solve, video_id, fmt, player_url)
-    print("v36.9 cipher solved", json.dumps({
+    print("v36.10 cipher solved", json.dumps({
         "videoId": video_id,
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "hadSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1547,7 +1587,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
                 return winner
             except Exception as exc:
                 errors.append(str(exc))
-                print("v36.9 direct head-start path failed", json.dumps({
+                print("v36.10 direct head-start path failed", json.dumps({
                     "videoId": video_id,
                     "path": "generic-direct" if task is generic_direct else "direct-pot",
                     "error": str(exc)[-1200:],
@@ -1579,7 +1619,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.9 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+            print("v36.10 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
     raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
@@ -1781,7 +1821,7 @@ async def startup_session() -> None:
     init_ytdlp_pools()
     global _session_gvs_task
     _session_gvs_task = asyncio.create_task(warm_session_gvs_pot())
-    print("v36.9 resolver stack warm", json.dumps({
+    print("v36.10 resolver stack warm", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
         "foregroundPotEngines": YTDLP_FG_POT_ENGINES,
