@@ -1,11 +1,20 @@
-# Veeb Render Resolver V26
+# Veeb Render Resolver V27
 
-V26 prioritises reliable browser playback over the V25 growing-file handoff.
+V27 restores fast progressive playback while preserving V26's completed-file cache.
 
-The YouTube extraction/cache build is still single-flight and prefetch-aware, but
-the browser now receives only a completed MP4 with Content-Length and byte-range
-support. In the V25 logs the full file commonly completed less than one second
-after the progressive handoff, so this removes a large source of buffering and
-media-element failures for very little added cold latency.
+Key changes:
 
-Keep the same RESOLVER_SECRET and youtube-cookies.txt secret file.
+- Prefer YouTube audio-only format 140, with format 18 as fallback.
+- Build fragmented MP4 exactly as before.
+- Start browser playback after a 512 KiB prebuffer instead of waiting for the whole track.
+- Continue building the same file in the background until it becomes the normal Range-capable cache entry.
+- Preserve single-flight foreground/preload behaviour and preemption of speculative work.
+- Completed files still expose Content-Length and byte-range support.
+
+Keep the same `RESOLVER_SECRET` and `youtube-cookies.txt` secret file.
+
+Recommended Cloudflare Cron Trigger for a Render Free deployment:
+
+    */10 * * * *
+
+The Veeb Worker already contains the `scheduled()` handler that calls `/health`.

@@ -25,7 +25,7 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
 WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
 
-SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "18")
+SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "140/18")
 STREAM_CONTENT_TYPE = "audio/mp4"
 
 # V20 cold-start strategy:
@@ -47,7 +47,10 @@ CACHE_MAX_FILES = int(os.environ.get("VEEB_AUDIO_CACHE_MAX_FILES", "40"))
 PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_PREFETCH_CONCURRENCY", "1")))
 FILE_CHUNK_BYTES = 256 * 1024
 FOREGROUND_READY_BYTES = max(64 * 1024, int(os.environ.get("VEEB_FOREGROUND_READY_BYTES", str(128 * 1024))))
-LIVE_PREBUFFER_BYTES = max(64 * 1024, int(os.environ.get("VEEB_LIVE_PREBUFFER_BYTES", str(192 * 1024))))
+LIVE_PREBUFFER_BYTES = max(
+    128 * 1024,
+    int(os.environ.get("VEEB_LIVE_PREBUFFER_BYTES", str(512 * 1024))),
+)
 PLAYBACK_WAIT_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_PLAYBACK_WAIT", "0")))
 
 # V24 uses one authenticated mweb pipeline only. Racing extra clients on the
@@ -824,7 +827,7 @@ def progressive_headers(state: ProgressiveBuildState) -> dict[str, str]:
         "Content-Type": STREAM_CONTENT_TYPE,
         "Accept-Ranges": "none",
         "Cache-Control": "no-store",
-        "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
+        "X-Veeb-Resolver": "yt-dlp-progressive-v27",
         "X-Veeb-Cache": "BUILDING",
         "X-Veeb-Progressive": "1",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
@@ -893,7 +896,7 @@ def cached_headers(path: Path) -> dict[str, str]:
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
         "ETag": f'"{stat.st_size:x}-{int(stat.st_mtime):x}"',
-        "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
+        "X-Veeb-Resolver": "yt-dlp-progressive-v27",
         "X-Veeb-Cache": "HIT",
         "X-Veeb-Source-Format": SOURCE_FORMAT,
     }
@@ -1084,7 +1087,7 @@ async def stream_endpoint(
                 "Content-Type": STREAM_CONTENT_TYPE,
                 "Accept-Ranges": "none" if state and not state.done.is_set() else "bytes",
                 "Cache-Control": "no-store",
-                "X-Veeb-Resolver": "yt-dlp-cache-first-v26",
+                "X-Veeb-Resolver": "yt-dlp-progressive-v27",
                 "X-Veeb-Cache": "BUILDING" if state and not state.done.is_set() else "MISS",
             },
         )
@@ -1143,45 +1146,66 @@ async def stream_endpoint(
             flush=True,
         )
 
-    # V26 reliability rule: never hand a growing MP4 to the browser.
-    # The V25 logs show the complete media file normally lands less than a
-    # second after the progressive handoff point, while browsers can buffer or
-    # reject the chunked, non-seekable response. Keep the expensive YouTube
-    # extraction single-flight, wait for the independent cache build to finish,
-    # then serve a normal Content-Length/Range-capable MP4.
-    if state.task and not state.task.done():
+    # V27 fast-start path.
+    #
+    # The cache builder writes fragmented MP4 into a growing temporary file.
+    # Wait only until a useful startup buffer exists, then attach playback to
+    # that file while the independent build continues to completion.
+    if not state.done.is_set():
         print(
-            "audio waiting for stable cache",
+            "audio waiting for progressive prebuffer",
             json.dumps({
                 "videoId": video_id,
                 "purpose": state.purpose,
                 "elapsedSeconds": round(time.monotonic() - state.started, 2),
                 "bytesReady": state.bytes_written,
+                "targetBytes": LIVE_PREBUFFER_BYTES,
             }),
             flush=True,
         )
-        try:
-            await state.task
-        except asyncio.CancelledError:
-            raise HTTPException(status_code=503, detail="Audio preparation was cancelled")
-        except Exception as exc:
-            state.error = state.error or str(exc)[:1200]
+        await wait_for_progressive_ready(state)
 
-    if not cache_is_valid(video_id):
+    # ready is also set when the build terminates. Do not hand a failed or tiny
+    # object to the media element.
+    if state.done.is_set() and not state.success and not cache_is_valid(video_id):
         raise HTTPException(
             status_code=502,
-            detail=state.error or "Audio preparation completed without a stable playable file",
+            detail=state.error or "Audio preparation failed before playable media was available",
         )
 
-    path = cache_path(video_id)
+    # Prefer the completed, Range-capable cache if it won the race.
+    if cache_is_valid(video_id):
+        print(
+            "audio cache completed before progressive handoff",
+            json.dumps({
+                "videoId": video_id,
+                "elapsedSeconds": round(time.monotonic() - state.started, 2),
+            }),
+            flush=True,
+        )
+        return await serve_cached(cache_path(video_id), request)
+
+    if state.bytes_written < LIVE_PREBUFFER_BYTES:
+        raise HTTPException(
+            status_code=502,
+            detail=state.error or "Audio source ended before enough media was buffered",
+        )
+
     print(
-        "audio stable cache ready for playback",
+        "audio progressive playback starting",
         json.dumps({
             "videoId": video_id,
             "purpose": state.purpose,
-            "bytes": path.stat().st_size,
+            "client": state.client,
+            "bytesReady": state.bytes_written,
             "elapsedSeconds": round(time.monotonic() - state.started, 2),
         }),
         flush=True,
     )
-    return await serve_cached(path, request)
+
+    return StreamingResponse(
+        progressive_file_body(state),
+        status_code=200,
+        headers=progressive_headers(state),
+        media_type=STREAM_CONTENT_TYPE,
+    )
