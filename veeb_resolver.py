@@ -985,6 +985,231 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     raise RuntimeError("all direct mweb media probes failed: " + " || ".join(probe_errors)[-1800:])
 
 
+class YtdlpPhaseLogger:
+    """Tiny yt-dlp logger that emits only cold-start milestones, never secrets."""
+
+    def __init__(self, engine_id: str):
+        self.engine_id = engine_id
+        self._lock = threading.Lock()
+        self.video_id = ""
+        self.purpose = ""
+        self.started = 0.0
+        self._seen: set[str] = set()
+
+    def begin(self, video_id: str, purpose: str) -> None:
+        with self._lock:
+            self.video_id = video_id
+            self.purpose = purpose
+            self.started = time.monotonic()
+            self._seen = set()
+
+    def _phase(self, phase: str) -> None:
+        with self._lock:
+            if not self.video_id or phase in self._seen:
+                return
+            self._seen.add(phase)
+            elapsed = time.monotonic() - self.started
+            payload = {
+                "videoId": self.video_id,
+                "purpose": self.purpose,
+                "engine": self.engine_id,
+                "phase": phase,
+                "elapsedSeconds": round(elapsed, 3),
+            }
+        print("cold resolve phase", json.dumps(payload), flush=True)
+
+    def debug(self, message: str) -> None:
+        low = str(message).lower()
+        if "downloading webpage" in low:
+            self._phase("webpage")
+        elif "player api json" in low:
+            self._phase("player_api")
+        elif "generating a gvs po token" in low or "generating pot" in low:
+            self._phase("pot_request")
+        elif "solving js challenge" in low or "solving js challenges" in low:
+            self._phase("js_challenge")
+        elif "downloading player " in low:
+            self._phase("player_js")
+        elif "downloading 1 format" in low or "format(s):" in low:
+            self._phase("format_selected")
+
+    def warning(self, message: str) -> None:
+        self.debug(message)
+
+    def error(self, message: str) -> None:
+        self.debug(message)
+
+
+def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
+    args: dict[str, list[str]] = {}
+    if client:
+        args["player_client"] = [client]
+    if client in {"mweb", "web_music"}:
+        args["fetch_pot"] = ["auto"]
+        if not YOUTUBE_PREMIUM_ACCOUNT:
+            args["use_ad_playback_context"] = ["true"]
+    player_skip = ["configs"]
+    # Optional turbo mode. Current yt-dlp supports webpage/config skipping when
+    # visitor data is explicitly supplied, but its own docs warn this can be less
+    # stable. It is therefore available as an environment switch, not forced.
+    if YTDLP_SKIP_WEBPAGE_WITH_VISITOR and _visitor_data:
+        player_skip = ["webpage", "configs"]
+        args["visitor_data"] = [_visitor_data]
+    args["player_skip"] = player_skip
+    args["skip"] = ["hls", "dash"]
+    args["playback_wait"] = [f"{PLAYBACK_WAIT_SECONDS:g}"]
+    return args
+
+
+def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger) -> dict[str, Any]:
+    cookie_file = get_writable_cookie_file()
+    opts: dict[str, Any] = {
+        "format": SOURCE_FORMAT,
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": YTDLP_CACHE_DIR,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "retries": 0,
+        "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
+        "check_formats": False,
+        "js_runtimes": {JSC_RUNTIME: {}},
+        "extractor_args": {"youtube": youtube_extractor_args_dict(client_name)},
+        "logger": logger,
+    }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+    return opts
+
+
+class YtdlpEngine:
+    """A long-lived in-process yt-dlp instance dedicated to one extraction at a time."""
+
+    def __init__(self, engine_id: str, client_name: str, resolver_path: str):
+        self.engine_id = engine_id
+        self.client_name = client_name
+        self.resolver_path = resolver_path
+        self.logger = YtdlpPhaseLogger(engine_id)
+        self.ydl = yt_dlp.YoutubeDL(ytdlp_options(client_name, self.logger))
+        # Force the YouTube extractor class to be loaded during app startup, not
+        # on the user's first cold tap.
+        try:
+            self.ydl.get_info_extractor("Youtube")
+        except Exception:
+            pass
+
+    def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+        started = time.monotonic()
+        self.logger.begin(video_id, purpose)
+        # Refresh dynamic visitor data for this isolated engine just before use.
+        self.ydl.params["extractor_args"] = {
+            "youtube": youtube_extractor_args_dict(self.client_name)
+        }
+        try:
+            info = self.ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} failed: {exc}") from exc
+        if not isinstance(info, dict):
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} returned no metadata")
+        media_url = str(info.get("url") or "").strip()
+        if not media_url.startswith(("https://", "http://")):
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} did not return a direct URL")
+        raw_headers = info.get("http_headers") or {}
+        media = ResolvedMedia(
+            video_id=video_id,
+            url=media_url,
+            http_headers={str(k): str(v) for k, v in raw_headers.items() if v is not None},
+            client=self.client_name,
+            format_id=str(info.get("format_id")) if info.get("format_id") is not None else None,
+            ext=str(info.get("ext")) if info.get("ext") is not None else None,
+            content_type=str(info.get("container")) if info.get("container") is not None else None,
+            acodec=str(info.get("acodec")) if info.get("acodec") is not None else None,
+            vcodec=str(info.get("vcodec")) if info.get("vcodec") is not None else None,
+            abr=float(info.get("abr")) if isinstance(info.get("abr"), (int, float)) else None,
+            duration=float(info.get("duration")) if isinstance(info.get("duration"), (int, float)) else None,
+            title=str(info.get("title")) if info.get("title") is not None else None,
+            resolved_at=time.time(),
+            expires_at=resolved_expiry(media_url),
+            resolver_path=self.resolver_path,
+        )
+        print("in-process yt-dlp resolve success", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "client": self.client_name,
+            "engine": self.engine_id,
+            "resolverPath": self.resolver_path,
+            "formatId": media.format_id,
+            "extractionSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+        return media
+
+    def close(self) -> None:
+        close = getattr(self.ydl, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+class YtdlpEnginePool:
+    def __init__(self, name: str, size: int, client_name: str, resolver_path: str):
+        self.name = name
+        self.client_name = client_name
+        self.resolver_path = resolver_path
+        self.engines = [
+            YtdlpEngine(f"{name}-{index + 1}", client_name, resolver_path)
+            for index in range(size)
+        ]
+        self.queue: asyncio.Queue[YtdlpEngine] = asyncio.Queue()
+        for engine in self.engines:
+            self.queue.put_nowait(engine)
+
+    async def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+        queued_at = time.monotonic()
+        engine = await self.queue.get()
+        queue_wait = time.monotonic() - queued_at
+        print("in-process yt-dlp slot acquired", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "pool": self.name,
+            "engine": engine.engine_id,
+            "queueWaitSeconds": round(queue_wait, 3),
+            "availableAfterAcquire": self.queue.qsize(),
+        }), flush=True)
+        try:
+            media = await asyncio.to_thread(engine.resolve, video_id, purpose)
+            # Validate the winning URL before allowing it to win a cold race.
+            await probe_resolved_media(media)
+            return media
+        finally:
+            self.queue.put_nowait(engine)
+
+    def close(self) -> None:
+        for engine in self.engines:
+            engine.close()
+
+
+def init_ytdlp_pools() -> None:
+    global _fg_auth_pool, _fg_pot_pool, _prefetch_pool
+    if _fg_auth_pool is None:
+        _fg_auth_pool = YtdlpEnginePool(
+            "fg-auth", YTDLP_FG_AUTH_ENGINES, YTDLP_AUTH_CLIENT, "yt-dlp-auth-inproc-v35"
+        )
+    if _fg_pot_pool is None:
+        _fg_pot_pool = YtdlpEnginePool(
+            "fg-pot", YTDLP_FG_POT_ENGINES, YTDLP_POT_CLIENT, "yt-dlp-mweb-pot-inproc-v35"
+        )
+    if _prefetch_pool is None:
+        _prefetch_pool = YtdlpEnginePool(
+            "prefetch", YTDLP_PREFETCH_ENGINES, YTDLP_AUTH_CLIENT, "yt-dlp-prefetch-inproc-v35"
+        )
+
+
 async def probe_resolved_media(media: ResolvedMedia) -> None:
     client = get_http_client()
     headers = {
