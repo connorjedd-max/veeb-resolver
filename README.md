@@ -1,4 +1,4 @@
-# Veeb Render Resolver V36.13 - TV-variant cipher path
+# Veeb Render Resolver V36.13.1 - TV-variant cipher path
 
 This is a full Render deploy package.
 
@@ -20,3 +20,8 @@ Expected decisive cold-path logs:
 - `v36.13 direct mweb resolve success`
 
 The internal POT server should log loopback startup, and Render should no longer announce `New primary port detected: 4416`.
+
+
+## V36.13.1 startup fix
+- Installs `httpx[http2]`, which includes the `h2` dependency required by the resolver's shared `httpx.AsyncClient(http2=True)`.
+- No resolver logic or front-end behavior changed from V36.13.
