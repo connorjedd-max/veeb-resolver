@@ -9,6 +9,7 @@ import shutil
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -18,7 +19,7 @@ import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.4", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -612,8 +613,28 @@ async def get_bgutil_pot(content_binding: str, context: dict[str, Any], label: s
     if not isinstance(token, str) or not token:
         raise RuntimeError("bgutil returned no poToken")
     returned_binding = payload.get("contentBinding")
-    expires_at = float(payload.get("expiresAt") or (time.time() + 300))
-    print("v36.1 POT ready", json.dumps({
+    raw_expires_at = payload.get("expiresAt")
+    if raw_expires_at in (None, ""):
+        expires_at = time.time() + 300
+    elif isinstance(raw_expires_at, (int, float)):
+        expires_at = float(raw_expires_at)
+        if expires_at > 10_000_000_000:
+            expires_at /= 1000.0
+    elif isinstance(raw_expires_at, str):
+        value = raw_expires_at.strip()
+        try:
+            expires_at = float(value)
+            if expires_at > 10_000_000_000:
+                expires_at /= 1000.0
+        except ValueError:
+            try:
+                expires_at = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError as exc:
+                raise RuntimeError(f"bgutil returned invalid expiresAt: {raw_expires_at!r}") from exc
+    else:
+        raise RuntimeError(f"bgutil returned unsupported expiresAt type: {type(raw_expires_at).__name__}")
+
+    print("v36.4 POT ready", json.dumps({
         "bindingType": label,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "bindingMatches": str(returned_binding) == content_binding,
@@ -740,7 +761,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         fmt = select_direct_format(data)
         if not fmt:
             raise RuntimeError(f"{label} mweb /player returned no usable signed format: " + (playability_error(data) or "unknown"))
-        print("v36.3 mweb player candidate ready", json.dumps({
+        print("v36.4 mweb player candidate ready", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "candidate": label,
@@ -759,7 +780,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         players.append(await plain_task)
     except Exception as exc:
         errors.append("plain-player: " + str(exc))
-        print("v36.3 plain mweb player missed", json.dumps({
+        print("v36.4 plain mweb player missed", json.dumps({
             "videoId": video_id,
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1000:],
@@ -772,7 +793,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             raise RuntimeError("unexpected video-bound content binding")
     except Exception as exc:
         errors.append("video-pot: " + str(exc))
-        print("v36.3 video GVS proof missed", json.dumps({
+        print("v36.4 video GVS proof missed", json.dumps({
             "videoId": video_id,
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1000:],
@@ -783,7 +804,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             players.append(await call_player("video-proof", video_pot))
         except Exception as exc:
             errors.append("video-proof-player: " + str(exc))
-            print("v36.3 video-proof mweb player missed", json.dumps({
+            print("v36.4 video-proof mweb player missed", json.dumps({
                 "videoId": video_id,
                 "elapsedSeconds": round(time.monotonic() - started, 3),
                 "error": str(exc)[-1000:],
@@ -794,7 +815,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         session_pot, _ = await asyncio.wait_for(asyncio.shield(session_task), timeout=0.75)
     except Exception as exc:
         errors.append("session-pot: " + str(exc))
-        print("v36.3 session GVS unavailable, continuing", json.dumps({
+        print("v36.4 session GVS unavailable, continuing", json.dumps({
             "videoId": video_id,
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "error": str(exc)[-1000:],
@@ -817,7 +838,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         url = append_query_param(str(fmt["url"]), "pot", token)
         t0 = time.monotonic()
         await probe_direct_media(url, str(MWEB_DIRECT_CONFIG["userAgent"]))
-        print("v36.3 GVS proof candidate verified", json.dumps({
+        print("v36.4 GVS proof candidate verified", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "playerCandidate": player_label,
@@ -865,7 +886,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         expires_at=resolved_expiry(media_url),
         resolver_path="mweb-resilient-direct-v36.3",
     )
-    print("v36.3 direct mweb resolve success", json.dumps({
+    print("v36.4 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "purpose": purpose,
         "playerCandidate": player_label,
@@ -1210,7 +1231,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
                 return winner
             except Exception as exc:
                 errors.append(str(exc))
-                print("v36.3 direct head-start path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+                print("v36.4 direct head-start path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
 
     fallback = asyncio.create_task(resolve_ytdlp_foreground_v35(video_id, purpose))
     tasks = {generic_direct, direct_pot, fallback}
@@ -1234,7 +1255,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.3 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+            print("v36.4 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
     raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
