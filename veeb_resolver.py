@@ -1,9956 +1,1373 @@
-const SESSION_COOKIE = "music_session";
-const VEEB_UI_VERSION = "8.0-progressive-reliable";
-const SESSION_DAYS = 30;
-const PASSWORD_HASH_PREFIX = "hmac1:";
+import asyncio
+import importlib.metadata
+import hashlib
+import http.cookiejar
+import json
+import os
+import re
+import shutil
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, AsyncIterator
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+import httpx
+import yt_dlp
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-    try {
-      if (!env.DB) {
-        throw new Error(
-          'Missing D1 binding "DB". Add a D1 database binding named exactly DB in Worker Settings -> Bindings.'
-        );
-      }
+app = FastAPI(title="Veeb YouTube Resolver V36", docs_url=None, redoc_url=None)
 
-      await ensureDatabase(env);
-    } catch (error) {
-      let startupMessage = "Unknown D1 startup error";
+RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YOUTUBE_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIE_FILE", "/etc/secrets/youtube-cookies.txt")
+WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube-cookies.txt")
+YTDLP_CACHE_DIR = os.environ.get("YTDLP_CACHE_DIR", "/tmp/veeb-yt-dlp-cache")
+JSC_RUNTIME = os.environ.get("YOUTUBE_JSC_RUNTIME", "deno").strip() or "deno"
+SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "18").strip() or "18"
+YOUTUBE_PREMIUM_ACCOUNT = os.environ.get("YOUTUBE_PREMIUM_ACCOUNT", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
-      try {
-        if (error && typeof error.message === "string") {
-          startupMessage = error.message;
-        } else {
-          startupMessage = String(error);
-        }
-      } catch (_) {}
+# Public Innertube key used by YouTube's own web clients. It can be overridden
+# without changing code if YouTube rotates client configuration.
+INNERTUBE_API_KEY = os.environ.get(
+    "YOUTUBE_INNERTUBE_API_KEY",
+    "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30",
+).strip()
+INNERTUBE_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player"
+DIRECT_FAST_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_FAST_TIMEOUT", "3.5")))
+DIRECT_CLIENT_COOLDOWN_SECONDS = max(60, int(os.environ.get("VEEB_DIRECT_CLIENT_COOLDOWN", "1800")))
+DIRECT_PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_DIRECT_PREFETCH_CONCURRENCY", "3")))
+BGUTIL_BASE_URL = os.environ.get("VEEB_BGUTIL_BASE_URL", "http://127.0.0.1:4416").rstrip("/")
+DIRECT_MWEB_POT_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_MWEB_POT_TIMEOUT", "8.0")))
+DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_MWEB_PLAYER_TIMEOUT", "4.0")))
+YTDLP_FG_AUTH_ENGINES = max(1, int(os.environ.get("VEEB_YTDLP_FG_AUTH_ENGINES", "1")))
+YTDLP_FG_POT_ENGINES = max(1, int(os.environ.get("VEEB_YTDLP_FG_POT_ENGINES", "1")))
+YTDLP_PREFETCH_ENGINES = max(1, int(os.environ.get("VEEB_YTDLP_PREFETCH_ENGINES", "1")))
+YTDLP_SOCKET_TIMEOUT_SECONDS = max(5, int(os.environ.get("VEEB_YTDLP_SOCKET_TIMEOUT", "15")))
+YTDLP_EXTRACTOR_RETRIES = max(0, int(os.environ.get("VEEB_YTDLP_EXTRACTOR_RETRIES", "0")))
+YTDLP_SKIP_WEBPAGE_WITH_VISITOR = os.environ.get("VEEB_YTDLP_SKIP_WEBPAGE_WITH_VISITOR", "false").strip().lower() in {"1", "true", "yes", "on"}
+HEAVY_PREFETCH = os.environ.get("VEEB_HEAVY_PREFETCH", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-      console.error("Veeb startup error:", startupMessage, error);
+# These contexts are copied from current yt-dlp client definitions, but the hot
+# path only asks Innertube for the player response. We accept only already-signed
+# direct URLs. Anything requiring JS decipher, DRM, SABR, or POT falls through to
+# the mature yt-dlp fallback.
+DIRECT_CLIENTS: dict[str, dict[str, Any]] = {
+    # Current yt-dlp defaults to tv_downgraded + web_safari when logged-in
+    # cookies are supplied. These clients support cookie authentication.
+    "tv_downgraded": {
+        "clientName": "TVHTML5",
+        "clientVersion": "5.20260707",
+        "userAgent": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+        "hl": "en",
+        "supportsCookies": True,
+    },
+    "web_embedded": {
+        "clientName": "WEB_EMBEDDED_PLAYER",
+        "clientVersion": "2.20260708.00.00",
+        "hl": "en",
+        "supportsCookies": True,
+    },
+    "web_safari": {
+        "clientName": "WEB",
+        "clientVersion": "2.20260708.00.00",
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)",
+        "hl": "en",
+        "supportsCookies": True,
+    },
+}
+MWEB_DIRECT_CONFIG: dict[str, Any] = {
+    "clientName": "MWEB",
+    "clientVersion": "2.20260708.05.00",
+    "userAgent": "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)",
+    "hl": "en",
+}
 
-      return new Response(
-        "VEEB STARTUP ERROR\n\n" + startupMessage,
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "text/plain; charset=UTF-8",
-            "Cache-Control": "no-store"
-          }
-        }
-      );
-    }
+DIRECT_CLIENT_ORDER = [
+    name.strip()
+    for name in os.environ.get(
+        "VEEB_DIRECT_CLIENTS",
+        "tv_downgraded,web_embedded,web_safari",
+    ).split(",")
+    if name.strip() in DIRECT_CLIENTS
+]
+if not DIRECT_CLIENT_ORDER:
+    DIRECT_CLIENT_ORDER = ["tv_downgraded", "web_embedded", "web_safari"]
 
-    // ============================================================
-    // AUTH API
-    // ============================================================
+# Two yt-dlp fallbacks. The authenticated/default pass is deliberately first;
+# with cookies current yt-dlp selects tv_downgraded + web_safari. Only if that
+# fails do we pay the expensive mweb + BotGuard/PO-token path.
+YTDLP_AUTH_CLIENT = os.environ.get("YOUTUBE_AUTH_FALLBACK_CLIENT", "default").strip() or "default"
+YTDLP_POT_CLIENT = os.environ.get("YOUTUBE_FALLBACK_CLIENT", "mweb").strip() or "mweb"
 
-    if (url.pathname === "/api/auth/status" && request.method === "GET") {
-      const user = await getCurrentUser(request, env);
+PLAYBACK_WAIT_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_PLAYBACK_WAIT", "0")))
+RESOLVED_URL_FALLBACK_TTL_SECONDS = max(60, int(os.environ.get("VEEB_RESOLVED_URL_TTL", "1800")))
+RESOLVED_URL_EXPIRY_MARGIN_SECONDS = max(30, int(os.environ.get("VEEB_RESOLVED_URL_EXPIRY_MARGIN", "120")))
+RESOLVED_URL_MAX_ENTRIES = max(16, int(os.environ.get("VEEB_RESOLVED_URL_MAX_ENTRIES", "512")))
+RESOLVE_TIMEOUT_SECONDS = max(15.0, float(os.environ.get("VEEB_RESOLVE_TIMEOUT", "45")))
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_UPSTREAM_CONNECT_TIMEOUT", "8")))
+UPSTREAM_READ_TIMEOUT_SECONDS = max(10.0, float(os.environ.get("VEEB_UPSTREAM_READ_TIMEOUT", "45")))
+PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", str(256 * 1024))))
 
-      return json({
-        authenticated: !!user,
-        user: user
-          ? {
-              id: user.id,
-              email: user.email
-            }
-          : null
-      });
-    }
-
-    if (url.pathname === "/api/auth/register" && request.method === "POST") {
-      try {
-        return await handleRegister(request, env);
-      } catch (error) {
-        return apiFailure("register", error);
-      }
-    }
-
-    if (url.pathname === "/api/auth/login" && request.method === "POST") {
-      try {
-        return await handleLogin(request, env);
-      } catch (error) {
-        return apiFailure("login", error);
-      }
-    }
-
-    if (url.pathname === "/api/auth/logout" && request.method === "POST") {
-      try {
-        return await handleLogout(request, env);
-      } catch (error) {
-        return apiFailure("logout", error);
-      }
-    }
-
-    // ============================================================
-    // EVERYTHING BELOW HERE REQUIRES LOGIN
-    // ============================================================
-
-    if (url.pathname.startsWith("/api/")) {
-      const user = await getCurrentUser(request, env);
-
-      if (!user) {
-        return json(
-          {
-            error: "Unauthorized"
-          },
-          401
-        );
-      }
-
-      // ==========================================================
-      // SEARCH
-      // ==========================================================
-
-      if (url.pathname === "/api/search" && request.method === "GET") {
-        const q = url.searchParams.get("q")?.trim();
-
-        if (!q) {
-          return json(
-            {
-              error: "Missing search query"
-            },
-            400
-          );
-        }
-
-        /*
-          IMPORTANT
-
-          Put your catalogue/search implementation here.
-
-          This example expects searchCatalogue() to return:
-
-          [
-            {
-              id: "...",
-              title: "...",
-              artist: "...",
-              album: "...",
-              artwork: "..."
-            }
-          ]
-        */
-
-        const results = await searchCatalogue(q, env);
-
-        return json(results);
-      }
-
-      // ==========================================================
-      // RESOLVER WAKE
-      // Wake Render as soon as Veeb opens so a first tap does not also pay
-      // the service cold-start cost.
-      // ==========================================================
-
-      if (url.pathname === "/api/resolver/wake" && request.method === "POST") {
-        ctx.waitUntil(
-          wakeYouTubeResolver(env).catch(error => {
-            console.error("Veeb resolver wake failed:", error);
-          })
-        );
-
-        return json({ ok: true, status: "waking" }, 202);
-      }
+os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
 
 
-      // ==========================================================
-      // AUDIO PREFETCH
-      // Warms the Render cache without exposing the resolver secret.
-      // ==========================================================
+@dataclass
+class ResolvedMedia:
+    video_id: str
+    url: str
+    http_headers: dict[str, str]
+    client: str
+    format_id: str | None
+    ext: str | None
+    content_type: str | None
+    acodec: str | None
+    vcodec: str | None
+    abr: float | None
+    duration: float | None
+    title: str | None
+    resolved_at: float
+    expires_at: float
+    resolver_path: str
 
-      if (
-        url.pathname.startsWith("/api/prefetch/") &&
-        request.method === "POST"
-      ) {
-        const trackId = decodeURIComponent(
-          url.pathname.slice("/api/prefetch/".length)
-        );
+    def valid(self) -> bool:
+        return time.time() < self.expires_at
 
-        if (!trackId) {
-          return json({ error: "Missing track ID" }, 400);
-        }
 
-        const intent = url.searchParams.get("intent") === "1";
+_resolved_cache: dict[str, ResolvedMedia] = {}
+_resolve_tasks: dict[str, asyncio.Task[ResolvedMedia]] = {}
+_http_client: httpx.AsyncClient | None = None
+_fg_auth_pool = None
+_fg_pot_pool = None
+_prefetch_pool = None
+_direct_prefetch_sem = asyncio.Semaphore(DIRECT_PREFETCH_CONCURRENCY)
+_resolve_task_purpose: dict[str, str] = {}
+_direct_client_cooldown_until: dict[str, float] = {}
+_visitor_data: str | None = None
+_youtube_cookie_header: str = ""
+_youtube_cookie_values: dict[str, str] = {}
+_youtube_cookie_authenticated = False
 
-        ctx.waitUntil(
-          prefetchPlayableAudio(trackId, env, intent).catch(error => {
-            console.error("Veeb prefetch failed:", trackId, error);
-          })
-        );
 
-        return json({ ok: true, status: "warming", trackId, intent }, 202);
-      }
+def require_auth(authorization: str | None) -> None:
+    if not RESOLVER_SECRET:
+        raise HTTPException(status_code=503, detail="RESOLVER_SECRET is not configured")
+    if authorization != f"Bearer {RESOLVER_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-      // ==========================================================
-      // AUDIO STREAM
-      // Veeb stays same-origin in the browser. Playback resolution and
-      // YouTube media fetching happen on the external resolver so the
-      // two upstream requests originate from the same resolver network.
-      // ==========================================================
 
-      if (
-        url.pathname.startsWith("/api/audio/") &&
-        (request.method === "GET" || request.method === "HEAD")
-      ) {
-        const trackId = decodeURIComponent(
-          url.pathname.slice("/api/audio/".length)
-        );
+def validate_video_id(video_id: str) -> str:
+    if not VIDEO_ID_RE.fullmatch(video_id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
+    return video_id
 
-        if (!trackId) {
-          return new Response("Missing track ID", {
-            status: 400,
-            headers: {
-              "Content-Type": "text/plain; charset=UTF-8",
-              "Cache-Control": "no-store"
-            }
-          });
-        }
 
-        try {
-          return await streamPlayableAudio(
-            request,
-            trackId,
-            env,
-            ctx
-          );
-        } catch (error) {
-          console.error(
-            "Veeb audio proxy failed:",
-            trackId,
-            error
-          );
+def get_writable_cookie_file() -> str | None:
+    if not os.path.isfile(YOUTUBE_COOKIE_FILE):
+        return None
+    if not os.path.isfile(WRITABLE_COOKIE_FILE):
+        shutil.copyfile(YOUTUBE_COOKIE_FILE, WRITABLE_COOKIE_FILE)
+        os.chmod(WRITABLE_COOKIE_FILE, 0o600)
+        print("cookie runtime copy ready", json.dumps({"source": YOUTUBE_COOKIE_FILE, "runtime": WRITABLE_COOKIE_FILE}), flush=True)
+    return WRITABLE_COOKIE_FILE
 
-          return new Response(
-            "Veeb playback failed: "
-            + (
-              error && typeof error.message === "string"
-                ? error.message
-                : String(error)
+
+def load_youtube_cookie_session(force: bool = False) -> bool:
+    """Load the existing Netscape cookie file once for the direct fast path.
+
+    We never log cookie values. The same cookie file remains available to yt-dlp.
+    """
+    global _youtube_cookie_header, _youtube_cookie_values, _youtube_cookie_authenticated
+    if _youtube_cookie_header and not force:
+        return _youtube_cookie_authenticated
+    cookie_file = get_writable_cookie_file()
+    if not cookie_file:
+        _youtube_cookie_header = ""
+        _youtube_cookie_values = {}
+        _youtube_cookie_authenticated = False
+        return False
+    jar = http.cookiejar.MozillaCookieJar(cookie_file)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=False)
+    except Exception as exc:
+        print("cookie session load failed", json.dumps({"error": str(exc)[:500]}), flush=True)
+        return False
+    now = time.time()
+    pairs: list[str] = []
+    values: dict[str, str] = {}
+    for cookie in jar:
+        domain = (cookie.domain or "").lower().lstrip(".")
+        # Match yt-dlp's auth behavior: only cookies that belong to YouTube
+        # are attached to youtube.com Innertube requests.
+        if not (domain == "youtube.com" or domain.endswith(".youtube.com")):
+            continue
+        if cookie.expires is not None and cookie.expires <= now:
+            continue
+        pairs.append(f"{cookie.name}={cookie.value}")
+        values[cookie.name] = cookie.value
+    _youtube_cookie_header = "; ".join(pairs)
+    _youtube_cookie_values = values
+    sid_present = bool(values.get("SAPISID") or values.get("__Secure-1PAPISID") or values.get("__Secure-3PAPISID"))
+    _youtube_cookie_authenticated = bool(values.get("LOGIN_INFO") and sid_present)
+    print("authenticated cookie session ready", json.dumps({
+        "cookieCount": len(values),
+        "hasLoginInfo": bool(values.get("LOGIN_INFO")),
+        "hasSidAuth": sid_present,
+        "authenticated": _youtube_cookie_authenticated,
+    }), flush=True)
+    return _youtube_cookie_authenticated
+
+
+def make_sid_authorization(scheme: str, sid: str, origin: str) -> str:
+    timestamp = str(round(time.time()))
+    digest = hashlib.sha1(f"{timestamp} {sid} {origin}".encode()).hexdigest()
+    return f"{scheme} {timestamp}_{digest}"
+
+
+def youtube_cookie_auth_header(origin: str = "https://www.youtube.com") -> str | None:
+    load_youtube_cookie_session()
+    values = _youtube_cookie_values
+    sapisid = values.get("SAPISID") or values.get("__Secure-3PAPISID")
+    candidates = (
+        ("SAPISIDHASH", sapisid),
+        ("SAPISID1PHASH", values.get("__Secure-1PAPISID")),
+        ("SAPISID3PHASH", values.get("__Secure-3PAPISID")),
+    )
+    parts = [make_sid_authorization(scheme, sid, origin) for scheme, sid in candidates if sid]
+    return " ".join(parts) or None
+
+
+def pot_http_server_ready() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 4416), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def parse_googlevideo_expiry(media_url: str) -> float | None:
+    try:
+        values = parse_qs(urlparse(media_url).query).get("expire")
+        if not values:
+            return None
+        value = float(values[0])
+        return value if value > time.time() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def resolved_expiry(media_url: str) -> float:
+    now = time.time()
+    google_expiry = parse_googlevideo_expiry(media_url)
+    if google_expiry:
+        return max(now + 30, google_expiry - RESOLVED_URL_EXPIRY_MARGIN_SECONDS)
+    return now + RESOLVED_URL_FALLBACK_TTL_SECONDS
+
+
+def cleanup_resolved_cache() -> None:
+    now = time.time()
+    for video_id in list(_resolved_cache):
+        if _resolved_cache[video_id].expires_at <= now:
+            _resolved_cache.pop(video_id, None)
+    if len(_resolved_cache) <= RESOLVED_URL_MAX_ENTRIES:
+        return
+    oldest = sorted(_resolved_cache.values(), key=lambda item: item.resolved_at)
+    for media in oldest[: len(_resolved_cache) - RESOLVED_URL_MAX_ENTRIES]:
+        _resolved_cache.pop(media.video_id, None)
+
+
+def get_cached_media(video_id: str) -> ResolvedMedia | None:
+    media = _resolved_cache.get(video_id)
+    if media and media.valid():
+        return media
+    if media:
+        _resolved_cache.pop(video_id, None)
+    return None
+
+
+def invalidate_media(video_id: str) -> None:
+    _resolved_cache.pop(video_id, None)
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(
+                connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                read=UPSTREAM_READ_TIMEOUT_SECONDS,
+                write=UPSTREAM_READ_TIMEOUT_SECONDS,
+                pool=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
             ),
-            {
-              status: 502,
-              headers: {
-                "Content-Type": "text/plain; charset=UTF-8",
-                "Cache-Control": "no-store"
-              }
+            limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+            http2=True,
+        )
+    return _http_client
+
+
+def client_on_cooldown(client: str) -> bool:
+    return _direct_client_cooldown_until.get(client, 0) > time.time()
+
+
+def cool_down_client(client: str, reason: str) -> None:
+    _direct_client_cooldown_until[client] = time.time() + DIRECT_CLIENT_COOLDOWN_SECONDS
+    print("direct client cooldown", json.dumps({"client": client, "seconds": DIRECT_CLIENT_COOLDOWN_SECONDS, "reason": reason[:500]}), flush=True)
+
+
+def innertube_headers(client: str) -> dict[str, str]:
+    cfg = DIRECT_CLIENTS[client]
+    origin = "https://www.youtube.com"
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "X-Youtube-Client-Name": str({"WEB_EMBEDDED_PLAYER": 56, "WEB": 1, "TVHTML5": 7}.get(cfg["clientName"], 1)),
+        "X-Youtube-Client-Version": str(cfg["clientVersion"]),
+    }
+    if cfg.get("userAgent"):
+        headers["User-Agent"] = str(cfg["userAgent"])
+    if _visitor_data:
+        headers["X-Goog-Visitor-Id"] = _visitor_data
+
+    # Mirror the essential cookie-auth headers used by yt-dlp's YouTube
+    # extractor. This turns the direct /player request into the same logged-in
+    # session represented by youtube-cookies.txt, instead of an anonymous
+    # datacenter request.
+    if cfg.get("supportsCookies") and load_youtube_cookie_session():
+        if _youtube_cookie_header:
+            headers["Cookie"] = _youtube_cookie_header
+        authorization = youtube_cookie_auth_header(origin)
+        if authorization:
+            headers["Authorization"] = authorization
+            headers["X-Origin"] = origin
+        headers["X-Goog-AuthUser"] = "0"
+        headers["X-Youtube-Bootstrap-Logged-In"] = "true"
+    return headers
+
+
+def innertube_payload(video_id: str, client: str) -> dict[str, Any]:
+    cfg = dict(DIRECT_CLIENTS[client])
+    cfg.pop("supportsCookies", None)
+    cfg.setdefault("timeZone", "UTC")
+    cfg.setdefault("utcOffsetMinutes", 0)
+    context: dict[str, Any] = {
+        "client": cfg,
+        "request": {"useSsl": True, "internalExperimentFlags": []},
+        "user": {"lockedSafetyMode": False},
+    }
+    if client == "web_embedded":
+        context["thirdParty"] = {"embedUrl": "https://www.google.com/"}
+    return {
+        "context": context,
+        "videoId": video_id,
+        "contentCheckOk": True,
+        "racyCheckOk": True,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "lactMilliseconds": "-1",
             }
-          );
-        }
-      }
-
-      // ==========================================================
-      // PLAYER DIAGNOSTICS
-      // Returns resolver metadata without exposing YouTube's temporary
-      // media URL. The browser player uses /api/audio/:id.
-      // ==========================================================
-
-      if (
-        url.pathname.startsWith("/api/play/") &&
-        request.method === "GET"
-      ) {
-        const trackId = decodeURIComponent(
-          url.pathname.slice("/api/play/".length)
-        );
-
-        if (!trackId) {
-          return json(
-            {
-              error: "Missing track ID"
-            },
-            400
-          );
-        }
-
-        /*
-          This function is intentionally isolated.
-
-          It should return a media URL you are authorised
-          to stream/play.
-
-          Example:
-          {
-            url: "https://...",
-            contentType: "audio/mp4"
-          }
-        */
-
-        const playable = await getPlayableUrl(trackId, env);
-
-        if (!playable) {
-          return json(
-            {
-              error: "No playable source available"
-            },
-            404
-          );
-        }
-
-        return json(playable);
-      }
-
-      // ==========================================================
-      // RECORD TRACK
-      // ==========================================================
-
-      if (url.pathname === "/api/tracks" && request.method === "POST") {
-        const track = await request.json();
-
-        await upsertTrack(env, track);
-
-        return json({
-          ok: true
-        });
-      }
-
-      // ==========================================================
-      // LISTENING EVENTS
-      // ==========================================================
-
-      if (url.pathname === "/api/events" && request.method === "POST") {
-        const event = await request.json();
-
-        const outcome = await recordListeningEvent(env, user.id, event);
-
-        if (
-          outcome?.needsGenreEnrichment &&
-          ctx?.waitUntil
-        ) {
-          ctx.waitUntil(
-            enrichTrackBrainzAndApplySignal(
-              env,
-              user.id,
-              outcome.trackId,
-              outcome.delta,
-              event.type
-            )
-          );
-        }
-
-        if (["like", "dislike", "complete", "skip"].includes(event.type)) {
-          await invalidateRecommendationCache(env, user.id);
-        }
-
-        return json({
-          ok: true
-        });
-      }
-
-      // ==========================================================
-      // SAVE
-      // ==========================================================
-
-      if (url.pathname === "/api/save" && request.method === "POST") {
-        const track = await request.json();
-
-        await upsertTrack(env, track);
-
-        await env.DB.prepare(`
-          INSERT INTO saved_tracks (
-            user_id,
-            track_id,
-            saved_at
-          )
-          VALUES (?, ?, unixepoch())
-
-          ON CONFLICT(user_id, track_id)
-          DO UPDATE SET
-            saved_at = unixepoch()
-        `)
-          .bind(
-            user.id,
-            track.id
-          )
-          .run();
-
-        const saveOutcome = await addPreferenceScore(
-          env,
-          user.id,
-          track.id,
-          7,
-          "save"
-        );
-
-        if (
-          saveOutcome?.needsGenreEnrichment &&
-          ctx?.waitUntil
-        ) {
-          ctx.waitUntil(
-            enrichTrackBrainzAndApplySignal(
-              env,
-              user.id,
-              track.id,
-              7,
-              "save"
-            )
-          );
-        }
-
-        await invalidateRecommendationCache(env, user.id);
-
-        return json({
-          ok: true
-        });
-      }
-
-      // ==========================================================
-      // UNSAVE
-      // ==========================================================
-
-      if (url.pathname === "/api/unsave" && request.method === "POST") {
-        const body = await request.json();
-
-        await env.DB.prepare(`
-          DELETE FROM saved_tracks
-          WHERE user_id = ?
-          AND track_id = ?
-        `)
-          .bind(
-            user.id,
-            body.trackId
-          )
-          .run();
-
-        await invalidateRecommendationCache(env, user.id);
-
-        return json({
-          ok: true
-        });
-      }
-
-      // ==========================================================
-      // SAVED TRACKS
-      // ==========================================================
-
-      if (url.pathname === "/api/saved" && request.method === "GET") {
-        const result = await env.DB.prepare(`
-          SELECT
-            t.id,
-            t.title,
-            t.artist,
-            t.album,
-            t.artwork
-
-          FROM saved_tracks s
-
-          INNER JOIN tracks t
-            ON t.id = s.track_id
-
-          WHERE s.user_id = ?
-
-          ORDER BY s.saved_at DESC
-        `)
-          .bind(user.id)
-          .all();
-
-        return json(result.results);
-      }
-
-      // ==========================================================
-      // PLAYLISTS
-      // ==========================================================
-
-      if (url.pathname === "/api/playlists" && request.method === "GET") {
-        const result = await env.DB.prepare(`
-          SELECT
-            id,
-            name,
-            created_at AS createdAt
-
-          FROM playlists
-
-          WHERE user_id = ?
-
-          ORDER BY created_at DESC
-        `)
-          .bind(user.id)
-          .all();
-
-        return json(result.results);
-      }
-
-      if (url.pathname === "/api/playlists" && request.method === "POST") {
-        const body = await request.json();
-
-        const name = String(body.name || "").trim();
-
-        if (!name) {
-          return json(
-            {
-              error: "Playlist name required"
-            },
-            400
-          );
-        }
-
-        const id = crypto.randomUUID();
-
-        await env.DB.prepare(`
-          INSERT INTO playlists (
-            id,
-            user_id,
-            name,
-            created_at
-          )
-          VALUES (?, ?, ?, unixepoch())
-        `)
-          .bind(
-            id,
-            user.id,
-            name
-          )
-          .run();
-
-        return json({
-          id,
-          name
-        });
-      }
-
-      const addPlaylistMatch = url.pathname.match(
-        /^\/api\/playlists\/([^/]+)\/tracks$/
-      );
-
-      if (
-        addPlaylistMatch &&
-        request.method === "POST"
-      ) {
-        const playlistId = decodeURIComponent(
-          addPlaylistMatch[1]
-        );
-
-        const track = await request.json();
-
-        const playlist = await env.DB.prepare(`
-          SELECT id
-          FROM playlists
-          WHERE id = ?
-          AND user_id = ?
-        `)
-          .bind(
-            playlistId,
-            user.id
-          )
-          .first();
-
-        if (!playlist) {
-          return json(
-            {
-              error: "Playlist not found"
-            },
-            404
-          );
-        }
-
-        await upsertTrack(env, track);
-
-        const nextPosition = await env.DB.prepare(`
-          SELECT
-            COALESCE(MAX(position), -1) + 1 AS nextPosition
-
-          FROM playlist_tracks
-
-          WHERE playlist_id = ?
-        `)
-          .bind(playlistId)
-          .first();
-
-        await env.DB.prepare(`
-          INSERT INTO playlist_tracks (
-            playlist_id,
-            track_id,
-            position,
-            added_at
-          )
-          VALUES (?, ?, ?, unixepoch())
-
-          ON CONFLICT(playlist_id, track_id)
-          DO NOTHING
-        `)
-          .bind(
-            playlistId,
-            track.id,
-            nextPosition?.nextPosition ?? 0
-          )
-          .run();
-
-        return json({
-          ok: true
-        });
-      }
-
-      // ==========================================================
-      // PLAYLIST TRACKS
-      // ==========================================================
-
-      const getPlaylistTracksMatch = url.pathname.match(
-        /^\/api\/playlists\/([^/]+)\/tracks$/
-      );
-
-      if (
-        getPlaylistTracksMatch &&
-        request.method === "GET"
-      ) {
-        const playlistId = decodeURIComponent(
-          getPlaylistTracksMatch[1]
-        );
-
-        const playlist = await env.DB.prepare(`
-          SELECT id, name
-          FROM playlists
-          WHERE id = ?
-            AND user_id = ?
-        `)
-          .bind(playlistId, user.id)
-          .first();
-
-        if (!playlist) {
-          return json({ error: "Playlist not found" }, 404);
-        }
-
-        const result = await env.DB.prepare(`
-          SELECT
-            t.id,
-            t.title,
-            t.artist,
-            t.album,
-            t.artwork,
-            t.provider,
-            t.provider_track_id AS providerTrackId
-          FROM playlist_tracks pt
-          INNER JOIN tracks t
-            ON t.id = pt.track_id
-          WHERE pt.playlist_id = ?
-          ORDER BY pt.position ASC, pt.added_at ASC
-        `)
-          .bind(playlistId)
-          .all();
-
-        return json({
-          playlist,
-          tracks: result.results || []
-        });
-      }
-
-      // ==========================================================
-      // RADIO / SESSION QUEUE
-      // ==========================================================
-
-      if (
-        url.pathname.startsWith("/api/radio/") &&
-        request.method === "GET"
-      ) {
-        const seedTrackId = decodeURIComponent(
-          url.pathname.slice("/api/radio/".length)
-        );
-
-        if (!seedTrackId) {
-          return json({ error: "Missing seed track ID" }, 400);
-        }
-
-        const tracks = await buildRecommendations(
-          env,
-          user.id,
-          {
-            seedTrackId,
-            limit: 32,
-            useCache: false
-          }
-        );
-
-        return json(tracks);
-      }
-
-      // ==========================================================
-      // RECOMMENDATIONS
-      // ==========================================================
-
-      if (
-        url.pathname === "/api/recommendations" &&
-        request.method === "GET"
-      ) {
-        const tracks = await buildRecommendations(
-          env,
-          user.id,
-          {
-            limit: 36,
-            useCache: true
-          }
-        );
-
-        return json(tracks);
-      }
-
-      // ==========================================================
-      // TASTE PROFILE DEBUG
-      // ==========================================================
-
-      if (
-        url.pathname === "/api/taste" &&
-        request.method === "GET"
-      ) {
-        const profile = await getTasteProfile(env, user.id);
-
-        return json({
-          artists: profile.artists.slice(0, 12),
-          genres: profile.genres.slice(0, 12),
-          tracks: profile.topTracks.slice(0, 12),
-          musicBrainzEnabled: true,
-          listenBrainzEnabled: true
-        });
-      }
-
-      return json(
-        {
-          error: "API endpoint not found"
         },
-        404
-      );
     }
 
-    // ============================================================
-    // APP
-    // ============================================================
 
-    return new Response(APP_HTML, {
-      headers: {
-        "Content-Type": "text/html; charset=UTF-8",
-        "Cache-Control": "no-store"
-      }
-    });
-  },
-
-  // Optional Cloudflare Cron Trigger. If you add `*/10 * * * *` in the
-  // Worker dashboard, this keeps the free Render service warm and preserves
-  // its in-memory/on-disk session caches instead of losing them after idle.
-  async scheduled(controller, env, ctx) {
-    ctx.waitUntil(
-      wakeYouTubeResolver(env).catch(error => {
-        console.error("Veeb scheduled resolver wake failed:", error);
-      })
-    );
-  }
-};
-
-
-// =================================================================
-// AUTH
-// =================================================================
-
-async function handleRegister(request, env) {
-  const body = await request.json();
-
-  const email = normalizeEmail(body.email);
-  const password = String(body.password || "");
-
-  if (!isValidEmail(email)) {
-    return json(
-      {
-        error: "Enter a valid email"
-      },
-      400
-    );
-  }
-
-  if (password.length < 10) {
-    return json(
-      {
-        error: "Password must be at least 10 characters"
-      },
-      400
-    );
-  }
-
-  const existing = await env.DB.prepare(`
-    SELECT id
-    FROM users
-    WHERE email = ?
-  `)
-    .bind(email)
-    .first();
-
-  if (existing) {
-    return json(
-      {
-        error: "An account already exists with that email"
-      },
-      409
-    );
-  }
-
-  const userId = crypto.randomUUID();
-
-  const salt = crypto.getRandomValues(
-    new Uint8Array(16)
-  );
-
-  const passwordHash = await hashPassword(
-    password,
-    salt,
-    env
-  );
-
-  await env.DB.prepare(`
-    INSERT INTO users (
-      id,
-      email,
-      password_hash,
-      password_salt,
-      created_at
-    )
-    VALUES (?, ?, ?, ?, unixepoch())
-  `)
-    .bind(
-      userId,
-      email,
-      PASSWORD_HASH_PREFIX + bytesToBase64(passwordHash),
-      bytesToBase64(salt)
-    )
-    .run();
-
-  const session = await createSession(
-    env,
-    userId
-  );
-
-  return jsonWithCookie(
-    {
-      ok: true,
-      user: {
-        id: userId,
-        email
-      }
-    },
-    session.cookie
-  );
-}
-
-
-async function handleLogin(request, env) {
-  const body = await request.json();
-
-  const email = normalizeEmail(body.email);
-  const password = String(body.password || "");
-
-  const user = await env.DB.prepare(`
-    SELECT
-      id,
-      email,
-      password_hash AS passwordHash,
-      password_salt AS passwordSalt
-
-    FROM users
-
-    WHERE email = ?
-  `)
-    .bind(email)
-    .first();
-
-  if (!user) {
-    return json(
-      {
-        error: "Incorrect email or password"
-      },
-      401
-    );
-  }
-
-  if (
-    typeof user.passwordHash !== "string" ||
-    !user.passwordHash.startsWith(
-      PASSWORD_HASH_PREFIX
-    )
-  ) {
-    throw new Error(
-      "This account was created by an older Veeb auth build. Delete that test account from D1 and create it again."
-    );
-  }
-
-  const expected = base64ToBytes(
-    user.passwordHash.slice(
-      PASSWORD_HASH_PREFIX.length
-    )
-  );
-
-  const salt = base64ToBytes(
-    user.passwordSalt
-  );
-
-  const actual = await hashPassword(
-    password,
-    salt,
-    env
-  );
-
-  const matches = timingSafeBytesEqual(
-    expected,
-    actual
-  );
-
-  if (!matches) {
-    return json(
-      {
-        error: "Incorrect email or password"
-      },
-      401
-    );
-  }
-
-  const session = await createSession(
-    env,
-    user.id
-  );
-
-  return jsonWithCookie(
-    {
-      ok: true,
-      user: {
-        id: user.id,
-        email: user.email
-      }
-    },
-    session.cookie
-  );
-}
-
-
-async function handleLogout(request, env) {
-  const token = getCookie(
-    request,
-    SESSION_COOKIE
-  );
-
-  if (token) {
-    const tokenHash = await sha256Hex(token);
-
-    await env.DB.prepare(`
-      DELETE FROM sessions
-      WHERE token_hash = ?
-    `)
-      .bind(tokenHash)
-      .run();
-  }
-
-  return jsonWithCookie(
-    {
-      ok: true
-    },
-    `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`
-  );
-}
-
-
-async function createSession(env, userId) {
-  const random = crypto.getRandomValues(
-    new Uint8Array(32)
-  );
-
-  const token = bytesToBase64Url(random);
-
-  const tokenHash = await sha256Hex(token);
-
-  const expiresAt =
-    Math.floor(Date.now() / 1000) +
-    SESSION_DAYS * 24 * 60 * 60;
-
-  await env.DB.prepare(`
-    INSERT INTO sessions (
-      id,
-      user_id,
-      token_hash,
-      expires_at,
-      created_at
-    )
-    VALUES (?, ?, ?, ?, unixepoch())
-  `)
-    .bind(
-      crypto.randomUUID(),
-      userId,
-      tokenHash,
-      expiresAt
-    )
-    .run();
-
-  const cookie =
-    `${SESSION_COOKIE}=${token}; ` +
-    `Path=/; ` +
-    `HttpOnly; ` +
-    `Secure; ` +
-    `SameSite=Lax; ` +
-    `Max-Age=${SESSION_DAYS * 24 * 60 * 60}`;
-
-  return {
-    token,
-    cookie
-  };
-}
-
-
-async function getCurrentUser(request, env) {
-  const token = getCookie(
-    request,
-    SESSION_COOKIE
-  );
-
-  if (!token) {
-    return null;
-  }
-
-  const tokenHash = await sha256Hex(token);
-
-  const user = await env.DB.prepare(`
-    SELECT
-      u.id,
-      u.email
-
-    FROM sessions s
-
-    INNER JOIN users u
-      ON u.id = s.user_id
-
-    WHERE
-      s.token_hash = ?
-      AND s.expires_at > unixepoch()
-
-    LIMIT 1
-  `)
-    .bind(tokenHash)
-    .first();
-
-  return user || null;
-}
-
-
-async function hashPassword(password, salt, env) {
-  if (!env.AUTH_PEPPER) {
-    throw new Error(
-      'Missing AUTH_PEPPER Worker secret. Add a secret named exactly AUTH_PEPPER in Worker Settings -> Variables and Secrets.'
-    );
-  }
-
-  const encoder = new TextEncoder();
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(
-      String(env.AUTH_PEPPER)
-    ),
-    {
-      name: "HMAC",
-      hash: "SHA-256"
-    },
-    false,
-    ["sign"]
-  );
-
-  const passwordBytes =
-    encoder.encode(password);
-
-  const payload =
-    new Uint8Array(
-      salt.length + passwordBytes.length
-    );
-
-  payload.set(salt, 0);
-  payload.set(
-    passwordBytes,
-    salt.length
-  );
-
-  const signature =
-    await crypto.subtle.sign(
-      "HMAC",
-      key,
-      payload
-    );
-
-  return new Uint8Array(
-    signature
-  );
-}
-
-function timingSafeBytesEqual(a, b) {
-  if (a.length !== b.length) {
-    return false;
-  }
-
-  if (
-    typeof crypto.subtle.timingSafeEqual === "function"
-  ) {
-    return crypto.subtle.timingSafeEqual(
-      a,
-      b
-    );
-  }
-
-  let diff = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    diff |= a[i] ^ b[i];
-  }
-
-  return diff === 0;
-}
-
-
-// =================================================================
-// DATABASE
-// =================================================================
-
-let schemaReadyPromise = null;
-
-async function ensureDatabase(env) {
-  if (!schemaReadyPromise) {
-    schemaReadyPromise = initialiseDatabaseSchema(env).catch(error => {
-      schemaReadyPromise = null;
-      throw error;
-    });
-  }
-
-  return schemaReadyPromise;
-}
-
-
-async function initialiseDatabaseSchema(env) {
-  const steps = [
-    {
-      name: "users table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
-          email TEXT NOT NULL UNIQUE,
-          password_hash TEXT NOT NULL,
-          password_salt TEXT NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "sessions table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS sessions (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          token_hash TEXT NOT NULL UNIQUE,
-          expires_at INTEGER NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "sessions token index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_sessions_token
-        ON sessions(token_hash)
-      `
-    },
-    {
-      name: "sessions user index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_sessions_user
-        ON sessions(user_id)
-      `
-    },
-    {
-      name: "tracks table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS tracks (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          artist TEXT,
-          album TEXT,
-          artwork TEXT,
-          created_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "saved tracks table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS saved_tracks (
-          user_id TEXT NOT NULL,
-          track_id TEXT NOT NULL,
-          saved_at INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY (user_id, track_id)
-        )
-      `
-    },
-    {
-      name: "playlists table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS playlists (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "playlist tracks table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS playlist_tracks (
-          playlist_id TEXT NOT NULL,
-          track_id TEXT NOT NULL,
-          position INTEGER NOT NULL,
-          added_at INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY (playlist_id, track_id)
-        )
-      `
-    },
-    {
-      name: "listening events table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS listening_events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          track_id TEXT NOT NULL,
-          event_type TEXT NOT NULL,
-          position_seconds REAL,
-          duration_seconds REAL,
-          created_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "track preferences table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS track_preferences (
-          user_id TEXT NOT NULL,
-          track_id TEXT NOT NULL,
-          score REAL NOT NULL DEFAULT 0,
-          play_count INTEGER NOT NULL DEFAULT 0,
-          completion_count INTEGER NOT NULL DEFAULT 0,
-          skip_count INTEGER NOT NULL DEFAULT 0,
-          like_count INTEGER NOT NULL DEFAULT 0,
-          dislike_count INTEGER NOT NULL DEFAULT 0,
-          save_count INTEGER NOT NULL DEFAULT 0,
-          last_played_at INTEGER,
-          PRIMARY KEY (user_id, track_id)
-        )
-      `
-    },
-    {
-      name: "artist preferences table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS artist_preferences (
-          user_id TEXT NOT NULL,
-          artist_key TEXT NOT NULL,
-          artist_name TEXT NOT NULL,
-          artist_id TEXT,
-          score REAL NOT NULL DEFAULT 0,
-          play_count INTEGER NOT NULL DEFAULT 0,
-          completion_count INTEGER NOT NULL DEFAULT 0,
-          skip_count INTEGER NOT NULL DEFAULT 0,
-          like_count INTEGER NOT NULL DEFAULT 0,
-          dislike_count INTEGER NOT NULL DEFAULT 0,
-          save_count INTEGER NOT NULL DEFAULT 0,
-          last_played_at INTEGER,
-          PRIMARY KEY (user_id, artist_key)
-        )
-      `
-    },
-    {
-      name: "genre preferences table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS genre_preferences (
-          user_id TEXT NOT NULL,
-          genre TEXT NOT NULL,
-          score REAL NOT NULL DEFAULT 0,
-          play_count INTEGER NOT NULL DEFAULT 0,
-          completion_count INTEGER NOT NULL DEFAULT 0,
-          skip_count INTEGER NOT NULL DEFAULT 0,
-          like_count INTEGER NOT NULL DEFAULT 0,
-          dislike_count INTEGER NOT NULL DEFAULT 0,
-          save_count INTEGER NOT NULL DEFAULT 0,
-          last_played_at INTEGER,
-          PRIMARY KEY (user_id, genre)
-        )
-      `
-    },
-    {
-      name: "recommendation cache table",
-      sql: `
-        CREATE TABLE IF NOT EXISTS recommendation_cache (
-          user_id TEXT PRIMARY KEY,
-          payload TEXT NOT NULL,
-          generated_at INTEGER NOT NULL DEFAULT 0
-        )
-      `
-    },
-    {
-      name: "events user time index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_events_user_time
-        ON listening_events(user_id, created_at DESC)
-      `
-    },
-    {
-      name: "track preferences score index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_track_prefs_user_score
-        ON track_preferences(user_id, score DESC)
-      `
-    },
-    {
-      name: "artist preferences score index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_artist_prefs_user_score
-        ON artist_preferences(user_id, score DESC)
-      `
-    },
-    {
-      name: "genre preferences score index",
-      sql: `
-        CREATE INDEX IF NOT EXISTS idx_genre_prefs_user_score
-        ON genre_preferences(user_id, score DESC)
-      `
-    }
-  ];
-
-  for (const step of steps) {
-    try {
-      await env.DB.prepare(step.sql).run();
-    } catch (error) {
-      const message =
-        error && typeof error.message === "string"
-          ? error.message
-          : String(error);
-
-      throw new Error(
-        `D1 schema step failed (${step.name}): ${message}`
-      );
-    }
-  }
-
-  await ensureColumn(env, "tracks", "artist_id", "TEXT");
-  await ensureColumn(env, "tracks", "album_id", "TEXT");
-  await ensureColumn(env, "tracks", "duration_seconds", "INTEGER");
-  await ensureColumn(env, "tracks", "canonical_key", "TEXT");
-  await ensureColumn(env, "tracks", "genres_json", "TEXT");
-  await ensureColumn(env, "tracks", "video_type", "TEXT");
-  await ensureColumn(env, "tracks", "source_quality", "REAL NOT NULL DEFAULT 0");
-  await ensureColumn(env, "tracks", "last_enriched_at", "INTEGER NOT NULL DEFAULT 0");
-  await ensureColumn(env, "tracks", "musicbrainz_recording_id", "TEXT");
-  await ensureColumn(env, "tracks", "musicbrainz_artist_id", "TEXT");
-  await ensureColumn(env, "tracks", "brainz_match_score", "REAL NOT NULL DEFAULT 0");
-  await ensureColumn(env, "tracks", "brainz_last_attempt_at", "INTEGER NOT NULL DEFAULT 0");
-  await ensureColumn(env, "artist_preferences", "musicbrainz_artist_id", "TEXT");
-}
-
-
-async function ensureColumn(env, tableName, columnName, definition) {
-  const result = await env.DB.prepare(
-    "PRAGMA table_info(" + tableName + ")"
-  ).all();
-
-  const exists = (result.results || []).some(
-    row => row.name === columnName
-  );
-
-  if (exists) {
-    return;
-  }
-
-  await env.DB.prepare(
-    "ALTER TABLE " + tableName + " ADD COLUMN " + columnName + " " + definition
-  ).run();
-}
-
-
-async function upsertTrack(env, track) {
-  const canonicalKey =
-    track.canonicalKey ||
-    makeCanonicalKey(track.artist, track.title);
-
-  const genresJson =
-    Array.isArray(track.genres)
-      ? JSON.stringify(track.genres)
-      : track.genresJson || null;
-
-  await env.DB.prepare(`
-    INSERT INTO tracks (
-      id,
-      title,
-      artist,
-      album,
-      artwork,
-      artist_id,
-      album_id,
-      duration_seconds,
-      canonical_key,
-      genres_json,
-      video_type,
-      source_quality,
-      musicbrainz_recording_id,
-      musicbrainz_artist_id,
-      brainz_match_score,
-      created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-
-    ON CONFLICT(id)
-    DO UPDATE SET
-      title = excluded.title,
-      artist = excluded.artist,
-      album = excluded.album,
-      artwork = excluded.artwork,
-      artist_id = COALESCE(excluded.artist_id, tracks.artist_id),
-      album_id = COALESCE(excluded.album_id, tracks.album_id),
-      duration_seconds = COALESCE(excluded.duration_seconds, tracks.duration_seconds),
-      canonical_key = COALESCE(excluded.canonical_key, tracks.canonical_key),
-      genres_json = COALESCE(excluded.genres_json, tracks.genres_json),
-      video_type = COALESCE(excluded.video_type, tracks.video_type),
-      source_quality = MAX(COALESCE(tracks.source_quality, 0), COALESCE(excluded.source_quality, 0)),
-      musicbrainz_recording_id = COALESCE(excluded.musicbrainz_recording_id, tracks.musicbrainz_recording_id),
-      musicbrainz_artist_id = COALESCE(excluded.musicbrainz_artist_id, tracks.musicbrainz_artist_id),
-      brainz_match_score = MAX(COALESCE(tracks.brainz_match_score, 0), COALESCE(excluded.brainz_match_score, 0))
-  `)
-    .bind(
-      String(track.id),
-      String(track.title || "Unknown"),
-      track.artist || null,
-      track.album || null,
-      track.artwork || null,
-      track.artistId || null,
-      track.albumId || null,
-      Number(track.durationSeconds || 0) || null,
-      canonicalKey || null,
-      genresJson,
-      track.videoType || null,
-      Number(track.sourceQuality || 0),
-      track.musicBrainzRecordingId || null,
-      track.musicBrainzArtistId || null,
-      Number(track.brainzMatchScore || 0)
-    )
-    .run();
-}
-
-
-async function recordListeningEvent(
-  env,
-  userId,
-  event
-) {
-  const trackId = String(event.trackId || "");
-
-  if (!trackId) {
-    return null;
-  }
-
-  const type = String(event.type || "");
-  const position = Number(event.positionSeconds) || 0;
-  const duration = Number(event.durationSeconds) || 0;
-  const delta = getListeningSignalDelta(type, position, duration);
-
-  await env.DB.prepare(`
-    INSERT INTO listening_events (
-      user_id,
-      track_id,
-      event_type,
-      position_seconds,
-      duration_seconds,
-      created_at
-    )
-    VALUES (?, ?, ?, ?, ?, unixepoch())
-  `)
-    .bind(userId, trackId, type, position, duration)
-    .run();
-
-  await env.DB.prepare(`
-    INSERT INTO track_preferences (
-      user_id,
-      track_id,
-      score,
-      play_count,
-      completion_count,
-      skip_count,
-      like_count,
-      dislike_count,
-      save_count,
-      last_played_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, unixepoch())
-
-    ON CONFLICT(user_id, track_id)
-    DO UPDATE SET
-      score = track_preferences.score + excluded.score,
-      play_count = track_preferences.play_count + excluded.play_count,
-      completion_count = track_preferences.completion_count + excluded.completion_count,
-      skip_count = track_preferences.skip_count + excluded.skip_count,
-      like_count = track_preferences.like_count + excluded.like_count,
-      dislike_count = track_preferences.dislike_count + excluded.dislike_count,
-      last_played_at = unixepoch()
-  `)
-    .bind(
-      userId,
-      trackId,
-      delta,
-      type === "play" ? 1 : 0,
-      type === "complete" ? 1 : 0,
-      type === "skip" ? 1 : 0,
-      type === "like" ? 1 : 0,
-      type === "dislike" ? 1 : 0
-    )
-    .run();
-
-  const track = await getStoredTrack(env, trackId);
-
-  if (track?.artist) {
-    await updateArtistPreference(
-      env,
-      userId,
-      track,
-      delta * 0.55,
-      type
-    );
-  }
-
-  const genres = parseStoredGenres(track?.genresJson);
-
-  if (genres.length) {
-    await updateGenrePreferences(
-      env,
-      userId,
-      genres,
-      delta * 0.38,
-      type
-    );
-  }
-
-  return {
-    trackId,
-    delta,
-    needsGenreEnrichment:
-      !!track?.artist &&
-      (
-        !genres.length ||
-        !track.musicBrainzRecordingId ||
-        !track.musicBrainzArtistId
-      ) &&
-      ["play", "complete", "like", "dislike"].includes(type)
-  };
-}
-
-
-function getListeningSignalDelta(type, position, duration) {
-  if (type === "play") {
-    return 0.15;
-  }
-
-  if (type === "complete") {
-    return 3.25;
-  }
-
-  if (type === "like") {
-    return 9;
-  }
-
-  if (type === "dislike") {
-    return -16;
-  }
-
-  if (type === "save") {
-    return 7;
-  }
-
-  if (type === "skip") {
-    const progress =
-      duration > 0
-        ? position / duration
-        : 0;
-
-    if (progress < 0.10) return -6;
-    if (progress < 0.30) return -4;
-    if (progress < 0.65) return -1.5;
-    return -0.25;
-  }
-
-  return 0;
-}
-
-
-async function addPreferenceScore(
-  env,
-  userId,
-  trackId,
-  amount,
-  type
-) {
-  await env.DB.prepare(`
-    INSERT INTO track_preferences (
-      user_id,
-      track_id,
-      score,
-      save_count
-    )
-    VALUES (?, ?, ?, ?)
-
-    ON CONFLICT(user_id, track_id)
-    DO UPDATE SET
-      score = score + excluded.score,
-      save_count = save_count + excluded.save_count
-  `)
-    .bind(
-      userId,
-      trackId,
-      amount,
-      type === "save" ? 1 : 0
-    )
-    .run();
-
-  const track = await getStoredTrack(env, trackId);
-
-  if (track?.artist) {
-    await updateArtistPreference(
-      env,
-      userId,
-      track,
-      amount * 0.55,
-      type
-    );
-  }
-
-  const genres = parseStoredGenres(track?.genresJson);
-
-  if (genres.length) {
-    await updateGenrePreferences(
-      env,
-      userId,
-      genres,
-      amount * 0.38,
-      type
-    );
-  }
-
-  return {
-    needsGenreEnrichment:
-      !!track?.artist &&
-      (
-        !genres.length ||
-        !track.musicBrainzRecordingId ||
-        !track.musicBrainzArtistId
-      )
-  };
-}
-
-
-async function getStoredTrack(env, trackId) {
-  return env.DB.prepare(`
-    SELECT
-      id,
-      title,
-      artist,
-      album,
-      artwork,
-      artist_id AS artistId,
-      album_id AS albumId,
-      duration_seconds AS durationSeconds,
-      canonical_key AS canonicalKey,
-      genres_json AS genresJson,
-      video_type AS videoType,
-      source_quality AS sourceQuality,
-      last_enriched_at AS lastEnrichedAt,
-      musicbrainz_recording_id AS musicBrainzRecordingId,
-      musicbrainz_artist_id AS musicBrainzArtistId,
-      brainz_match_score AS brainzMatchScore,
-      brainz_last_attempt_at AS brainzLastAttemptAt
-    FROM tracks
-    WHERE id = ?
-  `)
-    .bind(trackId)
-    .first();
-}
-
-
-async function updateArtistPreference(
-  env,
-  userId,
-  track,
-  delta,
-  type
-) {
-  const artistKey = normalizeArtistKey(track.artist);
-
-  if (!artistKey) {
-    return;
-  }
-
-  await env.DB.prepare(`
-    INSERT INTO artist_preferences (
-      user_id,
-      artist_key,
-      artist_name,
-      artist_id,
-      musicbrainz_artist_id,
-      score,
-      play_count,
-      completion_count,
-      skip_count,
-      like_count,
-      dislike_count,
-      save_count,
-      last_played_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-
-    ON CONFLICT(user_id, artist_key)
-    DO UPDATE SET
-      artist_name = excluded.artist_name,
-      artist_id = COALESCE(excluded.artist_id, artist_preferences.artist_id),
-      musicbrainz_artist_id = COALESCE(excluded.musicbrainz_artist_id, artist_preferences.musicbrainz_artist_id),
-      score = artist_preferences.score + excluded.score,
-      play_count = artist_preferences.play_count + excluded.play_count,
-      completion_count = artist_preferences.completion_count + excluded.completion_count,
-      skip_count = artist_preferences.skip_count + excluded.skip_count,
-      like_count = artist_preferences.like_count + excluded.like_count,
-      dislike_count = artist_preferences.dislike_count + excluded.dislike_count,
-      save_count = artist_preferences.save_count + excluded.save_count,
-      last_played_at = unixepoch()
-  `)
-    .bind(
-      userId,
-      artistKey,
-      track.artist,
-      track.artistId || null,
-      track.musicBrainzArtistId || null,
-      delta,
-      type === "play" ? 1 : 0,
-      type === "complete" ? 1 : 0,
-      type === "skip" ? 1 : 0,
-      type === "like" ? 1 : 0,
-      type === "dislike" ? 1 : 0,
-      type === "save" ? 1 : 0
-    )
-    .run();
-}
-
-
-async function updateGenrePreferences(
-  env,
-  userId,
-  genres,
-  delta,
-  type
-) {
-  for (const genre of genres.slice(0, 6)) {
-    const name = String(genre.name || genre).trim().toLowerCase();
-    const weight = Number(genre.weight || 1);
-
-    if (!name) continue;
-
-    await env.DB.prepare(`
-      INSERT INTO genre_preferences (
-        user_id,
-        genre,
-        score,
-        play_count,
-        completion_count,
-        skip_count,
-        like_count,
-        dislike_count,
-        save_count,
-        last_played_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-
-      ON CONFLICT(user_id, genre)
-      DO UPDATE SET
-        score = genre_preferences.score + excluded.score,
-        play_count = genre_preferences.play_count + excluded.play_count,
-        completion_count = genre_preferences.completion_count + excluded.completion_count,
-        skip_count = genre_preferences.skip_count + excluded.skip_count,
-        like_count = genre_preferences.like_count + excluded.like_count,
-        dislike_count = genre_preferences.dislike_count + excluded.dislike_count,
-        save_count = genre_preferences.save_count + excluded.save_count,
-        last_played_at = unixepoch()
-    `)
-      .bind(
-        userId,
-        name,
-        delta * weight,
-        type === "play" ? 1 : 0,
-        type === "complete" ? 1 : 0,
-        type === "skip" ? 1 : 0,
-        type === "like" ? 1 : 0,
-        type === "dislike" ? 1 : 0,
-        type === "save" ? 1 : 0
-      )
-      .run();
-  }
-}
-
-
-function parseStoredGenres(value) {
-  if (!value) return [];
-
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-
-// =================================================================
-// CATALOGUE / PLAYBACK PROVIDER
-// =================================================================
-
-const YT_INNERTUBE_API_KEY =
-  "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
-
-const YTM_BASE_API =
-  "https://music.youtube.com/youtubei/v1/";
-
-const YTM_SONG_SEARCH_PARAMS =
-  "EgWKAQIIAWoMEA4QChADEAQQCRAF";
-
-let ytmVisitorPromise = null;
-
-
-async function searchCatalogue(query, env) {
-  try {
-    const tracks = await ytmSearchSongs(query, 30);
-
-    if (tracks.length) {
-      return tracks.slice(0, 24);
-    }
-  } catch (error) {
-    console.error("YTM song search failed. Falling back to YouTube Data API.", error);
-  }
-
-  return searchYouTubeFallback(query, env);
-}
-
-
-async function ytmSearchSongs(query, limit = 20) {
-  const response = await ytmRequest(
-    "search",
-    {
-      query,
-      params: YTM_SONG_SEARCH_PARAMS
-    }
-  );
-
-  const renderers = [];
-  collectObjectsByKey(
-    response,
-    "musicResponsiveListItemRenderer",
-    renderers
-  );
-
-  const tracks = renderers
-    .map(extractYtmSearchTrack)
-    .filter(Boolean);
-
-  return cleanAndRankSongResults(
-    tracks,
-    query,
-    limit
-  );
-}
-
-
-async function ytmGetRadio(videoId, limit = 40) {
-  const response = await ytmRequest(
-    "next",
-    {
-      enablePersistentPlaylistPanel: true,
-      isAudioOnly: true,
-      tunerSettingValue: "AUTOMIX_SETTING_NORMAL",
-      videoId,
-      playlistId: "RDAMVM" + videoId,
-      params: "wAEB"
-    }
-  );
-
-  const renderers = [];
-  collectObjectsByKey(
-    response,
-    "playlistPanelVideoRenderer",
-    renderers
-  );
-
-  const tracks = renderers
-    .map(extractYtmRadioTrack)
-    .filter(Boolean)
-    .filter(track => track.id !== videoId);
-
-  return cleanAndRankSongResults(
-    tracks,
-    "",
-    limit,
-    true
-  );
-}
-
-
-async function ytmRequest(endpoint, body) {
-  const visitorData = await getYtmVisitorData();
-  const clientVersion = getYtmClientVersion();
-
-  const payload = {
-    ...body,
-    context: {
-      client: {
-        clientName: "WEB_REMIX",
-        clientVersion,
-        hl: "en",
-        gl: "AU"
-      },
-      user: {}
-    }
-  };
-
-  const headers = {
-    "Accept": "*/*",
-    "Content-Type": "application/json",
-    "Origin": "https://music.youtube.com",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
-  };
-
-  if (visitorData) {
-    headers["X-Goog-Visitor-Id"] = visitorData;
-  }
-
-  const response = await fetch(
-    YTM_BASE_API + endpoint +
-      "?alt=json&key=" + encodeURIComponent(YT_INNERTUBE_API_KEY),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload)
-    }
-  );
-
-  const text = await response.text();
-  let data = null;
-
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(
-      "YouTube Music returned non-JSON data for " + endpoint
-    );
-  }
-
-  if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      "HTTP " + response.status;
-
-    throw new Error(
-      "YouTube Music " + endpoint + " failed: " + message
-    );
-  }
-
-  return data;
-}
-
-
-async function getYtmVisitorData() {
-  if (!ytmVisitorPromise) {
-    ytmVisitorPromise = fetch(
-      "https://music.youtube.com/",
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
-        }
-      }
-    )
-      .then(response => response.text())
-      .then(text => {
-        const direct = text.match(
-          /"VISITOR_DATA"\s*:\s*"([^"]+)"/
-        );
-
-        if (direct?.[1]) {
-          return direct[1];
-        }
-
-        const escaped = text.match(
-          /VISITOR_DATA\\?"\s*:\s*\\?"([^"\\]+(?:\\.[^"\\]*)*)/
-        );
-
-        return escaped?.[1]
-          ? escaped[1].replaceAll("\\u003d", "=")
-          : "";
-      })
-      .catch(() => "");
-  }
-
-  return ytmVisitorPromise;
-}
-
-
-function getYtmClientVersion() {
-  const day = new Date()
-    .toISOString()
-    .slice(0, 10)
-    .replaceAll("-", "");
-
-  return "1." + day + ".01.00";
-}
-
-
-function collectObjectsByKey(value, key, output) {
-  if (!value || typeof value !== "object") {
-    return;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(value, key)) {
-    const candidate = value[key];
-
-    if (candidate && typeof candidate === "object") {
-      output.push(candidate);
-    }
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectObjectsByKey(item, key, output);
-    }
-    return;
-  }
-
-  for (const child of Object.values(value)) {
-    collectObjectsByKey(child, key, output);
-  }
-}
-
-
-function deepFindFirst(value, predicate) {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-
-  if (predicate(value)) {
-    return value;
-  }
-
-  const children = Array.isArray(value)
-    ? value
-    : Object.values(value);
-
-  for (const child of children) {
-    const found = deepFindFirst(child, predicate);
-    if (found) return found;
-  }
-
-  return null;
-}
-
-
-function extractYtmSearchTrack(renderer) {
-  const flexColumns = Array.isArray(renderer.flexColumns)
-    ? renderer.flexColumns
-    : [];
-
-  const titleRuns =
-    flexColumns[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-
-  const title = titleRuns[0]?.text || "";
-
-  const watchNode = deepFindFirst(
-    renderer,
-    node => !!node.watchEndpoint?.videoId
-  );
-
-  const videoId =
-    watchNode?.watchEndpoint?.videoId ||
-    renderer.playlistItemData?.videoId ||
-    "";
-
-  if (!videoId || !title) {
-    return null;
-  }
-
-  const metaRuns = [];
-
-  for (const column of flexColumns.slice(1)) {
-    const runs =
-      column?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-    metaRuns.push(...runs);
-  }
-
-  const fixedRuns =
-    renderer.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs || [];
-
-  const meta = extractArtistAlbumFromRuns(metaRuns);
-  const durationText =
-    fixedRuns.find(run => /^\d{1,2}:\d{2}(?::\d{2})?$/.test(run.text || ""))?.text ||
-    metaRuns.find(run => /^\d{1,2}:\d{2}(?::\d{2})?$/.test(run.text || ""))?.text ||
-    "";
-
-  const thumbs =
-    renderer.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-
-  const videoTypeNode = deepFindFirst(
-    renderer,
-    node => typeof node.musicVideoType === "string"
-  );
-
-  const videoType = videoTypeNode?.musicVideoType || "";
-
-  const track = {
-    id: videoId,
-    title,
-    artist: meta.artist || "Unknown artist",
-    artistId: meta.artistId || null,
-    album: meta.album || null,
-    albumId: meta.albumId || null,
-    artwork: thumbs.length ? thumbs[thumbs.length - 1].url : null,
-    durationSeconds: parseDurationSeconds(durationText),
-    videoType,
-    sourceQuality: 0
-  };
-
-  track.canonicalKey = makeCanonicalKey(track.artist, track.title);
-  track.sourceQuality = scoreSourceQuality(track);
-
-  return track;
-}
-
-
-function extractYtmRadioTrack(renderer) {
-  const videoId = renderer.videoId || "";
-  const title = renderer.title?.runs?.[0]?.text || "";
-
-  if (!videoId || !title || renderer.unplayableText) {
-    return null;
-  }
-
-  const metaRuns = renderer.longBylineText?.runs || [];
-  const meta = extractArtistAlbumFromRuns(metaRuns);
-  const thumbs = renderer.thumbnail?.thumbnails || [];
-
-  const videoTypeNode = deepFindFirst(
-    renderer,
-    node => typeof node.musicVideoType === "string"
-  );
-
-  const track = {
-    id: videoId,
-    title,
-    artist: meta.artist || "Unknown artist",
-    artistId: meta.artistId || null,
-    album: meta.album || null,
-    albumId: meta.albumId || null,
-    artwork: thumbs.length ? thumbs[thumbs.length - 1].url : null,
-    durationSeconds: parseDurationSeconds(renderer.lengthText?.runs?.[0]?.text || ""),
-    videoType: videoTypeNode?.musicVideoType || "",
-    sourceQuality: 0
-  };
-
-  track.canonicalKey = makeCanonicalKey(track.artist, track.title);
-  track.sourceQuality = scoreSourceQuality(track);
-
-  return track;
-}
-
-
-function extractArtistAlbumFromRuns(runs) {
-  const artists = [];
-  let artistId = null;
-  let album = null;
-  let albumId = null;
-
-  for (const run of runs || []) {
-    const text = String(run?.text || "").trim();
-    const browse = run?.navigationEndpoint?.browseEndpoint;
-    const browseId = browse?.browseId || "";
-    const pageType =
-      browse?.browseEndpointContextSupportedConfigs
-        ?.browseEndpointContextMusicConfig
-        ?.pageType || "";
-
-    if (!text || text === " • ") {
-      continue;
-    }
-
-    if (
-      pageType.includes("ARTIST") ||
-      browseId.startsWith("UC")
-    ) {
-      if (!artists.includes(text)) {
-        artists.push(text);
-      }
-      artistId ||= browseId || null;
-      continue;
-    }
-
-    if (
-      pageType.includes("ALBUM") ||
-      browseId.startsWith("MPRE")
-    ) {
-      album ||= text;
-      albumId ||= browseId || null;
-    }
-  }
-
-  if (!artists.length) {
-    for (const run of runs || []) {
-      const text = String(run?.text || "").trim();
-
-      if (
-        !text ||
-        text === "•" ||
-        /^\d{1,2}:\d{2}/.test(text) ||
-        /^\d{4}$/.test(text) ||
-        /^(song|songs|single|album|ep)$/i.test(text)
-      ) {
-        continue;
-      }
-
-      if (!run?.navigationEndpoint?.browseEndpoint) {
-        continue;
-      }
-
-      artists.push(text);
-      break;
-    }
-  }
-
-  return {
-    artist: artists.join(", "),
-    artistId,
-    album,
-    albumId
-  };
-}
-
-
-function cleanAndRankSongResults(
-  tracks,
-  query,
-  limit,
-  radioMode = false
-) {
-  const bestByKey = new Map();
-
-  for (const rawTrack of tracks) {
-    const track = {
-      ...rawTrack
-    };
-
-    const penalty = getVariantPenalty(track, query);
-
-    if (penalty >= 100) {
-      continue;
-    }
-
-    const canonicalKey =
-      track.canonicalKey ||
-      makeCanonicalKey(track.artist, track.title);
-
-    if (!canonicalKey) {
-      continue;
-    }
-
-    track.canonicalKey = canonicalKey;
-    track.sourceQuality =
-      Number(track.sourceQuality || 0) - penalty;
-
-    if (
-      !radioMode &&
-      track.videoType &&
-      track.videoType.includes("OMV")
-    ) {
-      continue;
-    }
-
-    const existing = bestByKey.get(canonicalKey);
-
-    if (
-      !existing ||
-      track.sourceQuality > existing.sourceQuality
-    ) {
-      bestByKey.set(canonicalKey, track);
-    }
-  }
-
-  return [...bestByKey.values()]
-    .sort(
-      (a, b) =>
-        Number(b.sourceQuality || 0) -
-        Number(a.sourceQuality || 0)
-    )
-    .slice(0, limit);
-}
-
-
-function scoreSourceQuality(track) {
-  let score = 0;
-
-  if (track.videoType?.includes("ATV")) score += 12;
-  if (track.album) score += 4;
-  if (track.artistId) score += 2;
-  if (track.durationSeconds > 45) score += 1;
-
-  const title = String(track.title || "").toLowerCase();
-
-  if (title.includes("official audio")) score += 1;
-  if (title.includes("official video")) score -= 10;
-  if (title.includes("music video")) score -= 10;
-
-  return score;
-}
-
-
-function getVariantPenalty(track, query) {
-  const title = String(track.title || "").toLowerCase();
-  const q = String(query || "").toLowerCase();
-
-  const checks = [
-    {
-      wanted: /\blive\b/.test(q),
-      pattern: /(\(|\[|\-|•)\s*live\b|\blive\s+(at|from|on|in)\b|\bin concert\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bacoustic\b/.test(q),
-      pattern: /\bacoustic\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bremix\b/.test(q),
-      pattern: /\bremix\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bcover\b/.test(q),
-      pattern: /\bcover\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\binstrumental\b/.test(q),
-      pattern: /\binstrumental\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bkaraoke\b/.test(q),
-      pattern: /\bkaraoke\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bslowed\b/.test(q),
-      pattern: /\bslowed\b|\breverb\b/i,
-      penalty: 100
-    },
-    {
-      wanted: /\bsped\b/.test(q),
-      pattern: /\bsped\s*up\b|\bnightcore\b/i,
-      penalty: 100
-    }
-  ];
-
-  for (const check of checks) {
-    if (!check.wanted && check.pattern.test(title)) {
-      return check.penalty;
-    }
-  }
-
-  if (/\b(official music video|music video)\b/i.test(title)) {
-    return 60;
-  }
-
-  if (/\b(session|performance)\b/i.test(title) && !/\b(session|performance)\b/i.test(q)) {
-    return 25;
-  }
-
-  return 0;
-}
-
-
-function makeCanonicalKey(artist, title) {
-  const a = normalizeArtistKey(artist);
-  const t = normalizeTitleKey(title);
-
-  if (!t) return "";
-
-  return a + "::" + t;
-}
-
-
-function normalizeArtistKey(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\bvevo\b/g, "")
-    .replace(/\s*-\s*topic\s*$/i, "")
-    .replace(/\bofficial\b/g, "")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-
-function normalizeTitleKey(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\[(official audio|official video|music video|lyrics?|visuali[sz]er)\]/gi, " ")
-    .replace(/\((official audio|official video|music video|lyrics?|visuali[sz]er)\)/gi, " ")
-    .replace(/\((?:\d{4}\s*)?remaster(?:ed)?[^)]*\)/gi, " ")
-    .replace(/\[(?:\d{4}\s*)?remaster(?:ed)?[^\]]*\]/gi, " ")
-    .replace(/\bremaster(?:ed)?\s*\d{0,4}\b/gi, " ")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-
-function parseDurationSeconds(value) {
-  const bits = String(value || "")
-    .split(":")
-    .map(Number);
-
-  if (!bits.length || bits.some(Number.isNaN)) {
-    return 0;
-  }
-
-  let seconds = 0;
-
-  for (const bit of bits) {
-    seconds = seconds * 60 + bit;
-  }
-
-  return seconds;
-}
-
-
-async function searchYouTubeFallback(query, env) {
-  if (!env.YOUTUBE_API_KEY) {
-    return [];
-  }
-
-  const url = new URL(
-    "https://www.googleapis.com/youtube/v3/search"
-  );
-
-  url.searchParams.set("part", "snippet");
-  url.searchParams.set("type", "video");
-  url.searchParams.set("videoCategoryId", "10");
-  url.searchParams.set("maxResults", "30");
-  url.searchParams.set("q", query + " official audio");
-  url.searchParams.set("key", env.YOUTUBE_API_KEY);
-
-  const response = await fetch(url.toString());
-
-  if (!response.ok) {
-    return [];
-  }
-
-  const data = await response.json();
-
-  const tracks = (data.items || [])
-    .filter(item => item?.id?.videoId)
-    .map(item => {
-      const snippet = item.snippet || {};
-      const track = {
-        id: item.id.videoId,
-        title: decodeYouTubeText(snippet.title || "Unknown track"),
-        artist: cleanFallbackChannelName(
-          decodeYouTubeText(snippet.channelTitle || "Unknown artist")
-        ),
-        album: null,
-        artwork:
-          snippet.thumbnails?.high?.url ||
-          snippet.thumbnails?.medium?.url ||
-          snippet.thumbnails?.default?.url ||
-          null,
-        videoType: "YOUTUBE_FALLBACK",
-        sourceQuality: 0
-      };
-
-      track.canonicalKey = makeCanonicalKey(track.artist, track.title);
-      track.sourceQuality = scoreSourceQuality(track);
-      return track;
-    });
-
-  return cleanAndRankSongResults(
-    tracks,
-    query,
-    20
-  );
-}
-
-
-function cleanFallbackChannelName(value) {
-  return String(value || "")
-    .replace(/\s*-\s*Topic\s*$/i, "")
-    .replace(/VEVO$/i, "")
-    .trim();
-}
-
-
-// =================================================================
-// GENRE + DISCOVERY INTELLIGENCE
-// =================================================================
-
-const MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2/";
-const LISTENBRAINZ_BASE = "https://api.listenbrainz.org/1/";
-const MUSICBRAINZ_USER_AGENT =
-  "Veeb/0.3 (https://veeb.connorjedd.workers.dev)";
-
-let musicBrainzQueue = Promise.resolve();
-let musicBrainzNextRequestAt = 0;
-
-
-async function enrichTrackBrainzAndApplySignal(
-  env,
-  userId,
-  trackId,
-  delta,
-  type
-) {
-  try {
-    let track = await getStoredTrack(env, trackId);
-
-    if (!track?.artist || !track?.title) {
-      return;
-    }
-
-    let genres = parseStoredGenres(track.genresJson);
-    const hadGenres = genres.length > 0;
-    let recordingMbid = track.musicBrainzRecordingId || null;
-    let artistMbid = track.musicBrainzArtistId || null;
-    let matchScore = Number(track.brainzMatchScore || 0);
-    let identityUpdated = false;
-
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const lastAttempt = Number(track.brainzLastAttemptAt || 0);
-    const identityNeedsAttempt =
-      (!recordingMbid || !artistMbid) &&
-      (!lastAttempt || lastAttempt < nowSeconds - 60 * 60 * 24 * 7);
-    const genreNeedsAttempt =
-      !genres.length &&
-      (!lastAttempt || lastAttempt < nowSeconds - 60 * 60 * 24 * 30);
-
-    if (identityNeedsAttempt || genreNeedsAttempt) {
-      await env.DB.prepare(`
-        UPDATE tracks
-        SET brainz_last_attempt_at = unixepoch()
-        WHERE id = ?
-      `)
-        .bind(trackId)
-        .run();
-      const match = await resolveMusicBrainzRecording(
-        track.artist,
-        track.title,
-        track.durationSeconds
-      );
-
-      if (match) {
-        const oldRecordingMbid = recordingMbid;
-        const oldArtistMbid = artistMbid;
-        recordingMbid = match.recordingMbid || recordingMbid;
-        artistMbid = match.artistMbid || artistMbid;
-        identityUpdated =
-          (!oldRecordingMbid && !!recordingMbid) ||
-          (!oldArtistMbid && !!artistMbid);
-        matchScore = Number(match.matchScore || matchScore || 0);
-
-        const detail = recordingMbid
-          ? await getBrainzRecordingMetadata(recordingMbid)
-          : null;
-
-        if (detail?.artistMbid) {
-          artistMbid = detail.artistMbid;
-        }
-
-        const enrichedGenres = detail?.genres || match.genres || [];
-
-        if (enrichedGenres.length) {
-          genres = enrichedGenres;
-        }
-
-        await env.DB.prepare(`
-          UPDATE tracks
-          SET
-            genres_json = COALESCE(?, genres_json),
-            musicbrainz_recording_id = COALESCE(?, musicbrainz_recording_id),
-            musicbrainz_artist_id = COALESCE(?, musicbrainz_artist_id),
-            brainz_match_score = MAX(COALESCE(brainz_match_score, 0), ?),
-            brainz_last_attempt_at = unixepoch(),
-            last_enriched_at = unixepoch()
-          WHERE id = ?
-        `)
-          .bind(
-            genres.length ? JSON.stringify(genres) : null,
-            recordingMbid,
-            artistMbid,
-            matchScore,
-            trackId
-          )
-          .run();
-
-        if (artistMbid) {
-          await env.DB.prepare(`
-            UPDATE artist_preferences
-            SET musicbrainz_artist_id = COALESCE(musicbrainz_artist_id, ?)
-            WHERE user_id = ?
-              AND artist_key = ?
-          `)
-            .bind(
-              artistMbid,
-              userId,
-              normalizeArtistKey(track.artist)
-            )
-            .run();
-        }
-
-        track = {
-          ...track,
-          musicBrainzRecordingId: recordingMbid,
-          musicBrainzArtistId: artistMbid,
-          genresJson: genres.length ? JSON.stringify(genres) : track.genresJson
-        };
-      } else {
-        await env.DB.prepare(`
-          UPDATE tracks
-          SET brainz_last_attempt_at = unixepoch()
-          WHERE id = ?
-        `)
-          .bind(trackId)
-          .run();
-      }
-    }
-
-    if (identityUpdated) {
-      await invalidateRecommendationCache(env, userId);
-    }
-
-    if (!hadGenres && genres.length && delta) {
-      await updateGenrePreferences(
-        env,
-        userId,
-        genres,
-        delta * 0.40,
-        type
-      );
-
-      await invalidateRecommendationCache(env, userId);
-    }
-  } catch (error) {
-    console.error("Brainz enrichment failed:", error);
-  }
-}
-
-
-async function musicBrainzFetch(url) {
-  const job = musicBrainzQueue.then(async () => {
-    const waitMs = Math.max(0, musicBrainzNextRequestAt - Date.now());
-
-    if (waitMs > 0) {
-      await sleep(waitMs);
-    }
-
-    const response = await fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "User-Agent": MUSICBRAINZ_USER_AGENT
-      }
-    });
-
-    musicBrainzNextRequestAt = Date.now() + 1100;
-    return response;
-  });
-
-  musicBrainzQueue = job.catch(() => null);
-  return job;
-}
-
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-
-function escapeMusicBrainzTerm(value) {
-  return String(value || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/([+\-!(){}\[\]^~*?:/])/g, "\\$1")
-    .replace(/&&/g, "\\&&")
-    .replace(/\|\|/g, "\\||")
-    .replace(/"/g, '\\"')
-    .trim();
-}
-
-
-async function resolveMusicBrainzRecording(artist, title, durationSeconds = 0) {
-  const cleanArtist = cleanBrainzArtistName(artist);
-  const cleanTitle = canonicalDisplayTitle(title);
-
-  if (!cleanArtist || !cleanTitle) {
-    return null;
-  }
-
-  const query =
-    'recording:"' + escapeMusicBrainzTerm(cleanTitle) + '"' +
-    ' AND artist:"' + escapeMusicBrainzTerm(cleanArtist) + '"';
-
-  const url = new URL(MUSICBRAINZ_BASE + "recording/");
-  url.searchParams.set("query", query);
-  url.searchParams.set("fmt", "json");
-  url.searchParams.set("limit", "8");
-
-  const response = await musicBrainzFetch(url.toString());
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = await response.json();
-  const recordings = Array.isArray(data.recordings) ? data.recordings : [];
-
-  let best = null;
-  let bestScore = -Infinity;
-
-  for (const item of recordings) {
-    const itemArtist = getMusicBrainzArtistCreditName(item);
-    const titleScore = textSimilarity(
-      normalizeTitleKey(cleanTitle),
-      normalizeTitleKey(item.title || "")
-    );
-    const artistScore = textSimilarity(
-      normalizeArtistKey(cleanArtist),
-      normalizeArtistKey(itemArtist)
-    );
-    const apiScore = Number(item.score || 0) / 100;
-
-    let durationScore = 0;
-    const itemDuration = Number(item.length || 0) / 1000;
-
-    if (durationSeconds > 0 && itemDuration > 0) {
-      const diff = Math.abs(durationSeconds - itemDuration);
-      durationScore = Math.max(-0.35, 0.25 - diff / 90);
-    }
-
-    const score =
-      apiScore * 0.30 +
-      titleScore * 0.38 +
-      artistScore * 0.37 +
-      durationScore;
-
-    if (score > bestScore) {
-      const firstArtist = item["artist-credit"]?.[0]?.artist || null;
-
-      bestScore = score;
-      best = {
-        recordingMbid: item.id || null,
-        artistMbid: firstArtist?.id || null,
-        artist: itemArtist || cleanArtist,
-        title: item.title || cleanTitle,
-        matchScore: Number(Math.max(0, Math.min(1, score)).toFixed(3)),
-        genres: normalizeBrainzTags(item.genres || [], item.tags || [])
-      };
-    }
-  }
-
-  return best && best.matchScore >= 0.58 ? best : null;
-}
-
-
-async function getBrainzRecordingMetadata(recordingMbid) {
-  if (!recordingMbid) {
-    return null;
-  }
-
-  const url = new URL(MUSICBRAINZ_BASE + "recording/" + recordingMbid);
-  url.searchParams.set("inc", "artist-credits+genres+tags");
-  url.searchParams.set("fmt", "json");
-
-  const response = await musicBrainzFetch(url.toString());
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = await response.json();
-  const firstArtist = data["artist-credit"]?.[0]?.artist || null;
-
-  let genres = normalizeBrainzTags(
-    data.genres || [],
-    data.tags || []
-  );
-
-  if (genres.length < 3 && firstArtist?.id) {
-    const artistMeta = await getBrainzArtistMetadata(firstArtist.id);
-    genres = mergeWeightedGenres(genres, artistMeta?.genres || []);
-  }
-
-  return {
-    recordingMbid: data.id || recordingMbid,
-    artistMbid: firstArtist?.id || null,
-    artist: getMusicBrainzArtistCreditName(data),
-    title: data.title || null,
-    genres
-  };
-}
-
-
-async function getBrainzArtistMetadata(artistMbid) {
-  const url = new URL(MUSICBRAINZ_BASE + "artist/" + artistMbid);
-  url.searchParams.set("inc", "genres+tags");
-  url.searchParams.set("fmt", "json");
-
-  const response = await musicBrainzFetch(url.toString());
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = await response.json();
-
-  return {
-    artistMbid: data.id || artistMbid,
-    artist: data.name || null,
-    genres: normalizeBrainzTags(data.genres || [], data.tags || [])
-  };
-}
-
-
-function getMusicBrainzArtistCreditName(value) {
-  const credits = Array.isArray(value?.["artist-credit"])
-    ? value["artist-credit"]
-    : [];
-
-  return credits
-    .map(item => {
-      const name = item?.name || item?.artist?.name || "";
-      return name + String(item?.joinphrase || "");
-    })
-    .join("")
-    .trim();
-}
-
-
-function cleanBrainzArtistName(value) {
-  return String(value || "")
-    .replace(/\s*-\s*Topic\s*$/i, "")
-    .replace(/VEVO$/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-function normalizeBrainzTags(genres, tags) {
-  const combined = [];
-
-  for (const item of Array.isArray(genres) ? genres : []) {
-    combined.push({
-      name: item?.name || "",
-      count: Number(item?.count || 0),
-      formalGenre: true
-    });
-  }
-
-  for (const item of Array.isArray(tags) ? tags : []) {
-    combined.push({
-      name: item?.name || item?.tag || "",
-      count: Number(item?.count || 0),
-      formalGenre: !!item?.["genre_mbid"] || !!item?.genre_mbid
-    });
-  }
-
-  return normalizeGenreTags(combined);
-}
-
-
-function normalizeGenreTags(tags) {
-  const output = [];
-  const seen = new Map();
-
-  const noise = /^(seen live|favorites?|favourites?|awesome|love|beautiful|cool|spotify|albums i own|songs i own|male vocalists?|female vocalists?|american|british|australian|canadian|00s|10s|20s|80s|90s|2000s|2010s|2020s|music|english)$/i;
-
-  const aliases = {
-    "rnb": "r&b",
-    "r and b": "r&b",
-    "rhythm and blues": "r&b",
-    "hiphop": "hip-hop",
-    "hip hop": "hip-hop",
-    "alt country": "alternative country",
-    "alt-country": "alternative country",
-    "singer songwriter": "singer-songwriter",
-    "singer/songwriter": "singer-songwriter",
-    "neo soul": "neo-soul",
-    "indiepop": "indie pop",
-    "indierock": "indie rock",
-    "electropop": "electro-pop",
-    "trip-hop": "trip hop"
-  };
-
-  for (const raw of Array.isArray(tags) ? tags : []) {
-    let name = String(raw?.name || raw?.tag || "")
-      .toLowerCase()
-      .trim();
-
-    if (!name || noise.test(name) || /^\d{4}s?$/.test(name)) {
-      continue;
-    }
-
-    name = aliases[name] || name;
-
-    if (name.length > 48) {
-      continue;
-    }
-
-    const count = Math.max(0, Number(raw?.count || 0));
-    const formalBonus = raw?.formalGenre ? 0.35 : 0;
-    const weight = Math.min(
-      1.35,
-      0.52 + Math.log10(count + 1) * 0.28 + formalBonus
-    );
-
-    const existing = seen.get(name);
-
-    if (!existing || weight > existing.weight) {
-      seen.set(name, {
-        name,
-        weight: Number(weight.toFixed(3))
-      });
-    }
-  }
-
-  output.push(...seen.values());
-  return output
-    .sort((a, b) => b.weight - a.weight)
-    .slice(0, 8);
-}
-
-
-function mergeWeightedGenres(first, second) {
-  const map = new Map();
-
-  for (const item of [...(first || []), ...(second || [])]) {
-    const name = String(item?.name || item || "").toLowerCase().trim();
-    if (!name) continue;
-    const weight = Number(item?.weight || 1);
-    if (!map.has(name) || Number(map.get(name).weight || 0) < weight) {
-      map.set(name, { name, weight });
-    }
-  }
-
-  return [...map.values()]
-    .sort((a, b) => b.weight - a.weight)
-    .slice(0, 8);
-}
-
-
-function canonicalDisplayTitle(value) {
-  return String(value || "")
-    .replace(/\[(official audio|official video|music video|lyrics?|visuali[sz]er)\]/gi, " ")
-    .replace(/\((official audio|official video|music video|lyrics?|visuali[sz]er)\)/gi, " ")
-    .replace(/\((?:\d{4}\s*)?remaster(?:ed)?[^)]*\)/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-function textSimilarity(a, b) {
-  const left = String(a || "").trim();
-  const right = String(b || "").trim();
-
-  if (!left || !right) return 0;
-  if (left === right) return 1;
-  if (left.includes(right) || right.includes(left)) return 0.82;
-
-  const leftTokens = new Set(left.split(/\s+/).filter(Boolean));
-  const rightTokens = new Set(right.split(/\s+/).filter(Boolean));
-  let overlap = 0;
-
-  for (const token of leftTokens) {
-    if (rightTokens.has(token)) overlap++;
-  }
-
-  const union = new Set([...leftTokens, ...rightTokens]).size || 1;
-  return overlap / union;
-}
-
-
-async function listenBrainzFetch(path, params = {}) {
-  const url = new URL(LISTENBRAINZ_BASE + path.replace(/^\/+/, ""));
-
-  for (const [key, value] of Object.entries(params)) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item !== undefined && item !== null && item !== "") {
-          url.searchParams.append(key, String(item));
-        }
-      }
-      continue;
-    }
-
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": MUSICBRAINZ_USER_AGENT
-    }
-  });
-
-  if (!response.ok) {
-    return null;
-  }
-
-  return response.json();
-}
-
-
-function flattenRecordingMbidRows(value, output = []) {
-  if (!value || typeof value !== "object") {
-    return output;
-  }
-
-  if (typeof value.recording_mbid === "string") {
-    output.push(value);
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      flattenRecordingMbidRows(item, output);
-    }
-    return output;
-  }
-
-  for (const child of Object.values(value)) {
-    flattenRecordingMbidRows(child, output);
-  }
-
-  return output;
-}
-
-
-async function listenBrainzArtistRadio(
-  artistMbid,
-  mode = "medium",
-  maxSimilarArtists = 6,
-  maxRecordingsPerArtist = 3,
-  popBegin = 10,
-  popEnd = 95
-) {
-  if (!artistMbid) return [];
-
-  const data = await listenBrainzFetch(
-    "lb-radio/artist/" + encodeURIComponent(artistMbid),
-    {
-      mode,
-      max_similar_artists: maxSimilarArtists,
-      max_recordings_per_artist: maxRecordingsPerArtist,
-      pop_begin: popBegin,
-      pop_end: popEnd
-    }
-  );
-
-  return flattenRecordingMbidRows(data)
-    .filter(item => item?.recording_mbid)
-    .map((item, index) => ({
-      recordingMbid: item.recording_mbid,
-      artistMbid: item.similar_artist_mbid || null,
-      artist: item.similar_artist_name || null,
-      totalListenCount: Number(item.total_listen_count || 0),
-      match: Math.max(0.18, 1 - index * 0.045),
-      mode
-    }));
-}
-
-
-async function listenBrainzTagRadio(
-  tags,
-  count = 12,
-  popBegin = 5,
-  popEnd = 90,
-  operator = "OR"
-) {
-  const cleanTags = (Array.isArray(tags) ? tags : [tags])
-    .map(item => String(item || "").toLowerCase().trim())
-    .filter(Boolean)
-    .slice(0, 4);
-
-  if (!cleanTags.length) return [];
-
-  const data = await listenBrainzFetch(
-    "lb-radio/tags",
-    {
-      tag: cleanTags,
-      operator: cleanTags.length > 1 ? operator : undefined,
-      pop_begin: popBegin,
-      pop_end: popEnd,
-      count
-    }
-  );
-
-  return flattenRecordingMbidRows(data)
-    .filter(item => item?.recording_mbid)
-    .map((item, index) => ({
-      recordingMbid: item.recording_mbid,
-      match: Math.max(0.18, 1 - index * 0.05),
-      seedGenres: cleanTags
-    }));
-}
-
-
-async function getListenBrainzRecordingMetadata(recordingMbids) {
-  const ids = [...new Set((recordingMbids || []).filter(Boolean))].slice(0, 50);
-
-  if (!ids.length) return {};
-
-  const data = await listenBrainzFetch(
-    "metadata/recording/",
-    {
-      recording_mbids: ids.join(","),
-      inc: "artist tag release"
-    }
-  );
-
-  return data && typeof data === "object" ? data : {};
-}
-
-
-function genresFromListenBrainzMetadata(meta) {
-  if (!meta || typeof meta !== "object") return [];
-
-  const tag = meta.tag || {};
-  const combined = [
-    ...(Array.isArray(tag.recording) ? tag.recording : []),
-    ...(Array.isArray(tag.artist) ? tag.artist : []),
-    ...(Array.isArray(tag.release_group) ? tag.release_group : [])
-  ].map(item => ({
-    name: item?.tag || "",
-    count: Number(item?.count || 0),
-    formalGenre: !!item?.genre_mbid
-  }));
-
-  return normalizeGenreTags(combined);
-}
-
-
-async function resolveRecordingMbids(recordingMbids) {
-  const ids = [...new Set((recordingMbids || []).filter(Boolean))];
-  const output = new Map();
-
-  for (let offset = 0; offset < ids.length; offset += 18) {
-    const batch = ids.slice(offset, offset + 18);
-    const query = batch.map(id => "rid:" + id).join(" OR ");
-    const url = new URL(MUSICBRAINZ_BASE + "recording/");
-    url.searchParams.set("query", query);
-    url.searchParams.set("fmt", "json");
-    url.searchParams.set("limit", String(Math.min(100, batch.length * 2)));
-
-    const response = await musicBrainzFetch(url.toString());
-    if (!response.ok) continue;
-
-    const data = await response.json();
-
-    for (const item of Array.isArray(data.recordings) ? data.recordings : []) {
-      if (!item?.id || !batch.includes(item.id)) continue;
-      const firstArtist = item["artist-credit"]?.[0]?.artist || null;
-      output.set(item.id, {
-        recordingMbid: item.id,
-        title: item.title || "",
-        artist: getMusicBrainzArtistCreditName(item),
-        artistMbid: firstArtist?.id || null
-      });
-    }
-  }
-
-  return output;
-}
-
-
-function deriveAdjacentGenres(metadataByMbid, seedGenres, limit = 5) {
-  const excluded = new Set(
-    (seedGenres || []).map(item => String(item || "").toLowerCase().trim())
-  );
-  const scores = new Map();
-
-  for (const meta of Object.values(metadataByMbid || {})) {
-    for (const genre of genresFromListenBrainzMetadata(meta)) {
-      const name = String(genre.name || "").toLowerCase().trim();
-      if (!name || excluded.has(name)) continue;
-      scores.set(
-        name,
-        (scores.get(name) || 0) + Number(genre.weight || 1)
-      );
-    }
-  }
-
-  return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([genre, score], index) => ({
-      genre,
-      match: Math.max(0.25, Math.min(1, score / 6 - index * 0.03))
-    }));
-}
-
-
-async function buildBrainzDiscoverySpecs(env, profile) {
-  const origins = new Map();
-  const baseRows = [];
-
-  const addOrigin = (recordingMbid, origin) => {
-    if (!recordingMbid) return;
-    if (!origins.has(recordingMbid)) origins.set(recordingMbid, []);
-    origins.get(recordingMbid).push(origin);
-  };
-
-  const artistSeedTracks = profile.topTracks
-    .filter(track => track.musicBrainzArtistId)
-    .slice(0, 2);
-
-  const artistCalls = artistSeedTracks.map((track, index) =>
-    listenBrainzArtistRadio(
-      track.musicBrainzArtistId,
-      index === 0 ? "medium" : "hard",
-      6,
-      3,
-      index === 0 ? 20 : 5,
-      index === 0 ? 95 : 72
-    )
-  );
-
-  const genreSeeds = profile.genres
-    .filter(genre => Number(genre.score || 0) > 0)
-    .slice(0, 3);
-
-  const genreCalls = [];
-
-  if (genreSeeds[0]) {
-    genreCalls.push(
-      listenBrainzTagRadio([genreSeeds[0].genre], 12, 15, 90)
-    );
-  }
-
-  if (genreSeeds.length >= 2) {
-    genreCalls.push(
-      listenBrainzTagRadio(
-        genreSeeds.slice(0, 2).map(item => item.genre),
-        14,
-        12,
-        88,
-        "OR"
-      )
-    );
-  }
-
-  const [artistResults, genreResults] = await Promise.all([
-    Promise.allSettled(artistCalls),
-    Promise.allSettled(genreCalls)
-  ]);
-
-  artistResults.forEach((result, seedIndex) => {
-    if (result.status !== "fulfilled") return;
-
-    for (const item of result.value.slice(0, 14)) {
-      baseRows.push(item);
-      addOrigin(item.recordingMbid, {
-        source: seedIndex === 0 ? "similar-track" : "similar-artist",
-        score: (seedIndex === 0 ? 5.0 : 3.2) + item.match * 3.4,
-        sourceGenre: null
-      });
-    }
-  });
-
-  genreResults.forEach((result, index) => {
-    if (result.status !== "fulfilled") return;
-
-    const seedGenre = genreSeeds[index]?.genre || genreSeeds[0]?.genre || null;
-
-    for (const item of result.value.slice(0, 14)) {
-      baseRows.push(item);
-      addOrigin(item.recordingMbid, {
-        source: "genre",
-        score: 2.7 + item.match * 2.4,
-        sourceGenre: seedGenre
-      });
-    }
-  });
-
-  const baseIds = [...new Set(baseRows.map(item => item.recordingMbid).filter(Boolean))]
-    .slice(0, 36);
-
-  const baseLbMetadata = await getListenBrainzRecordingMetadata(baseIds);
-  const adjacentGenres = deriveAdjacentGenres(
-    baseLbMetadata,
-    genreSeeds.map(item => item.genre),
-    4
-  );
-
-  const adjacentCalls = adjacentGenres.slice(0, 2).map(item =>
-    listenBrainzTagRadio([item.genre], 10, 5, 70)
-  );
-
-  const adjacentResults = await Promise.allSettled(adjacentCalls);
-  const adjacentRows = [];
-
-  adjacentResults.forEach((result, index) => {
-    if (result.status !== "fulfilled") return;
-    const adjacent = adjacentGenres[index];
-
-    for (const item of result.value.slice(0, 9)) {
-      adjacentRows.push(item);
-      addOrigin(item.recordingMbid, {
-        source: "adjacent-genre",
-        score: 2.8 + Number(adjacent?.match || 0) * 2.8,
-        sourceGenre: adjacent?.genre || null
-      });
-    }
-  });
-
-  const allIds = [...new Set([
-    ...baseIds,
-    ...adjacentRows.map(item => item.recordingMbid)
-  ].filter(Boolean))].slice(0, 48);
-
-  const extraIds = allIds.filter(id => !baseLbMetadata[id]);
-  const extraLbMetadata = extraIds.length
-    ? await getListenBrainzRecordingMetadata(extraIds)
-    : {};
-
-  const lbMetadata = {
-    ...baseLbMetadata,
-    ...extraLbMetadata
-  };
-
-  const resolved = await resolveRecordingMbids(allIds);
-  const specs = [];
-
-  for (const [recordingMbid, detail] of resolved.entries()) {
-    if (!detail?.title || !detail?.artist) continue;
-
-    const itemOrigins = origins.get(recordingMbid) || [];
-    if (!itemOrigins.length) continue;
-
-    const strongest = [...itemOrigins].sort((a, b) => b.score - a.score)[0];
-    const genres = genresFromListenBrainzMetadata(lbMetadata[recordingMbid]);
-
-    specs.push({
-      query: detail.artist + " " + detail.title,
-      source: strongest.source,
-      sourceGenre: strongest.sourceGenre,
-      sourceScore: strongest.score + Math.min(2.2, (itemOrigins.length - 1) * 0.6),
-      expectedArtist: detail.artist,
-      expectedTitle: detail.title,
-      musicBrainzRecordingId: recordingMbid,
-      musicBrainzArtistId: detail.artistMbid,
-      genres
-    });
-  }
-
-  return specs
-    .sort((a, b) => b.sourceScore - a.sourceScore)
-    .slice(0, 18);
-}
-
-
-async function invalidateRecommendationCache(env, userId) {
-  await env.DB.prepare(`
-    DELETE FROM recommendation_cache
-    WHERE user_id = ?
-  `)
-    .bind(userId)
-    .run();
-}
-
-
-async function getTasteProfile(env, userId) {
-  const [topTracksResult, artistResult, genreResult, recentResult, allPrefsResult] =
-    await Promise.all([
-      env.DB.prepare(`
-        SELECT
-          t.id,
-          t.title,
-          t.artist,
-          t.album,
-          t.artwork,
-          t.artist_id AS artistId,
-          t.album_id AS albumId,
-          t.duration_seconds AS durationSeconds,
-          t.canonical_key AS canonicalKey,
-          t.genres_json AS genresJson,
-          t.video_type AS videoType,
-          t.musicbrainz_recording_id AS musicBrainzRecordingId,
-          t.musicbrainz_artist_id AS musicBrainzArtistId,
-          t.brainz_match_score AS brainzMatchScore,
-          p.score,
-          p.play_count AS playCount,
-          p.completion_count AS completionCount,
-          p.skip_count AS skipCount,
-          p.like_count AS likeCount,
-          p.dislike_count AS dislikeCount,
-          p.save_count AS saveCount,
-          p.last_played_at AS lastPlayedAt
-        FROM track_preferences p
-        INNER JOIN tracks t ON t.id = p.track_id
-        WHERE p.user_id = ?
-          AND p.score > 0
-          AND p.dislike_count = 0
-        ORDER BY p.score DESC
-        LIMIT 12
-      `).bind(userId).all(),
-
-      env.DB.prepare(`
-        SELECT
-          artist_key AS artistKey,
-          artist_name AS artistName,
-          artist_id AS artistId,
-          musicbrainz_artist_id AS musicBrainzArtistId,
-          score,
-          play_count AS playCount,
-          completion_count AS completionCount,
-          skip_count AS skipCount,
-          like_count AS likeCount,
-          dislike_count AS dislikeCount,
-          save_count AS saveCount,
-          last_played_at AS lastPlayedAt
-        FROM artist_preferences
-        WHERE user_id = ?
-        ORDER BY score DESC
-        LIMIT 20
-      `).bind(userId).all(),
-
-      env.DB.prepare(`
-        SELECT
-          genre,
-          score,
-          play_count AS playCount,
-          completion_count AS completionCount,
-          skip_count AS skipCount,
-          like_count AS likeCount,
-          dislike_count AS dislikeCount,
-          save_count AS saveCount,
-          last_played_at AS lastPlayedAt
-        FROM genre_preferences
-        WHERE user_id = ?
-        ORDER BY score DESC
-        LIMIT 20
-      `).bind(userId).all(),
-
-      env.DB.prepare(`
-        SELECT
-          e.track_id AS trackId,
-          e.event_type AS eventType,
-          e.created_at AS createdAt,
-          t.artist,
-          t.genres_json AS genresJson
-        FROM listening_events e
-        LEFT JOIN tracks t ON t.id = e.track_id
-        WHERE e.user_id = ?
-          AND e.event_type IN ('play', 'complete', 'skip')
-        ORDER BY e.created_at DESC
-        LIMIT 60
-      `).bind(userId).all(),
-
-      env.DB.prepare(`
-        SELECT
-          track_id AS trackId,
-          score,
-          play_count AS playCount,
-          completion_count AS completionCount,
-          skip_count AS skipCount,
-          like_count AS likeCount,
-          dislike_count AS dislikeCount,
-          save_count AS saveCount,
-          last_played_at AS lastPlayedAt
-        FROM track_preferences
-        WHERE user_id = ?
-        LIMIT 1000
-      `).bind(userId).all()
-    ]);
-
-  let artists = artistResult.results || [];
-
-  if (!artists.length) {
-    const fallback = await env.DB.prepare(`
-      SELECT
-        lower(trim(t.artist)) AS artistKey,
-        t.artist AS artistName,
-        MAX(t.artist_id) AS artistId,
-        MAX(t.musicbrainz_artist_id) AS musicBrainzArtistId,
-        SUM(p.score) AS score,
-        SUM(p.play_count) AS playCount,
-        SUM(p.completion_count) AS completionCount,
-        SUM(p.skip_count) AS skipCount,
-        SUM(p.like_count) AS likeCount,
-        SUM(p.dislike_count) AS dislikeCount,
-        SUM(p.save_count) AS saveCount,
-        MAX(p.last_played_at) AS lastPlayedAt
-      FROM track_preferences p
-      INNER JOIN tracks t ON t.id = p.track_id
-      WHERE p.user_id = ?
-        AND t.artist IS NOT NULL
-      GROUP BY lower(trim(t.artist))
-      ORDER BY score DESC
-      LIMIT 20
-    `)
-      .bind(userId)
-      .all();
-
-    artists = fallback.results || [];
-  }
-
-  return {
-    topTracks: topTracksResult.results || [],
-    artists,
-    genres: genreResult.results || [],
-    recent: recentResult.results || [],
-    allTrackPreferences: allPrefsResult.results || []
-  };
-}
-
-
-async function buildRecommendations(
-  env,
-  userId,
-  options = {}
-) {
-  const limit = Number(options.limit || 36);
-  const seedTrackId = options.seedTrackId || null;
-  const useCache = options.useCache !== false && !seedTrackId;
-
-  if (useCache) {
-    const cached = await env.DB.prepare(`
-      SELECT payload, generated_at AS generatedAt
-      FROM recommendation_cache
-      WHERE user_id = ?
-    `)
-      .bind(userId)
-      .first();
-
-    if (
-      cached?.payload &&
-      Number(cached.generatedAt || 0) >
-        Math.floor(Date.now() / 1000) - 1200
-    ) {
-      try {
-        const parsed = JSON.parse(cached.payload);
-        if (Array.isArray(parsed) && parsed.length) {
-          return parsed.slice(0, limit);
-        }
-      } catch {}
-    }
-  }
-
-  const profile = await getTasteProfile(env, userId);
-  const candidates = new Map();
-
-  const addCandidate = (track, source, sourceScore = 0, sourceGenre = null) => {
-    if (!track?.id || !track?.title) return;
-
-    const key =
-      track.canonicalKey ||
-      makeCanonicalKey(track.artist, track.title) ||
-      track.id;
-
-    const existing = candidates.get(key);
-
-    if (!existing) {
-      candidates.set(key, {
-        ...track,
-        canonicalKey: key,
-        _sourceScore: sourceScore,
-        _sources: [source],
-        _sourceGenres: sourceGenre ? [sourceGenre] : []
-      });
-      return;
-    }
-
-    existing._sourceScore += sourceScore;
-
-    if (!existing._sources.includes(source)) {
-      existing._sources.push(source);
-    }
-
-    if (
-      sourceGenre &&
-      !existing._sourceGenres.includes(sourceGenre)
-    ) {
-      existing._sourceGenres.push(sourceGenre);
-    }
-
-    if (
-      Number(track.sourceQuality || 0) >
-      Number(existing.sourceQuality || 0)
-    ) {
-      const sourceMeta = {
-        _sourceScore: existing._sourceScore,
-        _sources: existing._sources,
-        _sourceGenres: existing._sourceGenres
-      };
-      Object.assign(existing, track, sourceMeta);
-    }
-  };
-
-  for (const track of profile.topTracks.slice(0, 12)) {
-    addCandidate(
-      storedRowToTrack(track),
-      "known",
-      Math.max(0, Math.min(8, Number(track.score || 0) * 0.35))
-    );
-  }
-
-  const seeds = [];
-
-  if (seedTrackId) {
-    seeds.push(seedTrackId);
-  }
-
-  for (const track of profile.topTracks) {
-    if (!seeds.includes(track.id)) {
-      seeds.push(track.id);
-    }
-    if (seeds.length >= 3) break;
-  }
-
-  const seedPrimaryGenres = new Map();
-
-  for (const seed of seeds) {
-    let sourceTrack = profile.topTracks.find(track => track.id === seed) || null;
-
-    if (!sourceTrack && seed === seedTrackId) {
-      sourceTrack = await getStoredTrack(env, seed);
-    }
-
-    const seedGenres = parseStoredGenres(sourceTrack?.genresJson);
-    if (seedGenres.length) {
-      seedPrimaryGenres.set(
-        seed,
-        String(seedGenres[0].name || seedGenres[0]).toLowerCase()
-      );
-    }
-  }
-
-  const radioResults = await Promise.allSettled(
-    seeds.map(seed => ytmGetRadio(seed, 35))
-  );
-
-  radioResults.forEach((result, seedIndex) => {
-    if (result.status !== "fulfilled") return;
-
-    result.value.forEach((track, index) => {
-      addCandidate(
-        track,
-        "ytm-radio",
-        Math.max(1.5, 6.5 - seedIndex * 1.2 - index * 0.035),
-        seedPrimaryGenres.get(seeds[seedIndex]) || null
-      );
-    });
-  });
-
-  // Full Brainz discovery is only done for the cached home mix.
-  // Per-track queue refreshes stay fast and use YT Music radio plus the
-  // learned Veeb profile.
-  if (!seedTrackId) {
-    try {
-      const discoverySpecs = await buildBrainzDiscoverySpecs(env, profile);
-
-      const resolved = await mapLimit(
-        discoverySpecs,
-        4,
-        async spec => {
-          try {
-            const results = await ytmSearchSongs(spec.query, 6);
-            const best = chooseExternalMatch(results, spec);
-
-            if (!best) {
-              return null;
-            }
-
-            best.musicBrainzRecordingId =
-              spec.musicBrainzRecordingId || null;
-            best.musicBrainzArtistId =
-              spec.musicBrainzArtistId || null;
-            best.genres = spec.genres || [];
-
-            return { track: best, spec };
-          } catch {
-            return null;
-          }
-        }
-      );
-
-      for (const item of resolved) {
-        if (!item) continue;
-
-        addCandidate(
-          item.track,
-          item.spec.source,
-          item.spec.sourceScore,
-          item.spec.sourceGenre || null
-        );
-      }
-    } catch (error) {
-      console.error("Brainz discovery failed:", error);
-    }
-  }
-
-  let list = [...candidates.values()];
-
-  if (!list.length) {
-    return [];
-  }
-
-  const trackPrefMap = new Map(
-    profile.allTrackPreferences.map(pref => [pref.trackId, pref])
-  );
-
-  const artistPrefMap = new Map(
-    profile.artists.map(pref => [
-      pref.artistKey || normalizeArtistKey(pref.artistName),
-      pref
-    ])
-  );
-
-  const genrePrefMap = new Map(
-    profile.genres.map(pref => [pref.genre, pref])
-  );
-
-  const recentTrackTimes = new Map();
-  const recentArtistCounts = new Map();
-  const recentGenreCounts = new Map();
-
-  for (const item of profile.recent) {
-    if (!recentTrackTimes.has(item.trackId)) {
-      recentTrackTimes.set(item.trackId, Number(item.createdAt || 0));
-    }
-
-    const artistKey = normalizeArtistKey(item.artist);
-
-    if (artistKey) {
-      recentArtistCounts.set(
-        artistKey,
-        (recentArtistCounts.get(artistKey) || 0) + 1
-      );
-    }
-
-    for (const genre of parseStoredGenres(item.genresJson)) {
-      const genreKey = String(genre.name || genre).toLowerCase().trim();
-      if (!genreKey) continue;
-      recentGenreCounts.set(
-        genreKey,
-        (recentGenreCounts.get(genreKey) || 0) + 1
-      );
-    }
-  }
-
-  list = list
-    .map(track => {
-      const pref = trackPrefMap.get(track.id);
-      const artistKey = normalizeArtistKey(track.artist);
-      const artistPref = artistPrefMap.get(artistKey);
-      const storedGenres = Array.isArray(track.genres)
-        ? track.genres
-        : parseStoredGenres(track.genresJson);
-      const candidateGenres = new Set([
-        ...storedGenres.map(item => String(item.name || item).toLowerCase()),
-        ...(track._sourceGenres || []).map(item => String(item).toLowerCase())
-      ]);
-
-      let score = Number(track._sourceScore || 0);
-
-      if (pref) {
-        if (Number(pref.dislikeCount || 0) > 0) {
-          score -= 1000;
-        }
-
-        score += clampNumber(Number(pref.score || 0) * 0.9, -20, 18);
-      } else {
-        score += 3.2;
-      }
-
-      if (artistPref) {
-        score += clampNumber(
-          Number(artistPref.score || 0) * 0.34,
-          -9,
-          10
-        );
-      } else if (artistKey) {
-        score += 1.25;
-      }
-
-      let genreAffinity = 0;
-
-      for (const genre of candidateGenres) {
-        const genrePref = genrePrefMap.get(genre);
-        if (!genrePref) continue;
-        genreAffinity += clampNumber(
-          Number(genrePref.score || 0) * 0.22,
-          -5,
-          5
-        );
-      }
-
-      score += clampNumber(genreAffinity, -8, 10);
-
-      // Avoid turning a strong genre preference into a one-genre tunnel.
-      let genreFatigue = 0;
-      for (const genre of candidateGenres) {
-        const count = recentGenreCounts.get(genre) || 0;
-        if (count > 5) {
-          genreFatigue += Math.min(5, (count - 5) * 0.65);
-        }
-      }
-      score -= genreFatigue;
-
-      // Small reward for an adjacent genre that has not been hammered recently.
-      if (
-        track._sources.includes("adjacent-genre") &&
-        [...candidateGenres].every(genre => (recentGenreCounts.get(genre) || 0) < 3)
-      ) {
-        score += 1.75;
-      }
-
-      const lastPlayed =
-        Number(pref?.lastPlayedAt || 0) ||
-        Number(recentTrackTimes.get(track.id) || 0);
-
-      if (lastPlayed) {
-        const ageDays =
-          (Date.now() / 1000 - lastPlayed) / 86400;
-
-        if (ageDays < 0.75) score -= 15;
-        else if (ageDays < 3) score -= 9;
-        else if (ageDays < 7) score -= 5;
-        else if (ageDays < 21) score -= 2;
-        else if (ageDays > 60) score += 1.5;
-      } else {
-        score += 2.25;
-      }
-
-      const recentArtistCount =
-        recentArtistCounts.get(artistKey) || 0;
-
-      if (recentArtistCount > 2) {
-        score -= (recentArtistCount - 2) * 2.25;
-      }
-
-      score -= Math.max(0, getVariantPenalty(track, "") * 0.4);
-      score += Math.random() * 1.4;
-
-      let bucket = "discovery";
-
-      if (
-        Number(pref?.score || 0) > 2.5 ||
-        Number(artistPref?.score || 0) > 6
-      ) {
-        bucket = "comfort";
-      } else if (
-        track._sources.includes("ytm-radio") ||
-        track._sources.includes("similar-track") ||
-        track._sources.includes("similar-artist") ||
-        track._sources.includes("adjacent-genre")
-      ) {
-        bucket = "edge";
-      }
-
-      if (track._sources.includes("genre") && !pref) {
-        bucket = "discovery";
-      }
-
-      return {
-        ...track,
-        _score: score,
-        _bucket: bucket,
-        genres: storedGenres,
-        veebReason: buildRecommendationReason(track, bucket)
-      };
-    })
-    .filter(track => track._score > -100)
-    .sort((a, b) => b._score - a._score);
-
-  const selected = selectRecommendationMix(
-    list,
-    limit
-  );
-
-  const output = selected.map(track => ({
-    id: track.id,
-    title: track.title,
-    artist: track.artist,
-    artistId: track.artistId || null,
-    album: track.album || null,
-    albumId: track.albumId || null,
-    artwork: track.artwork || null,
-    durationSeconds: Number(track.durationSeconds || 0) || null,
-    canonicalKey: track.canonicalKey,
-    videoType: track.videoType || null,
-    sourceQuality: Number(track.sourceQuality || 0),
-    musicBrainzRecordingId: track.musicBrainzRecordingId || null,
-    musicBrainzArtistId: track.musicBrainzArtistId || null,
-    genres: track.genres || [],
-    veebReason: track.veebReason,
-    veebBucket: track._bucket
-  }));
-
-  if (useCache && output.length) {
-    await env.DB.prepare(`
-      INSERT INTO recommendation_cache (
-        user_id,
-        payload,
-        generated_at
-      )
-      VALUES (?, ?, unixepoch())
-      ON CONFLICT(user_id)
-      DO UPDATE SET
-        payload = excluded.payload,
-        generated_at = unixepoch()
-    `)
-      .bind(userId, JSON.stringify(output))
-      .run();
-  }
-
-  return output;
-}
-
-
-function storedRowToTrack(row) {
-  return {
-    id: row.id,
-    title: row.title,
-    artist: row.artist,
-    artistId: row.artistId || null,
-    album: row.album || null,
-    albumId: row.albumId || null,
-    artwork: row.artwork || null,
-    durationSeconds: Number(row.durationSeconds || 0) || null,
-    canonicalKey:
-      row.canonicalKey ||
-      makeCanonicalKey(row.artist, row.title),
-    genresJson: row.genresJson || null,
-    videoType: row.videoType || null,
-    sourceQuality: Number(row.sourceQuality || 0),
-    musicBrainzRecordingId: row.musicBrainzRecordingId || null,
-    musicBrainzArtistId: row.musicBrainzArtistId || null,
-    brainzMatchScore: Number(row.brainzMatchScore || 0)
-  };
-}
-
-
-function chooseExternalMatch(results, spec) {
-  if (!Array.isArray(results) || !results.length) {
-    return null;
-  }
-
-  const expectedArtist = normalizeArtistKey(spec.expectedArtist || "");
-  const expectedTitle = normalizeTitleKey(spec.expectedTitle || "");
-
-  let best = null;
-  let bestScore = -Infinity;
-
-  for (const track of results) {
-    let score = Number(track.sourceQuality || 0);
-    const artist = normalizeArtistKey(track.artist);
-    const title = normalizeTitleKey(track.title);
-
-    if (expectedArtist) {
-      if (artist === expectedArtist) score += 12;
-      else if (artist.includes(expectedArtist) || expectedArtist.includes(artist)) score += 6;
-      else score -= 5;
-    }
-
-    if (expectedTitle) {
-      if (title === expectedTitle) score += 14;
-      else if (title.includes(expectedTitle) || expectedTitle.includes(title)) score += 5;
-      else score -= 4;
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = track;
-    }
-  }
-
-  return best;
-}
-
-
-function selectRecommendationMix(tracks, limit) {
-  const target = {
-    comfort: Math.round(limit * 0.55),
-    edge: Math.round(limit * 0.30)
-  };
-
-  target.discovery = Math.max(
-    0,
-    limit - target.comfort - target.edge
-  );
-
-  const selected = [];
-  const selectedIds = new Set();
-  const selectedKeys = new Set();
-  const artistCounts = new Map();
-
-  const canAdd = track => {
-    if (selectedIds.has(track.id)) return false;
-    if (selectedKeys.has(track.canonicalKey)) return false;
-
-    const artistKey = normalizeArtistKey(track.artist);
-    const artistCount = artistCounts.get(artistKey) || 0;
-
-    return !artistKey || artistCount < 2;
-  };
-
-  const add = track => {
-    if (!canAdd(track)) return false;
-
-    selected.push(track);
-    selectedIds.add(track.id);
-    selectedKeys.add(track.canonicalKey);
-
-    const artistKey = normalizeArtistKey(track.artist);
-
-    if (artistKey) {
-      artistCounts.set(
-        artistKey,
-        (artistCounts.get(artistKey) || 0) + 1
-      );
-    }
-
-    return true;
-  };
-
-  for (const bucket of ["comfort", "edge", "discovery"]) {
-    let count = 0;
-
-    for (const track of tracks) {
-      if (track._bucket !== bucket) continue;
-      if (count >= target[bucket]) break;
-      if (add(track)) count++;
-    }
-  }
-
-  for (const track of tracks) {
-    if (selected.length >= limit) break;
-    add(track);
-  }
-
-  return avoidAdjacentArtists(selected);
-}
-
-
-function avoidAdjacentArtists(tracks) {
-  const output = [];
-  const remaining = [...tracks];
-
-  while (remaining.length) {
-    const previousArtist = output.length
-      ? normalizeArtistKey(output[output.length - 1].artist)
-      : "";
-
-    let index = remaining.findIndex(
-      track => normalizeArtistKey(track.artist) !== previousArtist
-    );
-
-    if (index < 0) index = 0;
-
-    output.push(
-      remaining.splice(index, 1)[0]
-    );
-  }
-
-  return output;
-}
-
-
-function buildRecommendationReason(track, bucket) {
-  if (track._sources.includes("adjacent-genre") && track._sourceGenres?.length) {
-    return "Genre neighbour: " + track._sourceGenres[0];
-  }
-
-  if (track._sources.includes("genre") && track._sourceGenres?.length) {
-    return "Genre fit: " + track._sourceGenres[0];
-  }
-
-  if (track._sources.includes("similar-track")) {
-    return "Adjacent to tracks you like";
-  }
-
-  if (track._sources.includes("similar-artist")) {
-    return "Adjacent artist";
-  }
-
-  if (track._sources.includes("ytm-radio")) {
-    return bucket === "comfort"
-      ? "Strong fit"
-      : "Related discovery";
-  }
-
-  if (bucket === "comfort") {
-    return "Based on your history";
-  }
-
-  return "Discovery";
-}
-
-
-function clampNumber(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-
-async function mapLimit(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let cursor = 0;
-
-  const runners = new Array(
-    Math.min(concurrency, items.length)
-  )
-    .fill(null)
-    .map(async () => {
-      while (true) {
-        const index = cursor++;
-        if (index >= items.length) return;
-        results[index] = await worker(items[index], index);
-      }
-    });
-
-  await Promise.all(runners);
-  return results;
-}
-
-
-// =================================================================
-// PLAYBACK
-// =================================================================
-
-function getYouTubeResolverConfig(env) {
-  const baseUrl = String(
-    env.YOUTUBE_RESOLVER_URL || ""
-  ).trim().replace(/\/+$/, "");
-
-  const secret = String(
-    env.YOUTUBE_RESOLVER_SECRET || ""
-  ).trim();
-
-  if (!baseUrl) {
-    throw new Error(
-      "Missing YOUTUBE_RESOLVER_URL Worker secret/variable"
-    );
-  }
-
-  if (!/^https:\/\//i.test(baseUrl)) {
-    throw new Error(
-      "YOUTUBE_RESOLVER_URL must use HTTPS"
-    );
-  }
-
-  if (!secret) {
-    throw new Error(
-      "Missing YOUTUBE_RESOLVER_SECRET Worker secret"
-    );
-  }
-
-  return {
-    baseUrl,
-    secret
-  };
-}
-
-
-async function getPlayableUrl(
-  trackId,
-  env
-) {
-  const resolver = getYouTubeResolverConfig(env);
-
-  const response = await fetch(
-    resolver.baseUrl
-    + "/resolve/"
-    + encodeURIComponent(trackId),
-    {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "Authorization": "Bearer " + resolver.secret
-      },
-      redirect: "follow"
-    }
-  );
-
-  if (!response.ok) {
-    const message = await response.text();
-
-    console.error(
-      "YouTube resolver metadata failed:",
-      response.status,
-      message.slice(0, 1000)
-    );
-
-    throw new Error(
-      "YouTube resolver returned HTTP "
-      + response.status
-    );
-  }
-
-  const data = await response.json();
-
-  return {
-    provider: data.provider || "yt-dlp",
-    title: data.title || null,
-    duration: Number(data.duration || 0),
-    formatId: data.formatId || null,
-    ext: data.ext || null,
-    audioCodec: data.audioCodec || null,
-    abr: data.abr || null,
-    proxied: true
-  };
-}
-
-
-async function wakeYouTubeResolver(env) {
-  const resolver = getYouTubeResolverConfig(env);
-
-  const response = await fetch(
-    resolver.baseUrl + "/health",
-    {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "Authorization": "Bearer " + resolver.secret
-      },
-      redirect: "follow"
-    }
-  );
-
-  return response.ok;
-}
-
-
-async function prefetchPlayableAudio(
-  trackId,
-  env,
-  intent
-) {
-  const resolver = getYouTubeResolverConfig(env);
-
-  const response = await fetch(
-    resolver.baseUrl
-    + "/prefetch/"
-    + encodeURIComponent(trackId)
-    + (intent ? "?intent=1" : ""),
-    {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Authorization": "Bearer " + resolver.secret
-      },
-      redirect: "follow"
-    }
-  );
-
-  if (!response.ok && response.status !== 202) {
-    const message = await response.text().catch(() => "");
-    throw new Error(
-      "Resolver prefetch returned HTTP "
-      + response.status
-      + (message ? ": " + message.slice(0, 300) : "")
-    );
-  }
-
-  return true;
-}
-
-
-async function streamPlayableAudio(
-  request,
-  trackId,
-  env,
-  ctx
-) {
-  const resolver = getYouTubeResolverConfig(env);
-  const cache = caches.default;
-
-  const canonicalUrl = new URL(request.url);
-  canonicalUrl.pathname =
-    "/__veeb_audio_cache/"
-    + encodeURIComponent(trackId);
-  canonicalUrl.search = "";
-
-  const canonicalKey = new Request(
-    canonicalUrl.toString(),
-    { method: "GET" }
-  );
-
-  // Cloudflare's Cache API can satisfy Range requests from a cached full
-  // response. This keeps repeat plays and browser follow-up range reads away
-  // from Render entirely.
-  if (request.method === "GET") {
-    const lookupHeaders = new Headers();
-    const requestedRange = request.headers.get("Range");
-
-    if (requestedRange) {
-      lookupHeaders.set("Range", requestedRange);
-    }
-
-    const cacheLookup = new Request(
-      canonicalUrl.toString(),
-      {
-        method: "GET",
-        headers: lookupHeaders
-      }
-    );
-
-    const cached = await cache.match(cacheLookup);
-
-    if (cached) {
-      const cachedHeaders = new Headers(cached.headers);
-      cachedHeaders.set("X-Veeb-Edge-Cache", "HIT");
-      cachedHeaders.set("X-Veeb-Playback-Provider", "cloudflare-edge-cache");
-
-      return new Response(
-        cached.body,
-        {
-          status: cached.status,
-          statusText: cached.statusText,
-          headers: cachedHeaders
-        }
-      );
-    }
-  }
-
-  const upstreamHeaders = new Headers();
-  upstreamHeaders.set("Accept", "*/*");
-  upstreamHeaders.set(
-    "Authorization",
-    "Bearer " + resolver.secret
-  );
-
-  // On an edge-cache miss request the completed file from Render, not a
-  // partial range. A full 200 response is cacheable; Cloudflare then handles
-  // subsequent Range slicing itself.
-  const upstream = await fetch(
-    resolver.baseUrl
-    + "/stream/"
-    + encodeURIComponent(trackId),
-    {
-      method:
-        request.method === "HEAD"
-          ? "HEAD"
-          : "GET",
-      headers: upstreamHeaders,
-      redirect: "follow"
-    }
-  );
-
-  if (!upstream.ok && upstream.status !== 206) {
-    let upstreamMessage = "";
-
-    try {
-      upstreamMessage = await upstream.text();
-    } catch (_) {}
-
-    console.error(
-      "YouTube resolver stream failed:",
-      upstream.status,
-      upstream.statusText,
-      upstreamMessage.slice(0, 1000)
-    );
-
-    throw new Error(
-      "Resolver audio stream returned HTTP "
-      + upstream.status
-    );
-  }
-
-  const headers = new Headers(upstream.headers);
-
-  if (!headers.has("Content-Type")) {
-    headers.set("Content-Type", "audio/mp4");
-  }
-
-  if (!headers.has("Accept-Ranges")) {
-    headers.set("Accept-Ranges", "bytes");
-  }
-
-  headers.set("X-Veeb-Playback-Provider", "youtube-resolver");
-  headers.set("X-Veeb-Edge-Cache", "MISS");
-
-  if (request.method === "HEAD") {
-    headers.set("Cache-Control", "no-store");
-    return new Response(null, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers
-    });
-  }
-
-  // Store the completed audio at the Cloudflare edge for a day. Render's free
-  // filesystem disappears on spin-down, while this gives Veeb another cache
-  // layer that can survive a resolver restart for the user's usual edge POP.
-  headers.set(
-    "Cache-Control",
-    "public, max-age=3600, s-maxage=86400"
-  );
-
-  const response = new Response(
-    upstream.body,
-    {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers
-    }
-  );
-
-  const resolverCacheState = upstream.headers.get("X-Veeb-Cache") || "";
-
-  if (
-    upstream.status === 200 &&
-    resolverCacheState === "HIT" &&
-    ctx?.waitUntil
-  ) {
-    const cacheHeaders = new Headers(headers);
-    cacheHeaders.delete("X-Veeb-Edge-Cache");
-    cacheHeaders.set("X-Veeb-Edge-Cache", "STORED");
-
-    const cacheResponse = new Response(
-      response.clone().body,
-      {
-        status: 200,
-        headers: cacheHeaders
-      }
-    );
-
-    ctx.waitUntil(
-      cache.put(
-        canonicalKey,
-        cacheResponse
-      ).catch(error => {
-        console.error(
-          "Veeb edge audio cache put failed:",
-          trackId,
-          error
-        );
-      })
-    );
-  }
-
-  return response;
-}
-
-
-function compareAudioFormats(
-  a,
-  b
-) {
-  if (
-    a.itag === 251
-    &&
-    b.itag !== 251
-  ) {
-    return -1;
-  }
-
-  if (
-    b.itag === 251
-    &&
-    a.itag !== 251
-  ) {
-    return 1;
-  }
-
-  if (
-    a.itag === 140
-    &&
-    b.itag !== 140
-  ) {
-    return -1;
-  }
-
-  if (
-    b.itag === 140
-    &&
-    a.itag !== 140
-  ) {
-    return 1;
-  }
-
-  return (
-    Number(
-      b.bitrate || 0
-    )
-    -
-    Number(
-      a.bitrate || 0
-    )
-  );
-}
-
-
-function getGoogleVideoExpiry(
-  streamUrl
-) {
-  try {
-    const parsed =
-      new URL(
-        streamUrl
-      );
-
-    const expire =
-      parsed.searchParams.get(
-        "expire"
-      );
-
-    return expire
-      ? Number(expire)
-      : null;
-
-  } catch {
-    return null;
-  }
-}
-
-
-function decodeYouTubeText(
-  value
-) {
-  return String(
-    value || ""
-  )
-    .replaceAll(
-      "&amp;",
-      "&"
-    )
-    .replaceAll(
-      "&quot;",
-      '"'
-    )
-    .replaceAll(
-      "&#39;",
-      "'"
-    )
-    .replaceAll(
-      "&lt;",
-      "<"
-    )
-    .replaceAll(
-      "&gt;",
-      ">"
-    );
-}
-
-// =================================================================
-// HELPERS
-// =================================================================
-
-function normalizeEmail(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase();
-}
-
-
-function isValidEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-    value
-  );
-}
-
-
-function getCookie(request, name) {
-  const cookieHeader =
-    request.headers.get("Cookie");
-
-  if (!cookieHeader) {
-    return null;
-  }
-
-  const cookies =
-    cookieHeader.split(";");
-
-  for (const cookie of cookies) {
-    const [key, ...rest] =
-      cookie.trim().split("=");
-
-    if (key === name) {
-      return rest.join("=");
-    }
-  }
-
-  return null;
-}
-
-
-async function sha256Hex(value) {
-  const bytes =
-    new TextEncoder().encode(value);
-
-  const hash =
-    await crypto.subtle.digest(
-      "SHA-256",
-      bytes
-    );
-
-  return [...new Uint8Array(hash)]
-    .map(
-      byte =>
-        byte
-          .toString(16)
-          .padStart(2, "0")
-    )
-    .join("");
-}
-
-
-function bytesToBase64(bytes) {
-  let binary = "";
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary);
-}
-
-
-function base64ToBytes(value) {
-  const binary = atob(value);
-
-  const bytes =
-    new Uint8Array(binary.length);
-
-  for (
-    let i = 0;
-    i < binary.length;
-    i++
-  ) {
-    bytes[i] =
-      binary.charCodeAt(i);
-  }
-
-  return bytes;
-}
-
-
-function bytesToBase64Url(bytes) {
-  return bytesToBase64(bytes)
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
-}
-
-
-function apiFailure(context, error) {
-  const message =
-    error && typeof error.message === "string"
-      ? error.message
-      : String(error);
-
-  console.error(`Veeb API error (${context}):`, error);
-
-  return json(
-    {
-      error: `Veeb ${context} failed: ${message}`
-    },
-    500
-  );
-}
-
-
-function json(data, status = 200) {
-  return Response.json(
-    data,
-    {
-      status,
-      headers: {
-        "Cache-Control": "no-store"
-      }
-    }
-  );
-}
-
-
-function jsonWithCookie(
-  data,
-  cookie,
-  status = 200
-) {
-  const headers =
-    new Headers();
-
-  headers.set(
-    "Content-Type",
-    "application/json; charset=UTF-8"
-  );
-
-  headers.set(
-    "Cache-Control",
-    "no-store"
-  );
-
-  headers.append(
-    "Set-Cookie",
-    cookie
-  );
-
-  return new Response(
-    JSON.stringify(data),
-    {
-      status,
-      headers
-    }
-  );
-}
-
-
-// =================================================================
-// SINGLE PAGE APP
-// =================================================================
-
-const APP_HTML = `
-<!DOCTYPE html>
-<html lang="en">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1,viewport-fit=cover"
->
-
-<title>Veeb</title>
-
-<link
-  rel="stylesheet"
-  href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css"
->
-<link
-  rel="stylesheet"
-  href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css"
->
-
-<style>
-
-@font-face {
-  font-family: "Veeb PolySans";
-  src: url("https://cdn.shopify.com/s/files/1/0439/5597/8399/files/polysanstrial-median.woff2?v=1786620069") format("woff2");
-  font-style: normal;
-  font-weight: 500;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Veeb Trade Gothic";
-  src: url("https://cdn.shopify.com/s/files/1/0439/5597/8399/files/Trade-Gothic-Std-Extended.woff2?v=1786619972") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Veeb Trade Gothic";
-  src: url("https://cdn.shopify.com/s/files/1/0439/5597/8399/files/Trade-Gothic-Std-Bold-Extended.woff2?v=1786619915") format("woff2");
-  font-style: normal;
-  font-weight: 700 900;
-  font-display: swap;
-}
-
-:root {
-  --bg: #101210;
-  --surface: #181b19;
-  --surface-2: #2a2a2a;
-
-  --green: #20e47c;
-  --green-soft: #9df3ad;
-
-  --white: #edebeb;
-  --yellow: #e8b73d;
-
-  --muted: #858b87;
-  --border: #303532;
-
-  --danger: #ff685c;
-}
-
-
-* {
-  box-sizing: border-box;
-}
-
-
-html,
-body {
-  margin: 0;
-
-  min-height: 100%;
-
-  background: var(--bg);
-
-  color: var(--white);
-
-  font-family:
-    "Veeb PolySans",
-    Arial,
-    Helvetica,
-    sans-serif;
-
-  font-weight: 500;
-}
-
-
-button,
-input {
-  font: inherit;
-}
-
-
-button {
-  border-radius: 0;
-  box-shadow: none;
-}
-
-
-.hidden {
-  display: none !important;
-}
-
-
-/* ================================================================
-   TYPOGRAPHY
-   PolySans carries readable/interface copy.
-   Trade Gothic Extended carries identity, hierarchy and utility UI.
-   ================================================================ */
-
-.auth-logo,
-.auth-big,
-.auth-title,
-.logo,
-.hero h1 {
-  font-family:
-    "Veeb Trade Gothic",
-    "Arial Narrow",
-    Arial,
-    sans-serif;
-
-  font-weight: 900;
-}
-
-.auth-eyebrow,
-.auth-tab,
-.field label,
-.auth-submit,
-.small-button,
-.kicker,
-.search button,
-.section-label,
-.track-num,
-.progress {
-  font-family:
-    "Veeb Trade Gothic",
-    "Arial Narrow",
-    Arial,
-    sans-serif;
-}
-
-.auth-eyebrow,
-.auth-tab,
-.field label,
-.auth-submit,
-.small-button,
-.kicker,
-.search button,
-.section-label {
-  font-weight: 700;
-}
-
-.auth-foot,
-.field input,
-.user-email,
-.search input,
-.empty,
-.track-title,
-.track-sub,
-.now-title,
-.now-artist {
-  font-family:
-    "Veeb PolySans",
-    Arial,
-    Helvetica,
-    sans-serif;
-
-  font-weight: 500;
-}
-
-
-/* ================================================================
-   AUTH
-   ================================================================ */
-
-#authScreen {
-  min-height: 100vh;
-
-  display: grid;
-
-  grid-template-columns:
-    1.15fr .85fr;
-}
-
-
-.auth-brand {
-  position: relative;
-
-  min-height: 100vh;
-
-  display: flex;
-
-  flex-direction: column;
-
-  justify-content: space-between;
-
-  padding:
-    48px;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-}
-
-
-.auth-logo {
-  font-size:
-    30px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    -0.8px;
-}
-
-
-.auth-big {
-  max-width:
-    700px;
-
-  margin:
-    auto 0;
-
-  font-size:
-    clamp(
-      58px,
-      8vw,
-      118px
-    );
-
-  font-weight:
-    900;
-
-  line-height:
-    .85;
-
-  letter-spacing:
-    -2.5px;
-}
-
-
-.auth-foot {
-  max-width:
-    420px;
-
-  font-size:
-    13px;
-
-  line-height:
-    1.5;
-
-  font-weight:
-    700;
-}
-
-
-.auth-panel {
-  min-height:
-    100vh;
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    center;
-
-  padding:
-    48px;
-}
-
-
-.auth-box {
-  width:
-    min(440px, 100%);
-}
-
-
-.auth-eyebrow {
-  margin-bottom:
-    16px;
-
-  color:
-    var(--green);
-
-  font-size:
-    11px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    3px;
-}
-
-
-.auth-title {
-  margin:
-    0 0 38px;
-
-  font-size:
-    48px;
-
-  line-height:
-    .95;
-
-  letter-spacing:
-    -3px;
-}
-
-
-.auth-tabs {
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  margin-bottom:
-    32px;
-
-  border-bottom:
-    1px solid var(--border);
-}
-
-
-.auth-tab {
-  border:
-    0;
-
-  border-bottom:
-    2px solid transparent;
-
-  padding:
-    14px 4px;
-
-  background:
-    transparent;
-
-  color:
-    var(--muted);
-
-  text-align:
-    left;
-
-  font-size:
-    11px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    2px;
-
-  cursor:
-    pointer;
-}
-
-
-.auth-tab.active {
-  border-bottom-color:
-    var(--green);
-
-  color:
-    var(--green);
-}
-
-
-.field {
-  margin-bottom:
-    22px;
-}
-
-
-.field label {
-  display:
-    block;
-
-  margin-bottom:
-    8px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    2px;
-}
-
-
-.field input {
-  width:
-    100%;
-
-  padding:
-    15px 0;
-
-  border:
-    0;
-
-  border-bottom:
-    1px solid var(--border);
-
-  outline:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    17px;
-}
-
-
-.field input:focus {
-  border-bottom-color:
-    var(--green);
-}
-
-
-.auth-submit {
-  width:
-    100%;
-
-  margin-top:
-    18px;
-
-  border:
-    0;
-
-  padding:
-    16px 20px;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    1px;
-
-  cursor:
-    pointer;
-}
-
-
-.auth-error {
-  min-height:
-    22px;
-
-  margin-top:
-    15px;
-
-  color:
-    var(--danger);
-
-  font-size:
-    12px;
-}
-
-
-/* ================================================================
-   APP
-   ================================================================ */
-
-#appScreen {
-  min-height:
-    100vh;
-
-  padding-bottom:
-    126px;
-}
-
-
-.topbar {
-  height:
-    78px;
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    space-between;
-
-  padding:
-    0 34px;
-
-  position:
-    sticky;
-
-  top:
-    0;
-
-  z-index:
-    50;
-
-  border-bottom:
-    1px solid var(--border);
-
-  background:
-    rgba(16,18,16,.97);
-}
-
-
-.logo {
-  font-size:
-    25px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    -0.6px;
-}
-
-
-.logo-dot {
-  display:
-    inline-block;
-
-  width:
-    9px;
-
-  height:
-    9px;
-
-  margin-left:
-    7px;
-
-  background:
-    var(--green);
-}
-
-
-.top-actions {
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  gap:
-    10px;
-}
-
-
-.user-email {
-  margin-right:
-    8px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    11px;
-}
-
-
-.small-button {
-  padding:
-    9px 13px;
-
-  border:
-    1px solid var(--border);
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    10px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    1px;
-
-  cursor:
-    pointer;
-}
-
-
-.small-button:hover {
-  border-color:
-    var(--green);
-
-  color:
-    var(--green);
-}
-
-
-.shell {
-  width:
-    min(
-      1300px,
-      calc(100% - 58px)
-    );
-
-  margin:
-    0 auto;
-}
-
-
-.hero {
-  padding:
-    74px 0 54px;
-}
-
-
-.kicker {
-  margin-bottom:
-    16px;
-
-  color:
-    var(--green);
-
-  font-size:
-    11px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    3px;
-}
-
-
-.hero h1 {
-  margin:
-    0;
-
-  max-width:
-    1000px;
-
-  font-size:
-    clamp(
-      54px,
-      8vw,
-      116px
-    );
-
-  line-height:
-    .86;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    -2.5px;
-}
-
-
-.search {
-  max-width:
-    850px;
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr auto;
-
-  margin-top:
-    50px;
-
-  border-bottom:
-    2px solid var(--white);
-}
-
-
-.search input {
-  padding:
-    18px 0;
-
-  border:
-    0;
-
-  outline:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    18px;
-}
-
-
-.search button {
-  border:
-    0;
-
-  padding:
-    0 28px;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-
-  font-weight:
-    900;
-
-  cursor:
-    pointer;
-}
-
-
-.section-label {
-  margin:
-    0 0 18px;
-
-  color:
-    var(--green);
-
-  font-size:
-    11px;
-
-  font-weight:
-    900;
-
-  letter-spacing:
-    3px;
-}
-
-
-.empty {
-  padding:
-    30px 0;
-
-  color:
-    var(--muted);
-}
-
-
-.track-row {
-  width:
-    100%;
-
-  display:
-    grid;
-
-  grid-template-columns:
-    52px 62px 1fr auto;
-
-  align-items:
-    center;
-
-  gap:
-    16px;
-
-  padding:
-    13px 0;
-
-  border:
-    0;
-
-  border-bottom:
-    1px solid var(--border);
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  text-align:
-    left;
-
-  cursor:
-    pointer;
-}
-
-
-.track-row:hover {
-  background:
-    var(--surface);
-}
-
-
-.track-row img {
-  width:
-    62px;
-
-  height:
-    62px;
-
-  object-fit:
-    cover;
-
-  background:
-    var(--surface-2);
-}
-
-
-.track-num {
-  color:
-    var(--muted);
-
-  font-size:
-    11px;
-}
-
-
-.track-title {
-  font-size:
-    15px;
-
-  font-weight:
-    800;
-}
-
-
-.track-sub {
-  margin-top:
-    5px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    12px;
-}
-
-
-.track-play {
-  padding:
-    18px;
-
-  color:
-    var(--green);
-}
-
-
-.player {
-  position:
-    fixed;
-
-  left:
-    0;
-
-  right:
-    0;
-
-  bottom:
-    0;
-
-  min-height:
-    108px;
-
-  overflow:
-    hidden;
-
-  border-top:
-    1px solid var(--border);
-
-  background:
-    #151715;
-
-  z-index:
-    100;
-
-  touch-action:
-    none;
-
-  user-select:
-    none;
-}
-
-
-.player-swipe-surface {
-  position:
-    relative;
-
-  z-index:
-    2;
-
-  width:
-    100%;
-
-  min-height:
-    108px;
-
-  display:
-    grid;
-
-  grid-template-columns:
-    minmax(240px,1fr)
-    minmax(400px,1.4fr)
-    minmax(220px,1fr);
-
-  align-items:
-    center;
-
-  gap:
-    26px;
-
-  padding:
-    14px 28px;
-
-  background:
-    #151715;
-
-  transform:
-    translate3d(0,0,0);
-
-  will-change:
-    transform;
-}
-
-
-.player-swipe-preview {
-  position:
-    absolute;
-
-  inset:
-    0;
-
-  z-index:
-    1;
-
-  pointer-events:
-    none;
-
-  will-change:
-    transform, opacity;
-}
-
-
-.player.gesture-active .player-swipe-surface {
-  cursor:
-    grabbing;
-}
-
-
-.player-up-hint {
-  position:
-    absolute;
-
-  top:
-    3px;
-
-  left:
-    50%;
-
-  z-index:
-    5;
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  gap:
-    4px;
-
-  transform:
-    translateX(-50%);
-
-  color:
-    var(--muted);
-
-  font-size:
-    8px;
-
-  letter-spacing:
-    .8px;
-
-  pointer-events:
-    none;
-
-  opacity:
-    .7;
-}
-
-
-.player-up-hint i {
-  font-size:
-    10px;
-}
-
-
-.now {
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  gap:
-    14px;
-
-  min-width:
-    0;
-}
-
-
-.now img {
-  width:
-    72px;
-
-  height:
-    72px;
-
-  object-fit:
-    cover;
-
-  background:
-    var(--surface-2);
-}
-
-
-.now-title {
-  overflow:
-    hidden;
-
-  white-space:
-    nowrap;
-
-  text-overflow:
-    ellipsis;
-
-  font-size:
-    14px;
-
-  font-weight:
-    800;
-}
-
-
-.now-artist {
-  margin-top:
-    5px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    12px;
-}
-
-
-.player-center {
-  display:
-    flex;
-
-  flex-direction:
-    column;
-
-  gap:
-    10px;
-}
-
-
-.controls {
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    center;
-
-  gap:
-    18px;
-}
-
-
-.control {
-  width:
-    40px;
-
-  height:
-    40px;
-
-  border:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  cursor:
-    pointer;
-}
-
-
-.control:hover {
-  color:
-    var(--green);
-}
-
-
-.play {
-  width:
-    50px;
-
-  height:
-    50px;
-
-  border:
-    0;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-
-  font-size:
-    18px;
-
-  font-weight:
-    900;
-
-  cursor:
-    pointer;
-}
-
-
-.progress {
-  display:
-    grid;
-
-  grid-template-columns:
-    40px 1fr 40px;
-
-  align-items:
-    center;
-
-  gap:
-    10px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-}
-
-
-.progress input {
-  width:
-    100%;
-
-  accent-color:
-    var(--green);
-}
-
-
-.player-actions {
-  display:
-    flex;
-
-  justify-content:
-    flex-end;
-
-  gap:
-    10px;
-}
-
-
-.toast {
-  position:
-    fixed;
-
-  right:
-    20px;
-
-  bottom:
-    130px;
-
-  display:
-    none;
-
-  padding:
-    12px 16px;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-
-  font-size:
-    11px;
-
-  font-weight:
-    900;
-
-  z-index:
-    500;
-}
-
-
-.veeb-spin {
-  display: inline-block;
-  animation: veeb-spin .8s linear infinite;
-}
-
-@keyframes veeb-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-
-
-/* ================================================================
-   VEEB HOME / LIBRARY
-   ================================================================ */
-
-.nav-button.active,
-.small-button.active {
-  border-color: var(--green);
-  color: var(--green);
-}
-
-.home-view {
-  display: grid;
-  gap: 48px;
-  padding-bottom: 32px;
-}
-
-.home-section {
-  min-width: 0;
-}
-
-.home-section-head {
-  display: flex;
-  align-items: end;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 18px;
-}
-
-.home-section-head h2 {
-  margin: 0;
-  font-size: clamp(25px, 3vw, 42px);
-  line-height: .95;
-  letter-spacing: -1px;
-}
-
-.home-section-head p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.home-track-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.home-track-card {
-  appearance: none;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--white);
-  padding: 0;
-  text-align: left;
-  cursor: pointer;
-  min-width: 0;
-}
-
-.home-track-card:hover,
-.taste-card:hover,
-.playlist-card:hover {
-  border-color: var(--green);
-}
-
-.home-track-card img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 1;
-  object-fit: cover;
-  background: var(--surface-2);
-}
-
-.home-track-card-copy {
-  padding: 13px;
-}
-
-.home-track-card-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 14px;
-  font-weight: 800;
-}
-
-.home-track-card-sub {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.taste-grid,
-.playlist-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.taste-card,
-.playlist-card {
-  min-height: 116px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  gap: 18px;
-  padding: 18px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--white);
-  text-align: left;
-  cursor: pointer;
-}
-
-.taste-card i,
-.playlist-card i {
-  color: var(--green);
-  font-size: 24px;
-}
-
-.taste-card strong,
-.playlist-card strong {
-  display: block;
-  font-size: 16px;
-}
-
-.taste-card span,
-.playlist-card span {
-  display: block;
-  margin-top: 5px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.library-empty {
-  padding: 22px;
-  border: 1px solid var(--border);
-  color: var(--muted);
-}
-
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 800;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: rgba(0,0,0,.72);
-}
-
-.modal-card {
-  width: min(520px, 100%);
-  max-height: min(680px, 84vh);
-  overflow: auto;
-  border: 1px solid var(--border);
-  background: #101210;
-  padding: 24px;
-}
-
-.modal-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 22px;
-}
-
-.modal-head h3 {
-  margin: 0;
-  font-size: 28px;
-}
-
-.modal-close {
-  border: 0;
-  background: transparent;
-  color: var(--white);
-  font-size: 24px;
-  cursor: pointer;
-}
-
-.playlist-choice {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 14px 0;
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  color: var(--white);
-  text-align: left;
-  cursor: pointer;
-}
-
-.playlist-choice i {
-  color: var(--green);
-}
-
-.modal-create {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  margin-top: 22px;
-}
-
-.modal-create input {
-  min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--white);
-  outline: none;
-}
-
-.modal-create button {
-  border: 0;
-  padding: 0 16px;
-  background: var(--green);
-  color: #07110b;
-  font-weight: 900;
-  cursor: pointer;
-}
-
-.control.is-favourite {
-  color: var(--green);
-}
-
-#audioEngine {
-  display: none;
-}
-
-
-body.expanded-player-open {
-  overflow:
-    hidden;
-}
-
-
-.expanded-player {
-  position:
-    fixed;
-
-  inset:
-    0;
-
-  z-index:
-    900;
-
-  display:
-    flex;
-
-  flex-direction:
-    column;
-
-  background:
-    #101210;
-
-  color:
-    var(--white);
-
-  transform:
-    translate3d(0,100%,0);
-
-  visibility:
-    hidden;
-
-  transition:
-    transform 360ms cubic-bezier(.22,1,.36,1),
-    visibility 0s linear 360ms;
-
-  will-change:
-    transform;
-
-  touch-action:
-    none;
-}
-
-
-.expanded-player.open {
-  transform:
-    translate3d(0,0,0);
-
-  visibility:
-    visible;
-
-  transition:
-    transform 360ms cubic-bezier(.22,1,.36,1),
-    visibility 0s;
-}
-
-
-.expanded-player.dragging {
-  transition:
-    none;
-}
-
-
-.expanded-player-shell {
-  width:
-    min(520px, calc(100% - 36px));
-
-  min-height:
-    100%;
-
-  margin:
-    0 auto;
-
-  display:
-    flex;
-
-  flex-direction:
-    column;
-
-  padding:
-    max(12px, env(safe-area-inset-top))
-    0
-    calc(22px + env(safe-area-inset-bottom));
-}
-
-
-.expanded-handle-row {
-  min-height:
-    44px;
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    space-between;
-}
-
-
-.expanded-handle {
-  width:
-    46px;
-
-  height:
-    4px;
-
-  margin:
-    0 auto;
-
-  background:
-    var(--muted);
-
-  opacity:
-    .6;
-}
-
-
-.expanded-close {
-  width:
-    44px;
-
-  height:
-    44px;
-
-  border:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    24px;
-
-  cursor:
-    pointer;
-}
-
-
-.expanded-spacer {
-  width:
-    44px;
-}
-
-
-.expanded-content {
-  flex:
-    1;
-
-  min-height:
-    0;
-
-  display:
-    flex;
-
-  flex-direction:
-    column;
-
-  justify-content:
-    center;
-
-  gap:
-    24px;
-}
-
-
-.expanded-art {
-  display:
-    block;
-
-  width:
-    min(78vw, 420px, 46vh);
-
-  aspect-ratio:
-    1;
-
-  align-self:
-    center;
-
-  object-fit:
-    cover;
-
-  background:
-    var(--surface-2);
-}
-
-
-.expanded-meta-row {
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr auto;
-
-  align-items:
-    center;
-
-  gap:
-    16px;
-}
-
-
-.expanded-title {
-  overflow:
-    hidden;
-
-  white-space:
-    nowrap;
-
-  text-overflow:
-    ellipsis;
-
-  font-family:
-    "Veeb PolySans", sans-serif;
-
-  font-size:
-    clamp(24px, 6vw, 34px);
-
-  line-height:
-    1.02;
-}
-
-
-.expanded-artist,
-.expanded-album {
-  overflow:
-    hidden;
-
-  white-space:
-    nowrap;
-
-  text-overflow:
-    ellipsis;
-
-  margin-top:
-    7px;
-
-  color:
-    var(--muted);
-
-  font-family:
-    "Veeb PolySans", sans-serif;
-
-  font-size:
-    14px;
-}
-
-
-.expanded-album {
-  margin-top:
-    3px;
-
-  font-size:
-    11px;
-}
-
-
-.expanded-like {
-  width:
-    48px;
-
-  height:
-    48px;
-
-  border:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    26px;
-
-  cursor:
-    pointer;
-}
-
-
-.expanded-like.is-favourite {
-  color:
-    var(--green);
-}
-
-
-.expanded-progress {
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr;
-
-  gap:
-    8px;
-}
-
-
-.expanded-progress input {
-  width:
-    100%;
-
-  accent-color:
-    var(--green);
-}
-
-
-.expanded-times {
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    space-between;
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-}
-
-
-.expanded-controls {
-  display:
-    grid;
-
-  grid-template-columns:
-    repeat(5, 1fr);
-
-  align-items:
-    center;
-
-  gap:
-    8px;
-}
-
-
-.expanded-control,
-.expanded-play {
-  height:
-    54px;
-
-  border:
-    0;
-
-  background:
-    transparent;
-
-  color:
-    var(--white);
-
-  font-size:
-    23px;
-
-  cursor:
-    pointer;
-}
-
-
-.expanded-play {
-  width:
-    60px;
-
-  height:
-    60px;
-
-  justify-self:
-    center;
-
-  background:
-    var(--green);
-
-  color:
-    #07110b;
-
-  font-size:
-    22px;
-}
-
-
-.expanded-bottom-actions {
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap:
-    10px;
-}
-
-
-.expanded-bottom-actions button {
-  min-height:
-    44px;
-}
-
-
-.now {
-  cursor:
-    pointer;
-}
-
-
-@media (prefers-reduced-motion: reduce) {
-  .expanded-player,
-  .player-swipe-surface,
-  .player-swipe-preview {
-    transition-duration:
-      1ms !important;
-  }
-}
-
-@media(max-width:1050px) {
-  .home-track-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .taste-grid,
-  .playlist-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media(max-width:800px) {
-
-  #authScreen {
-    grid-template-columns:
-      1fr;
-  }
-
-
-  .auth-brand {
-    min-height:
-      280px;
-
-    padding:
-      28px;
-  }
-
-
-  .auth-big {
-    font-size:
-      62px;
-
-    letter-spacing:
-      -5px;
-  }
-
-
-  .auth-panel {
-    min-height:
-      auto;
-
-    padding:
-      42px 28px;
-  }
-
-
-  .topbar {
-    padding:
-      0 16px;
-  }
-
-
-  .user-email {
-    display:
-      none;
-  }
-
-
-  .shell {
-    width:
-      calc(100% - 32px);
-  }
-
-
-  .hero {
-    padding:
-      46px 0 40px;
-  }
-
-
-  .hero h1 {
-    letter-spacing:
-      -4px;
-  }
-
-
-  .player-swipe-surface {
-    grid-template-columns:
-      1fr auto;
-
-    padding:
-      12px 14px 10px;
-  }
-
-
-  .player-center {
-    grid-column:
-      1 / -1;
-  }
-
-
-  .home-track-grid {
-    grid-template-columns:
-      repeat(2, minmax(0, 1fr));
-  }
-
-
-  .taste-grid,
-  .playlist-grid {
-    grid-template-columns:
-      1fr 1fr;
-  }
-
-
-  .top-actions {
-    gap:
-      6px;
-  }
-
-
-  .top-actions .small-button {
-    padding:
-      8px 9px;
-
-    font-size:
-      9px;
-  }
-
-
-  .player-actions {
-    display:
-      none;
-  }
-
-}
-
-</style>
-
-</head>
-
-<body>
-
-
-<section id="authScreen">
-
-  <div class="auth-brand">
-
-    <div class="auth-logo">
-      VEEB.
-    </div>
-
-    <div class="auth-big">
-      MUSIC
-      <br>
-      THAT
-      <br>
-      MOVES.
-    </div>
-
-    <div class="auth-foot">
-      Your library, your playlists, your taste.
-      Built around what you actually want to hear.
-    </div>
-
-  </div>
-
-
-  <div class="auth-panel">
-
-    <div class="auth-box">
-
-      <div class="auth-eyebrow">
-        PRIVATE LISTENING
-      </div>
-
-      <h2 class="auth-title">
-        Welcome in.
-      </h2>
-
-
-      <div class="auth-tabs">
-
-        <button
-          id="loginTab"
-          class="auth-tab active"
-        >
-          LOG IN
-        </button>
-
-        <button
-          id="registerTab"
-          class="auth-tab"
-        >
-          CREATE ACCOUNT
-        </button>
-
-      </div>
-
-
-      <form id="authForm">
-
-        <div class="field">
-
-          <label>
-            EMAIL
-          </label>
-
-          <input
-            id="emailInput"
-            type="email"
-            autocomplete="email"
-            required
-          >
-
-        </div>
-
-
-        <div class="field">
-
-          <label>
-            PASSWORD
-          </label>
-
-          <input
-            id="passwordInput"
-            type="password"
-            autocomplete="current-password"
-            required
-          >
-
-        </div>
-
-
-        <button
-          id="authSubmit"
-          class="auth-submit"
-          type="submit"
-        >
-          LOG IN
-        </button>
-
-
-        <div
-          id="authError"
-          class="auth-error"
-        ></div>
-
-      </form>
-
-    </div>
-
-  </div>
-
-</section>
-
-
-
-<section
-  id="appScreen"
-  class="hidden"
->
-
-  <header class="topbar">
-
-    <div class="logo">
-      VEEB
-      <span class="logo-dot"></span>
-    </div>
-
-
-    <div class="top-actions">
-
-      <span
-        id="userEmail"
-        class="user-email"
-      ></span>
-
-      <button
-        id="homeButton"
-        class="small-button active"
-      >
-        HOME
-      </button>
-
-      <button
-        id="savedButton"
-        class="small-button"
-      >
-        FAVOURITES
-      </button>
-
-      <button
-        id="playlistsButton"
-        class="small-button"
-      >
-        PLAYLISTS
-      </button>
-
-      <button
-        id="logoutButton"
-        class="small-button"
-      >
-        LOG OUT
-      </button>
-
-    </div>
-
-  </header>
-
-
-  <main class="shell">
-
-    <section class="hero">
-
-      <div class="kicker">
-        YOUR MUSIC. YOUR TASTE.
-      </div>
-
-      <h1>
-        Find something
-        <br>
-        worth hearing.
-      </h1>
-
-
-      <form
-        id="searchForm"
-        class="search"
-      >
-
-        <input
-          id="searchInput"
-          placeholder="Search songs, artists, albums..."
-          autocomplete="off"
-        >
-
-        <button type="submit">
-          SEARCH
-        </button>
-
-      </form>
-
-    </section>
-
-
-    <section
-      id="homeView"
-      class="home-view"
-    >
-
-      <div class="home-section">
-        <div class="home-section-head">
-          <div>
-            <div class="section-label">FOR YOU</div>
-            <h2>Made around your taste.</h2>
-          </div>
-          <p id="homeStatus">Learning what you like.</p>
-        </div>
-        <div id="homeRecommendations" class="home-track-grid"></div>
-      </div>
-
-      <div class="home-section">
-        <div class="home-section-head">
-          <div>
-            <div class="section-label">ARTISTS</div>
-            <h2>More from your orbit.</h2>
-          </div>
-        </div>
-        <div id="homeArtists" class="taste-grid"></div>
-      </div>
-
-      <div class="home-section">
-        <div class="home-section-head">
-          <div>
-            <div class="section-label">GENRES</div>
-            <h2>Keep digging.</h2>
-          </div>
-        </div>
-        <div id="homeGenres" class="taste-grid"></div>
-      </div>
-
-      <div class="home-section">
-        <div class="home-section-head">
-          <div>
-            <div class="section-label">YOUR LIBRARY</div>
-            <h2>Playlists & favourites.</h2>
-          </div>
-          <button id="createPlaylistButton" class="small-button">+ NEW PLAYLIST</button>
-        </div>
-        <div id="homePlaylists" class="playlist-grid"></div>
-      </div>
-
-    </section>
-
-
-    <section
-      id="listView"
-      class="hidden"
-    >
-
-      <div
-        id="sectionLabel"
-        class="section-label"
-      >
-        DISCOVER
-      </div>
-
-      <div id="results">
-
-        <div class="empty">
-          Your music will appear here.
-        </div>
-
-      </div>
-
-    </section>
-
-  </main>
-
-
-  <section
-    id="player"
-    class="player hidden"
-  >
-
-    <div class="player-up-hint">
-      <i class="ph ph-caret-up"></i>
-      NOW PLAYING
-    </div>
-
-    <div
-      id="playerSwipeSurface"
-      class="player-swipe-surface"
-    >
-
-    <div class="now" id="miniNow">
-
-      <img
-        id="nowArt"
-        alt=""
-      >
-
-      <div>
-
-        <div
-          id="nowTitle"
-          class="now-title"
-        ></div>
-
-        <div
-          id="nowArtist"
-          class="now-artist"
-        ></div>
-
-      </div>
-
-    </div>
-
-
-    <div class="player-center">
-
-      <div class="controls">
-
-        <button
-          id="dislikeButton"
-          class="control"
-        >
-          <i class="ph ph-thumbs-down"></i>
-        </button>
-
-        <button
-          id="previousButton"
-          class="control"
-        >
-          <i class="ph ph-skip-back"></i>
-        </button>
-
-        <button
-          id="playButton"
-          class="play"
-        >
-          <i class="ph ph-play"></i>
-        </button>
-
-        <button
-          id="nextButton"
-          class="control"
-        >
-          <i class="ph ph-skip-forward"></i>
-        </button>
-
-        <button
-          id="likeButton"
-          class="control"
-        >
-          <i class="ph ph-heart"></i>
-        </button>
-
-      </div>
-
-
-      <div class="progress">
-
-        <span id="currentTime">
-          0:00
-        </span>
-
-        <input
-          id="seek"
-          type="range"
-          min="0"
-          max="0"
-          value="0"
-        >
-
-        <span id="totalTime">
-          0:00
-        </span>
-
-      </div>
-
-    </div>
-
-
-    <div class="player-actions">
-
-      <button
-        id="saveButton"
-        class="small-button"
-      >
-        FAVOURITE
-      </button>
-
-      <button
-        id="playlistButton"
-        class="small-button"
-      >
-        + PLAYLIST
-      </button>
-
-    </div>
-
-    </div>
-
-  </section>
-
-</section>
-
-
-<section
-  id="expandedPlayer"
-  class="expanded-player"
-  aria-hidden="true"
->
-  <div class="expanded-player-shell">
-    <div class="expanded-handle-row">
-      <div class="expanded-spacer"></div>
-      <div class="expanded-handle"></div>
-      <button
-        id="expandedCloseButton"
-        class="expanded-close"
-        aria-label="Close now playing"
-      >
-        <i class="ph ph-caret-down"></i>
-      </button>
-    </div>
-
-    <div class="expanded-content">
-      <img
-        id="expandedArt"
-        class="expanded-art"
-        alt=""
-      >
-
-      <div class="expanded-meta-row">
-        <div>
-          <div id="expandedTitle" class="expanded-title"></div>
-          <div id="expandedArtist" class="expanded-artist"></div>
-          <div id="expandedAlbum" class="expanded-album"></div>
-        </div>
-
-        <button
-          id="expandedLikeButton"
-          class="expanded-like"
-          aria-label="Favourite track"
-        >
-          <i class="ph ph-heart"></i>
-        </button>
-      </div>
-
-      <div class="expanded-progress">
-        <input
-          id="expandedSeek"
-          type="range"
-          min="0"
-          max="0"
-          value="0"
-        >
-        <div class="expanded-times">
-          <span id="expandedCurrentTime">0:00</span>
-          <span id="expandedTotalTime">0:00</span>
-        </div>
-      </div>
-
-      <div class="expanded-controls">
-        <button id="expandedDislikeButton" class="expanded-control" aria-label="Less like this">
-          <i class="ph ph-thumbs-down"></i>
-        </button>
-        <button id="expandedPreviousButton" class="expanded-control" aria-label="Previous track">
-          <i class="ph ph-skip-back"></i>
-        </button>
-        <button id="expandedPlayButton" class="expanded-play" aria-label="Play or pause">
-          <i class="ph ph-play"></i>
-        </button>
-        <button id="expandedNextButton" class="expanded-control" aria-label="Next track">
-          <i class="ph ph-skip-forward"></i>
-        </button>
-        <button id="expandedLikeControl" class="expanded-control" aria-label="Favourite track">
-          <i class="ph ph-heart"></i>
-        </button>
-      </div>
-
-      <div class="expanded-bottom-actions">
-        <button id="expandedPlaylistButton" class="small-button">+ PLAYLIST</button>
-        <button id="expandedFavouriteButton" class="small-button">FAVOURITE</button>
-      </div>
-    </div>
-  </div>
-</section>
-
-
-<audio
-  id="audioEngine"
-  preload="auto"
-  playsinline
-></audio>
-
-<div
-  id="playlistModal"
-  class="modal-backdrop hidden"
->
-  <div class="modal-card">
-    <div class="modal-head">
-      <h3>ADD TO PLAYLIST</h3>
-      <button id="playlistModalClose" class="modal-close" aria-label="Close">
-        <i class="ph ph-x"></i>
-      </button>
-    </div>
-
-    <div id="playlistChoices"></div>
-
-    <div class="modal-create">
-      <input id="newPlaylistName" placeholder="New playlist name">
-      <button id="newPlaylistCreate">CREATE</button>
-    </div>
-  </div>
-</div>
-
-<div
-  id="toast"
-  class="toast"
-></div>
-
-
-<script>
-
-const state = {
-  authMode: "login",
-  user: null,
-
-  tracks: [],
-  currentTrack: null,
-
-  queue: [],
-  history: [],
-  savedIds: new Set(),
-  playlists: [],
-  homeRecommendations: [],
-  queueRefreshToken: 0,
-  prefetchRequested: new Set(),
-  visiblePrefetchGeneration: 0,
-  visiblePrefetchTimers: [],
-  playerGestureBusy: false,
-  playbackGeneration: 0,
-  playbackPendingGeneration: 0,
-  expectedAudioSrc: "",
-  mediaRecoveryGeneration: 0
-};
-
-
-const audio =
-  document.getElementById(
-    "audioEngine"
-  );
-
-audio.preload =
-  "auto";
-
-audio.disableRemotePlayback =
-  true;
-
-
-const authScreen =
-  document.getElementById(
-    "authScreen"
-  );
-
-const appScreen =
-  document.getElementById(
-    "appScreen"
-  );
-
-
-async function initialise() {
-
-  const response =
-    await fetch(
-      "/api/auth/status"
-    );
-
-  const result =
-    await response.json();
-
-
-  if (
-    result.authenticated
-  ) {
-
-    showApp(
-      result.user
-    );
-
-    void fetch("/api/resolver/wake", { method: "POST", keepalive: true });
-    await loadHome();
-
-  } else {
-
-    showAuth();
-
-  }
-
-}
-
-
-function showAuth() {
-
-  authScreen.classList.remove(
-    "hidden"
-  );
-
-  appScreen.classList.add(
-    "hidden"
-  );
-
-}
-
-
-function showApp(
-  user
-) {
-
-  state.user =
-    user;
-
-
-  authScreen.classList.add(
-    "hidden"
-  );
-
-  appScreen.classList.remove(
-    "hidden"
-  );
-
-
-  document.getElementById(
-    "userEmail"
-  ).textContent =
-    user.email;
-
-}
-
-
-document.getElementById(
-  "loginTab"
-).onclick =
-  () => setAuthMode(
-    "login"
-  );
-
-
-document.getElementById(
-  "registerTab"
-).onclick =
-  () => setAuthMode(
-    "register"
-  );
-
-
-function setAuthMode(
-  mode
-) {
-
-  state.authMode =
-    mode;
-
-
-  document.getElementById(
-    "loginTab"
-  ).classList.toggle(
-    "active",
-    mode === "login"
-  );
-
-
-  document.getElementById(
-    "registerTab"
-  ).classList.toggle(
-    "active",
-    mode === "register"
-  );
-
-
-  document.getElementById(
-    "authSubmit"
-  ).textContent =
-    mode === "login"
-      ? "LOG IN"
-      : "CREATE ACCOUNT";
-
-
-  document.getElementById(
-    "passwordInput"
-  ).autocomplete =
-    mode === "login"
-      ? "current-password"
-      : "new-password";
-
-
-  document.getElementById(
-    "authError"
-  ).textContent =
-    "";
-
-}
-
-
-document.getElementById(
-  "authForm"
-).addEventListener(
-  "submit",
-  async event => {
-
-    event.preventDefault();
-
-
-    const email =
-      document.getElementById(
-        "emailInput"
-      ).value.trim();
-
-
-    const password =
-      document.getElementById(
-        "passwordInput"
-      ).value;
-
-
-    const endpoint =
-      state.authMode === "login"
-        ? "/api/auth/login"
-        : "/api/auth/register";
-
-
-    const button =
-      document.getElementById(
-        "authSubmit"
-      );
-
-
-    button.disabled =
-      true;
-
-
-    document.getElementById(
-      "authError"
-    ).textContent =
-      "";
-
-
-    try {
-
-      const response =
-        await fetch(
-          endpoint,
-          {
-            method:
-              "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-
-            body:
-              JSON.stringify({
-                email,
-                password
-              })
-          }
-        );
-
-
-      const responseText =
-        await response.text();
-
-
-      let result = null;
-
-
-      try {
-        result = JSON.parse(
-          responseText
-        );
-      } catch (_) {
-        console.error(
-          "Non-JSON auth response:",
-          response.status,
-          responseText
-        );
-
-        throw new Error(
-          "Veeb server error (" + response.status + "). Check Worker logs."
-        );
-      }
-
-
-      if (!response.ok) {
-
-        throw new Error(
-          result.error ||
-          "Authentication failed"
-        );
-
-      }
-
-
-      showApp(
-        result.user
-      );
-
-
-      await loadHome();
-
-
-    } catch (error) {
-
-      document.getElementById(
-        "authError"
-      ).textContent =
-        error.message;
-
-
-    } finally {
-
-      button.disabled =
-        false;
-
-    }
-
-  }
-);
-
-
-document.getElementById(
-  "logoutButton"
-).onclick =
-  async () => {
-
-    await fetch(
-      "/api/auth/logout",
-      {
-        method:
-          "POST"
-      }
-    );
-
-
-    location.reload();
-
-  };
-
-
-document.getElementById(
-  "searchForm"
-).addEventListener(
-  "submit",
-  async event => {
-
-    event.preventDefault();
-
-
-    const query =
-      document.getElementById(
-        "searchInput"
-      ).value.trim();
-
-
-    if (!query) {
-      return;
-    }
-
-
-    showListView(
-      "SEARCH RESULTS"
-    );
-
-
-    setResultsMessage(
-      "SEARCHING..."
-    );
-
-
-    const response =
-      await fetch(
-        "/api/search?q="
-        + encodeURIComponent(
-          query
-        )
-      );
-
-
-    if (
-      response.status === 401
-    ) {
-
-      location.reload();
-
-      return;
-
-    }
-
-
-    const tracks =
-      await response.json();
-
-
-    state.tracks =
-      tracks;
-
-
-    renderTracks(
-      tracks
-    );
-
-    scheduleVisiblePrefetches(Array.isArray(tracks) ? tracks : []);
-
-  }
-);
-
-
-function setNavActive(id) {
-  [
-    "homeButton",
-    "savedButton",
-    "playlistsButton"
-  ].forEach(buttonId => {
-    const button = document.getElementById(buttonId);
-    if (button) {
-      button.classList.toggle("active", buttonId === id);
-    }
-  });
-}
-
-
-function showHomeView() {
-  document.getElementById("homeView").classList.remove("hidden");
-  document.getElementById("listView").classList.add("hidden");
-  setNavActive("homeButton");
-}
-
-
-function showListView(label) {
-  document.getElementById("homeView").classList.add("hidden");
-  document.getElementById("listView").classList.remove("hidden");
-  if (label) {
-    setSection(label);
-  }
-}
-
-
-async function fetchJson(url, options) {
-  const response = await fetch(url, options);
-
-  if (response.status === 401) {
-    location.reload();
-    throw new Error("Unauthorized");
-  }
-
-  let data = null;
-  try {
-    data = await response.json();
-  } catch (_) {}
-
-  if (!response.ok) {
-    throw new Error(data?.error || "Request failed");
-  }
-
-  return data;
-}
-
-
-async function loadLibraryState() {
-  const [saved, playlists] = await Promise.all([
-    fetchJson("/api/saved").catch(() => []),
-    fetchJson("/api/playlists").catch(() => [])
-  ]);
-
-  state.savedIds = new Set(
-    (saved || []).map(track => track.id)
-  );
-  state.playlists = playlists || [];
-  updateFavouriteUI();
-
-  return { saved, playlists };
-}
-
-
-async function loadHome() {
-  showHomeView();
-
-  const status = document.getElementById("homeStatus");
-  status.textContent = "Building your home...";
-
-  const [recommendations, taste, library] = await Promise.all([
-    fetchJson("/api/recommendations").catch(() => []),
-    fetchJson("/api/taste").catch(() => ({ artists: [], genres: [], tracks: [] })),
-    loadLibraryState()
-  ]);
-
-  state.homeRecommendations = Array.isArray(recommendations)
-    ? recommendations
-    : [];
-
-  state.queue = state.homeRecommendations.slice();
-
-  scheduleVisiblePrefetches(state.homeRecommendations);
-
-  renderHomeTrackCards(
-    document.getElementById("homeRecommendations"),
-    state.homeRecommendations.slice(0, 12)
-  );
-
-  renderTasteCards(
-    document.getElementById("homeArtists"),
-    (taste.artists || []).slice(0, 8),
-    "artist"
-  );
-
-  renderTasteCards(
-    document.getElementById("homeGenres"),
-    (taste.genres || []).slice(0, 8),
-    "genre"
-  );
-
-  renderPlaylistCards(
-    library.playlists || [],
-    library.saved || []
-  );
-
-  status.textContent = state.homeRecommendations.length
-    ? "Personalised from your listening."
-    : "Play, favourite and skip tracks to shape this page.";
-}
-
-
-function renderHomeTrackCards(container, tracks) {
-  container.innerHTML = "";
-
-  if (!tracks.length) {
-    container.innerHTML = '<div class="library-empty">No recommendations yet. Search and play a few tracks first.</div>';
-    return;
-  }
-
-  tracks.forEach((track, index) => {
-    const card = document.createElement("button");
-    card.className = "home-track-card";
-    card.innerHTML = \`
-      <img src="\${escapeHtml(track.artwork || "")}" alt="">
-      <div class="home-track-card-copy">
-        <div class="home-track-card-title">\${escapeHtml(track.title || "")}</div>
-        <div class="home-track-card-sub">\${escapeHtml(track.artist || "")}</div>
-      </div>
-    \`;
-
-    card.onpointerenter = () => prefetchTrack(track, true);
-    card.onfocus = () => prefetchTrack(track, true);
-    card.onpointerdown = () => prefetchTrack(track, true);
-    card.onclick = () => {
-      state.queue = tracks.slice(index + 1);
-      void playTrack(track, { refreshQueue: false });
-      void appendRadioQueue(track.id);
-    };
-
-    container.appendChild(card);
-  });
-}
-
-
-function renderTasteCards(container, items, type) {
-  container.innerHTML = "";
-
-  if (!items.length) {
-    container.innerHTML = '<div class="library-empty">Still learning this part of your taste.</div>';
-    return;
-  }
-
-  items.forEach(item => {
-    const name = type === "artist"
-      ? (item.artistName || item.artistKey || "Artist")
-      : (item.genre || "Genre");
-
-    const score = Number(item.score || 0);
-    const card = document.createElement("button");
-    card.className = "taste-card";
-    card.innerHTML = \`
-      <i class="ph \${type === "artist" ? "ph-microphone-stage" : "ph-waveform"}"></i>
-      <div>
-        <strong>\${escapeHtml(name)}</strong>
-        <span>\${type === "artist" ? "ARTIST" : "GENRE"}\${score ? " · " + Math.round(score) : ""}</span>
-      </div>
-    \`;
-
-    card.onclick = () => searchByTerm(name, type === "artist" ? "ARTIST" : "GENRE");
-    container.appendChild(card);
-  });
-}
-
-
-function renderPlaylistCards(playlists, savedTracks) {
-  const container = document.getElementById("homePlaylists");
-  container.innerHTML = "";
-
-  const favourites = document.createElement("button");
-  favourites.className = "playlist-card";
-  favourites.innerHTML = \`
-    <i class="ph ph-heart"></i>
-    <div>
-      <strong>Favourites</strong>
-      <span>\${savedTracks.length} SAVED TRACK\${savedTracks.length === 1 ? "" : "S"}</span>
-    </div>
-  \`;
-  favourites.onclick = loadFavourites;
-  container.appendChild(favourites);
-
-  playlists.slice(0, 7).forEach(playlist => {
-    const card = document.createElement("button");
-    card.className = "playlist-card";
-    card.innerHTML = \`
-      <i class="ph ph-playlist"></i>
-      <div>
-        <strong>\${escapeHtml(playlist.name || "Playlist")}</strong>
-        <span>PLAYLIST</span>
-      </div>
-    \`;
-    card.onclick = () => loadPlaylist(playlist.id, playlist.name);
-    container.appendChild(card);
-  });
-}
-
-
-async function searchByTerm(term, label) {
-  const input = document.getElementById("searchInput");
-  input.value = term;
-  showListView(label + " · " + term.toUpperCase());
-  setNavActive("");
-  setResultsMessage("SEARCHING...");
-
-  const tracks = await fetchJson(
-    "/api/search?q=" + encodeURIComponent(term)
-  ).catch(error => {
-    setResultsMessage(error.message || "SEARCH FAILED");
-    return [];
-  });
-
-  state.tracks = tracks;
-  renderTracks(tracks);
-  scheduleVisiblePrefetches(tracks);
-}
-
-
-async function loadFavourites() {
-  showListView("FAVOURITES");
-  setNavActive("savedButton");
-  setResultsMessage("LOADING...");
-
-  const tracks = await fetchJson("/api/saved").catch(() => []);
-  state.savedIds = new Set(tracks.map(track => track.id));
-  state.tracks = tracks;
-  renderTracks(tracks);
-  scheduleVisiblePrefetches(tracks);
-  updateFavouriteUI();
-}
-
-
-async function loadPlaylists() {
-  showListView("PLAYLISTS");
-  setNavActive("playlistsButton");
-
-  const playlists = await fetchJson("/api/playlists").catch(() => []);
-  state.playlists = playlists;
-
-  const container = document.getElementById("results");
-  container.innerHTML = "";
-  container.className = "playlist-grid";
-
-  const create = document.createElement("button");
-  create.className = "playlist-card";
-  create.innerHTML = '<i class="ph ph-plus"></i><div><strong>New playlist</strong><span>CREATE</span></div>';
-  create.onclick = () => openPlaylistModal(true);
-  container.appendChild(create);
-
-  playlists.forEach(playlist => {
-    const card = document.createElement("button");
-    card.className = "playlist-card";
-    card.innerHTML = \`
-      <i class="ph ph-playlist"></i>
-      <div><strong>\${escapeHtml(playlist.name || "Playlist")}</strong><span>OPEN PLAYLIST</span></div>
-    \`;
-    card.onclick = () => loadPlaylist(playlist.id, playlist.name);
-    container.appendChild(card);
-  });
-}
-
-
-async function loadPlaylist(id, name) {
-  showListView((name || "PLAYLIST").toUpperCase());
-  setNavActive("playlistsButton");
-  setResultsMessage("LOADING...");
-
-  const payload = await fetchJson(
-    "/api/playlists/" + encodeURIComponent(id) + "/tracks"
-  ).catch(() => ({ tracks: [] }));
-
-  const tracks = payload.tracks || [];
-  state.tracks = tracks;
-  state.queue = tracks.slice();
-  renderTracks(tracks);
-  scheduleVisiblePrefetches(tracks);
-}
-
-
-document.getElementById("homeButton").onclick = loadHome;
-document.getElementById("savedButton").onclick = loadFavourites;
-document.getElementById("playlistsButton").onclick = loadPlaylists;
-document.getElementById("createPlaylistButton").onclick = () => openPlaylistModal(true);
-
-
-function renderTracks(
-  tracks
-) {
-
-  const container =
-    document.getElementById(
-      "results"
-    );
-
-
-  container.className =
-    "";
-
-
-  container.innerHTML =
-    "";
-
-
-  if (
-    !Array.isArray(tracks) ||
-    !tracks.length
-  ) {
-
-    setResultsMessage(
-      "Nothing here yet."
-    );
-
-    return;
-
-  }
-
-
-  tracks.forEach(
-    (
-      track,
-      index
-    ) => {
-
-      const row =
-        document.createElement(
-          "button"
-        );
-
-
-      row.className =
-        "track-row";
-
-
-      row.innerHTML =
-        \`
-
-          <div class="track-num">
-            \${String(
-              index + 1
-            ).padStart(
-              2,
-              "0"
-            )}
-          </div>
-
-          <img
-            src="\${escapeHtml(
-              track.artwork || ""
-            )}"
-            alt=""
-          >
-
-          <div>
-
-            <div class="track-title">
-              \${escapeHtml(
-                track.title || ""
-              )}
-            </div>
-
-            <div class="track-sub">
-              \${escapeHtml(
-                (track.artist || "")
-                + (track.album ? " · " + track.album : "")
-                + (track.veebReason ? " · " + track.veebReason : "")
-              )}
-            </div>
-
-          </div>
-
-          <div class="track-play">
-            <i class="ph ph-play"></i>
-          </div>
-
-        \`;
-
-
-      row.onpointerenter =
-        () => prefetchTrack(
-          track,
-          true
-        );
-
-      row.onfocus =
-        () => prefetchTrack(
-          track,
-          true
-        );
-
-      row.onpointerdown =
-        () => prefetchTrack(
-          track,
-          true
-        );
-
-
-      row.onclick =
-        () => playTrack(
-          track
-        );
-
-
-      container.appendChild(
-        row
-      );
-
-    }
-  );
-
-}
-
-
-async function playTrack(
-  track,
-  options
-) {
-
-  const opts =
-    options || {};
-
-  const playbackGeneration =
-    ++state.playbackGeneration;
-
-  state.playbackPendingGeneration =
-    playbackGeneration;
-
-  state.mediaRecoveryGeneration =
-    0;
-
-  cancelVisiblePrefetchTimers();
-
-  if (
-    state.currentTrack &&
-    state.currentTrack.id !== track.id
-  ) {
-
-    state.history.push(
-      state.currentTrack
-    );
-
-    if (!opts.suppressTransitionSignal) {
-      void sendListeningEvent(
-        "skip"
-      );
-    }
-
-  }
-
-  state.currentTrack =
-    track;
-
-  document.getElementById(
-    "player"
-  ).classList.remove(
-    "hidden"
-  );
-
-  document.getElementById(
-    "nowTitle"
-  ).textContent =
-    track.title || "";
-
-  document.getElementById(
-    "nowArtist"
-  ).textContent =
-    (track.artist || "") + " · PREPARING AUDIO";
-
-  document.getElementById(
-    "nowArt"
-  ).src =
-    track.artwork || "";
-
-  syncExpandedPlayerTrack(
-    track
-  );
-
-  updateFavouriteUI();
-
-  setMediaSession(
-    track
-  );
-
-  document.getElementById(
-    "playButton"
-  ).innerHTML =
-    '<i class="ph ph-spinner-gap veeb-spin"></i>';
-
-  document.getElementById(
-    "expandedPlayButton"
-  ).innerHTML =
-    '<i class="ph ph-spinner-gap veeb-spin"></i>';
-
-  const basePlaybackUrl =
-    "/api/audio/"
-    + encodeURIComponent(
-      track.id
-    )
-    + "?transport=v25&generation="
-    + playbackGeneration;
-
-  state.expectedAudioSrc =
-    new URL(
-      basePlaybackUrl,
-      window.location.href
-    ).href;
-
-  audio.src =
-    basePlaybackUrl;
-
-  audio.load();
-
-  // First play() happens immediately inside the user's click/swipe activation.
-  // If a stale request is aborted because the user changes track again, that
-  // AbortError is normal navigation and must never surface as PLAYBACK FAILED.
-  let playError = null;
-  let started = false;
-
-  for (
-    let attempt = 0;
-    attempt < 3;
-    attempt += 1
-  ) {
-
-    if (
-      playbackGeneration !== state.playbackGeneration ||
-      state.currentTrack?.id !== track.id
-    ) {
-      return;
-    }
-
-    if (attempt > 0) {
-      await new Promise(
-        resolve => setTimeout(
-          resolve,
-          attempt === 1 ? 350 : 900
-        )
-      );
-
-      if (
-        playbackGeneration !== state.playbackGeneration ||
-        state.currentTrack?.id !== track.id
-      ) {
-        return;
-      }
-
-      const retryUrl =
-        basePlaybackUrl
-        + "&retry="
-        + attempt;
-
-      state.expectedAudioSrc =
-        new URL(
-          retryUrl,
-          window.location.href
-        ).href;
-
-      audio.src =
-        retryUrl;
-
-      audio.load();
-    }
-
-    try {
-      await audio.play();
-      started = true;
-      playError = null;
-      break;
-    } catch (error) {
-      playError = error;
-
-      console.error(
-        "Audio play() attempt failed:",
-        attempt + 1,
-        error?.name,
-        error?.message,
-        error
-      );
-
-      if (
-        error?.name === "AbortError" ||
-        playbackGeneration !== state.playbackGeneration ||
-        state.currentTrack?.id !== track.id
-      ) {
-        return;
-      }
-
-      if (error?.name === "NotAllowedError") {
-        break;
-      }
-    }
-  }
-
-  if (
-    playbackGeneration === state.playbackPendingGeneration
-  ) {
-    state.playbackPendingGeneration =
-      0;
-  }
-
-  // Persist track metadata in parallel. This must not delay playback.
-  void fetch(
-    "/api/tracks",
-    {
-      method:
-        "POST",
-
-      headers: {
-        "Content-Type":
-          "application/json"
-      },
-
-      body:
-        JSON.stringify(
-          track
-        )
-    }
-  ).catch(
-    error =>
-      console.error(
-        "Track persistence failed:",
-        error
-      )
-  );
-
-  if (started) {
-    await sendListeningEvent(
-      "play"
-    );
-
-    if (opts.refreshQueue !== false) {
-      refreshQueueFromSeed(
-        track.id
-      );
-    }
-
-    return;
-  }
-
-  if (
-    playbackGeneration !== state.playbackGeneration ||
-    state.currentTrack?.id !== track.id
-  ) {
-    return;
-  }
-
-  document.getElementById(
-    "playButton"
-  ).innerHTML =
-    '<i class="ph ph-play"></i>';
-
-  document.getElementById(
-    "expandedPlayButton"
-  ).innerHTML =
-    '<i class="ph ph-play"></i>';
-
-  if (playError?.name === "NotAllowedError") {
-    showToast(
-      "TAP PLAY TO CONTINUE"
-    );
-  } else {
-    // Three real attempts have failed for the current track. Avoid the old
-    // alarming PLAYBACK FAILED toast for normal source swaps/AbortErrors.
-    showToast(
-      "AUDIO DIDN'T START · TAP PLAY TO RETRY"
-    );
-  }
-
-}
-
-
-
-document.getElementById(
-  "playButton"
-).onclick =
-  async () => {
-
-    if (!state.currentTrack) {
-      return;
-    }
-
-
-    if (audio.paused) {
-
-      await audio.play();
-
-    } else {
-
-      audio.pause();
-
-    }
-
-  };
-
-
-async function toggleFavourite(track) {
-  if (!track) {
-    return;
-  }
-
-  const isSaved = state.savedIds.has(track.id);
-
-  if (isSaved) {
-    await fetchJson(
-      "/api/unsave",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trackId: track.id })
-      }
-    );
-
-    state.savedIds.delete(track.id);
-    showToast("REMOVED FROM FAVOURITES");
-  } else {
-    await fetchJson(
-      "/api/save",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(track)
-      }
-    );
-
-    state.savedIds.add(track.id);
-    void sendListeningEvent("like");
-    showToast("ADDED TO FAVOURITES");
-  }
-
-  updateFavouriteUI();
-}
-
-
-function updateFavouriteUI() {
-  const saved = !!state.currentTrack && state.savedIds.has(state.currentTrack.id);
-  const heart = document.getElementById("likeButton");
-  const save = document.getElementById("saveButton");
-  const expandedHeart = document.getElementById("expandedLikeButton");
-  const expandedHeartControl = document.getElementById("expandedLikeControl");
-  const expandedFavourite = document.getElementById("expandedFavouriteButton");
-  const iconHtml = saved
-    ? '<i class="ph-fill ph-heart"></i>'
-    : '<i class="ph ph-heart"></i>';
-
-  heart.classList.toggle("is-favourite", saved);
-  heart.innerHTML = iconHtml;
-
-  save.textContent = saved
-    ? "FAVOURITED"
-    : "FAVOURITE";
-
-  expandedHeart.classList.toggle("is-favourite", saved);
-  expandedHeart.innerHTML = iconHtml;
-  expandedHeartControl.classList.toggle("is-favourite", saved);
-  expandedHeartControl.innerHTML = iconHtml;
-  expandedFavourite.textContent = saved
-    ? "FAVOURITED"
-    : "FAVOURITE";
-}
-
-
-function syncExpandedPlayerTrack(track) {
-  if (!track) {
-    return;
-  }
-
-  document.getElementById("expandedArt").src = track.artwork || "";
-  document.getElementById("expandedTitle").textContent = track.title || "";
-  document.getElementById("expandedArtist").textContent = track.artist || "";
-  document.getElementById("expandedAlbum").textContent = track.album || "";
-}
-
-
-document.getElementById("likeButton").onclick = async () => {
-  await toggleFavourite(state.currentTrack);
-};
-
-
-document.getElementById("dislikeButton").onclick = async () => {
-  await sendListeningEvent("dislike");
-  showToast("LESS LIKE THIS");
-  await playNext(true);
-};
-
-
-document.getElementById("saveButton").onclick = async () => {
-  await toggleFavourite(state.currentTrack);
-};
-
-
-document.getElementById("nextButton").onclick = async () => {
-  await animatePlayerNavigation("next", false);
-};
-
-
-document.getElementById("previousButton").onclick = async () => {
-  await animatePlayerNavigation("previous", true);
-};
-
-
-const miniPlayer = document.getElementById("player");
-const playerSwipeSurface = document.getElementById("playerSwipeSurface");
-const expandedPlayer = document.getElementById("expandedPlayer");
-
-const miniGesture = {
-  active: false,
-  pointerId: null,
-  startX: 0,
-  startY: 0,
-  lastX: 0,
-  lastY: 0,
-  lastTime: 0,
-  velocityX: 0,
-  velocityY: 0,
-  axis: null,
-  direction: null,
-  preview: null
-};
-
-const expandedGesture = {
-  active: false,
-  pointerId: null,
-  startY: 0,
-  lastY: 0,
-  lastTime: 0,
-  velocityY: 0
-};
-
-
-function clampNumber(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
-
-
-function getNavigationPreviewTrack(direction) {
-  if (direction === "next") {
-    return state.queue.find(
-      track => track?.id && track.id !== state.currentTrack?.id
-    ) || null;
-  }
-
-  if (direction === "previous") {
-    return state.history.length
-      ? state.history[state.history.length - 1]
-      : null;
-  }
-
-  return null;
-}
-
-
-function removeSwipePreview() {
-  if (miniGesture.preview) {
-    miniGesture.preview.remove();
-    miniGesture.preview = null;
-  }
-}
-
-
-function createSwipePreview(direction) {
-  const track = getNavigationPreviewTrack(direction);
-
-  removeSwipePreview();
-
-  if (!track) {
-    return null;
-  }
-
-  const preview = playerSwipeSurface.cloneNode(true);
-  preview.removeAttribute("id");
-  preview.classList.add("player-swipe-preview");
-  preview.setAttribute("aria-hidden", "true");
-
-  preview.querySelectorAll("[id]").forEach(
-    element => element.removeAttribute("id")
-  );
-
-  const art = preview.querySelector(".now img");
-  const title = preview.querySelector(".now-title");
-  const artist = preview.querySelector(".now-artist");
-
-  if (art) {
-    art.src = track.artwork || "";
-  }
-
-  if (title) {
-    title.textContent = track.title || "";
-  }
-
-  if (artist) {
-    artist.textContent = track.artist || "";
-  }
-
-  const heart = preview.querySelector(".controls .control:last-child");
-  if (heart) {
-    const saved = state.savedIds.has(track.id);
-    heart.classList.toggle("is-favourite", saved);
-    heart.innerHTML = saved
-      ? '<i class="ph-fill ph-heart"></i>'
-      : '<i class="ph ph-heart"></i>';
-  }
-
-  preview.style.transition = "none";
-  miniPlayer.appendChild(preview);
-  miniGesture.preview = preview;
-
-  prefetchTrack(track, true);
-
-  return preview;
-}
-
-
-function positionSwipeDeck(dx, direction) {
-  const width = Math.max(1, miniPlayer.getBoundingClientRect().width);
-  const preview = miniGesture.preview;
-
-  playerSwipeSurface.style.transform =
-    "translate3d(" + dx + "px,0,0)";
-
-  if (preview) {
-    const base = direction === "next" ? width : -width;
-    preview.style.transform =
-      "translate3d(" + (base + dx) + "px,0,0)";
-  }
-}
-
-
-function resetSwipeDeck(animated) {
-  const duration = animated ? 220 : 0;
-  const transition = duration
-    ? "transform " + duration + "ms cubic-bezier(.22,1,.36,1)"
-    : "none";
-
-  playerSwipeSurface.style.transition = transition;
-  playerSwipeSurface.style.transform = "translate3d(0,0,0)";
-
-  if (miniGesture.preview) {
-    miniGesture.preview.style.transition = transition;
-    const direction = miniGesture.direction || "next";
-    const width = Math.max(1, miniPlayer.getBoundingClientRect().width);
-    miniGesture.preview.style.transform =
-      "translate3d(" + (direction === "next" ? width : -width) + "px,0,0)";
-  }
-
-  setTimeout(
-    () => {
-      playerSwipeSurface.style.transition = "";
-      playerSwipeSurface.style.transform = "";
-      removeSwipePreview();
-    },
-    duration + 25
-  );
-}
-
-
-async function performNavigation(direction, suppressTransitionSignal) {
-  if (direction === "next") {
-    await playNext(!!suppressTransitionSignal);
-    return;
-  }
-
-  await playPrevious();
-}
-
-
-function commitSwipeNavigation(direction, suppressTransitionSignal, velocityX) {
-  if (state.playerGestureBusy) {
-    return Promise.resolve();
-  }
-
-  const track = getNavigationPreviewTrack(direction);
-  if (!track) {
-    resetSwipeDeck(true);
-    return Promise.resolve();
-  }
-
-  state.playerGestureBusy = true;
-  prefetchTrack(track, true);
-
-  if (!miniGesture.preview || miniGesture.direction !== direction) {
-    miniGesture.direction = direction;
-    createSwipePreview(direction);
-  }
-
-  const width = Math.max(1, miniPlayer.getBoundingClientRect().width);
-  const speed = Math.abs(Number(velocityX || 0));
-  const duration = Math.round(clampNumber(225 - speed * 90, 120, 225));
-  const destination = direction === "next" ? -width : width;
-  const transition =
-    "transform " + duration + "ms cubic-bezier(.22,1,.36,1)";
-
-  playerSwipeSurface.style.transition = transition;
-  playerSwipeSurface.style.transform =
-    "translate3d(" + destination + "px,0,0)";
-
-  if (miniGesture.preview) {
-    miniGesture.preview.style.transition = transition;
-    miniGesture.preview.style.transform = "translate3d(0,0,0)";
-  }
-
-  try {
-    if (navigator.vibrate) {
-      navigator.vibrate(8);
-    }
-  } catch (_) {}
-
-  return new Promise(resolve => {
-    setTimeout(
-      () => {
-        const preview = miniGesture.preview;
-
-        playerSwipeSurface.style.transition = "none";
-        playerSwipeSurface.style.transform = "translate3d(0,0,0)";
-        playerSwipeSurface.style.opacity = "0";
-
-        void performNavigation(
-          direction,
-          suppressTransitionSignal
-        ).finally(() => {
-          state.playerGestureBusy = false;
-          resolve();
-        });
-
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            playerSwipeSurface.style.transition = "opacity 130ms ease";
-            playerSwipeSurface.style.opacity = "1";
-
-            if (preview) {
-              preview.style.transition = "opacity 130ms ease";
-              preview.style.opacity = "0";
-            }
-
-            setTimeout(() => {
-              playerSwipeSurface.style.transition = "";
-              playerSwipeSurface.style.opacity = "";
-              removeSwipePreview();
-            }, 150);
-          });
-        });
-      },
-      duration
-    );
-  });
-}
-
-
-async function animatePlayerNavigation(direction, suppressTransitionSignal) {
-  if (state.playerGestureBusy) {
-    return;
-  }
-
-  const track = getNavigationPreviewTrack(direction);
-
-  if (!track) {
-    await performNavigation(direction, suppressTransitionSignal);
-    return;
-  }
-
-  miniGesture.direction = direction;
-  createSwipePreview(direction);
-  positionSwipeDeck(0, direction);
-
-  await commitSwipeNavigation(
-    direction,
-    suppressTransitionSignal,
-    .7
-  );
-}
-
-
-function openExpandedPlayer() {
-  if (!state.currentTrack) {
-    return;
-  }
-
-  syncExpandedPlayerTrack(state.currentTrack);
-  updateFavouriteUI();
-
-  const expandedSeek = document.getElementById("expandedSeek");
-  expandedSeek.max = audio.duration || 0;
-  expandedSeek.value = audio.currentTime || 0;
-  document.getElementById("expandedCurrentTime").textContent = formatTime(audio.currentTime);
-  document.getElementById("expandedTotalTime").textContent = formatTime(audio.duration);
-
-  expandedPlayer.style.transform = "";
-  expandedPlayer.classList.add("open");
-  expandedPlayer.setAttribute("aria-hidden", "false");
-  document.body.classList.add("expanded-player-open");
-}
-
-
-function closeExpandedPlayer() {
-  expandedPlayer.classList.remove("dragging");
-  expandedPlayer.style.transform = "";
-  expandedPlayer.classList.remove("open");
-  expandedPlayer.setAttribute("aria-hidden", "true");
-  document.body.classList.remove("expanded-player-open");
-}
-
-
-miniPlayer.addEventListener(
-  "pointerdown",
-  event => {
-    if (
-      event.pointerType === "mouse" &&
-      event.button !== 0
-    ) {
-      return;
-    }
-
-    if (event.target.closest("button,input")) {
-      return;
-    }
-
-    if (state.playerGestureBusy) {
-      return;
-    }
-
-    miniGesture.active = true;
-    miniGesture.pointerId = event.pointerId;
-    miniGesture.startX = event.clientX;
-    miniGesture.startY = event.clientY;
-    miniGesture.lastX = event.clientX;
-    miniGesture.lastY = event.clientY;
-    miniGesture.lastTime = performance.now();
-    miniGesture.velocityX = 0;
-    miniGesture.velocityY = 0;
-    miniGesture.axis = null;
-    miniGesture.direction = null;
-
-    miniPlayer.classList.add("gesture-active");
-
-    try {
-      miniPlayer.setPointerCapture(event.pointerId);
-    } catch (_) {}
-
-    if (!state.queue.length && state.currentTrack?.id) {
-      void ensureQueue();
-    }
-  },
-  { passive: false }
-);
-
-
-miniPlayer.addEventListener(
-  "pointermove",
-  event => {
-    if (
-      !miniGesture.active ||
-      event.pointerId !== miniGesture.pointerId
-    ) {
-      return;
-    }
-
-    const now = performance.now();
-    const dt = Math.max(1, now - miniGesture.lastTime);
-    const dx = event.clientX - miniGesture.startX;
-    const dy = event.clientY - miniGesture.startY;
-    const instantaneousX = (event.clientX - miniGesture.lastX) / dt;
-    const instantaneousY = (event.clientY - miniGesture.lastY) / dt;
-
-    miniGesture.velocityX =
-      miniGesture.velocityX * .65 + instantaneousX * .35;
-    miniGesture.velocityY =
-      miniGesture.velocityY * .65 + instantaneousY * .35;
-    miniGesture.lastX = event.clientX;
-    miniGesture.lastY = event.clientY;
-    miniGesture.lastTime = now;
-
-    if (!miniGesture.axis) {
-      if (Math.hypot(dx, dy) < 8) {
-        return;
-      }
-
-      miniGesture.axis =
-        Math.abs(dx) > Math.abs(dy) * 1.08
-          ? "x"
-          : "y";
-    }
-
-    if (miniGesture.axis === "x") {
-      event.preventDefault();
-
-      const direction = dx < 0 ? "next" : "previous";
-      const track = getNavigationPreviewTrack(direction);
-
-      if (miniGesture.direction !== direction) {
-        miniGesture.direction = direction;
-        createSwipePreview(direction);
-      }
-
-      const effectiveDx = track ? dx : dx * .24;
-      positionSwipeDeck(effectiveDx, direction);
-      return;
-    }
-
-    if (miniGesture.axis === "y" && dy < 0) {
-      event.preventDefault();
-      const lift = Math.max(-42, dy * .22);
-      playerSwipeSurface.style.transition = "none";
-      playerSwipeSurface.style.transform =
-        "translate3d(0," + lift + "px,0)";
-    }
-  },
-  { passive: false }
-);
-
-
-function finishMiniGesture(event) {
-  if (
-    !miniGesture.active ||
-    event.pointerId !== miniGesture.pointerId
-  ) {
-    return;
-  }
-
-  const dx = event.clientX - miniGesture.startX;
-  const dy = event.clientY - miniGesture.startY;
-  const axis = miniGesture.axis;
-  const direction = miniGesture.direction;
-  const velocityX = miniGesture.velocityX;
-  const velocityY = miniGesture.velocityY;
-
-  miniGesture.active = false;
-  miniGesture.pointerId = null;
-  miniPlayer.classList.remove("gesture-active");
-
-  try {
-    miniPlayer.releasePointerCapture(event.pointerId);
-  } catch (_) {}
-
-  if (axis === "x" && direction) {
-    const width = Math.max(1, miniPlayer.getBoundingClientRect().width);
-    const threshold = Math.min(105, width * .22);
-    const track = getNavigationPreviewTrack(direction);
-    const movingCorrectWay =
-      direction === "next"
-        ? velocityX < -.5
-        : velocityX > .5;
-    const committed =
-      !!track &&
-      (Math.abs(dx) >= threshold || movingCorrectWay);
-
-    if (committed) {
-      void commitSwipeNavigation(
-        direction,
-        direction === "previous",
-        velocityX
-      );
-      return;
-    }
-
-    resetSwipeDeck(true);
-    return;
-  }
-
-  if (
-    axis === "y" &&
-    (-dy > 68 || velocityY < -.42)
-  ) {
-    resetSwipeDeck(false);
-    openExpandedPlayer();
-    return;
-  }
-
-  resetSwipeDeck(true);
-}
-
-
-miniPlayer.addEventListener("pointerup", finishMiniGesture);
-miniPlayer.addEventListener("pointercancel", finishMiniGesture);
-
-
-document.getElementById("miniNow").onclick = () => {
-  if (!miniGesture.active && !state.playerGestureBusy) {
-    openExpandedPlayer();
-  }
-};
-
-
-document.getElementById("expandedCloseButton").onclick = closeExpandedPlayer;
-
-document.getElementById("expandedLikeButton").onclick = async () => {
-  await toggleFavourite(state.currentTrack);
-};
-
-document.getElementById("expandedLikeControl").onclick = async () => {
-  await toggleFavourite(state.currentTrack);
-};
-
-document.getElementById("expandedFavouriteButton").onclick = async () => {
-  await toggleFavourite(state.currentTrack);
-};
-
-document.getElementById("expandedPlaylistButton").onclick = () => {
-  openPlaylistModal(false);
-};
-
-document.getElementById("expandedDislikeButton").onclick = async () => {
-  await sendListeningEvent("dislike");
-  showToast("LESS LIKE THIS");
-  await animatePlayerNavigation("next", true);
-};
-
-document.getElementById("expandedNextButton").onclick = async () => {
-  await animatePlayerNavigation("next", false);
-};
-
-document.getElementById("expandedPreviousButton").onclick = async () => {
-  await animatePlayerNavigation("previous", true);
-};
-
-document.getElementById("expandedPlayButton").onclick = async () => {
-  if (!state.currentTrack) {
-    return;
-  }
-
-  if (audio.paused) {
-    await audio.play();
-  } else {
-    audio.pause();
-  }
-};
-
-
-document.getElementById("expandedSeek").oninput = event => {
-  audio.currentTime = Number(event.target.value);
-};
-
-
-expandedPlayer.addEventListener(
-  "pointerdown",
-  event => {
-    if (event.target.closest("button,input")) {
-      return;
-    }
-
-    expandedGesture.active = true;
-    expandedGesture.pointerId = event.pointerId;
-    expandedGesture.startY = event.clientY;
-    expandedGesture.lastY = event.clientY;
-    expandedGesture.lastTime = performance.now();
-    expandedGesture.velocityY = 0;
-    expandedPlayer.classList.add("dragging");
-
-    try {
-      expandedPlayer.setPointerCapture(event.pointerId);
-    } catch (_) {}
-  },
-  { passive: false }
-);
-
-
-expandedPlayer.addEventListener(
-  "pointermove",
-  event => {
-    if (
-      !expandedGesture.active ||
-      event.pointerId !== expandedGesture.pointerId
-    ) {
-      return;
-    }
-
-    const dy = Math.max(0, event.clientY - expandedGesture.startY);
-    const now = performance.now();
-    const dt = Math.max(1, now - expandedGesture.lastTime);
-    const instantaneousY = (event.clientY - expandedGesture.lastY) / dt;
-
-    expandedGesture.velocityY =
-      expandedGesture.velocityY * .65 + instantaneousY * .35;
-    expandedGesture.lastY = event.clientY;
-    expandedGesture.lastTime = now;
-
-    if (dy > 0) {
-      event.preventDefault();
-      expandedPlayer.style.transform =
-        "translate3d(0," + dy + "px,0)";
-    }
-  },
-  { passive: false }
-);
-
-
-function finishExpandedGesture(event) {
-  if (
-    !expandedGesture.active ||
-    event.pointerId !== expandedGesture.pointerId
-  ) {
-    return;
-  }
-
-  const dy = Math.max(0, event.clientY - expandedGesture.startY);
-  const shouldClose =
-    dy > 105 || expandedGesture.velocityY > .5;
-
-  expandedGesture.active = false;
-  expandedGesture.pointerId = null;
-  expandedPlayer.classList.remove("dragging");
-
-  try {
-    expandedPlayer.releasePointerCapture(event.pointerId);
-  } catch (_) {}
-
-  if (shouldClose) {
-    closeExpandedPlayer();
-    return;
-  }
-
-  expandedPlayer.style.transform = "";
-};
-
-
-expandedPlayer.addEventListener("pointerup", finishExpandedGesture);
-expandedPlayer.addEventListener("pointercancel", finishExpandedGesture);
-
-document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && expandedPlayer.classList.contains("open")) {
-    closeExpandedPlayer();
-  }
-});
-
-
-function prefetchTrack(track, intent) {
-  const trackId = track?.id;
-
-  if (
-    !trackId ||
-    state.prefetchRequested.has(trackId) ||
-    trackId === state.currentTrack?.id
-  ) {
-    return;
-  }
-
-  state.prefetchRequested.add(trackId);
-
-  void fetch(
-    "/api/prefetch/"
-      + encodeURIComponent(trackId)
-      + (intent ? "?intent=1" : ""),
-    {
-      method: "POST",
-      keepalive: true
-    }
-  ).then(async response => {
-    if (!response.ok && response.status !== 202) {
-      state.prefetchRequested.delete(trackId);
-      return;
-    }
-
-    try {
-      const payload = await response.clone().json();
-      if (payload?.status === "busy") {
-        state.prefetchRequested.delete(trackId);
-      }
-    } catch (_) {}
-  }).catch(() => {
-    state.prefetchRequested.delete(trackId);
-  });
-
-  setTimeout(
-    () => state.prefetchRequested.delete(trackId),
-    45000
-  );
-}
-
-
-function cancelVisiblePrefetchTimers() {
-  state.visiblePrefetchGeneration += 1;
-
-  for (const timer of state.visiblePrefetchTimers) {
-    clearTimeout(timer);
-  }
-
-  state.visiblePrefetchTimers = [];
-}
-
-
-function schedulePrefetchTrack(track, delayMs, generation) {
-  if (!track?.id) {
-    return;
-  }
-
-  const timer = setTimeout(
-    () => {
-      if (generation !== state.visiblePrefetchGeneration) {
-        return;
-      }
-
-      if (audio.paused && !state.currentTrack) {
-        prefetchTrack(track, false);
-      }
-    },
-    Math.max(0, Number(delayMs || 0))
-  );
-
-  state.visiblePrefetchTimers.push(timer);
-}
-
-
-function scheduleVisiblePrefetches(tracks) {
-  // V24 deliberately does not guess a track just because it is first in a
-  // list. On the small Render instance, a wrong speculative extraction can
-  // make the track the user actually taps slower. Explicit hover/focus/touch
-  // intent and next-track prefetching still warm useful tracks.
-  cancelVisiblePrefetchTimers();
-}
-
-
-function prefetchNextTrack() {
-  const next = state.queue.find(
-    track => track?.id && track.id !== state.currentTrack?.id
-  );
-
-  if (next) {
-    prefetchTrack(next, true);
-  }
-}
-
-
-async function appendRadioQueue(seedTrackId) {
-  const token = ++state.queueRefreshToken;
-
-  try {
-    const tracks = await fetchJson(
-      "/api/radio/" + encodeURIComponent(seedTrackId)
-    );
-
-    if (token !== state.queueRefreshToken || !Array.isArray(tracks)) {
-      return;
-    }
-
-    const seen = new Set([
-      state.currentTrack?.id,
-      ...state.queue.map(track => track.id),
-      ...state.history.slice(-12).map(track => track.id)
-    ].filter(Boolean));
-
-    for (const track of tracks) {
-      if (track?.id && !seen.has(track.id)) {
-        state.queue.push(track);
-        seen.add(track.id);
-      }
-    }
-
-    if (!audio.paused) {
-      prefetchNextTrack();
-    }
-  } catch (error) {
-    console.error("Queue refresh failed:", error);
-  }
-}
-
-
-function refreshQueueFromSeed(seedTrackId) {
-  state.queue = [];
-  void appendRadioQueue(seedTrackId);
-}
-
-
-async function ensureQueue() {
-  if (state.queue.length) {
-    return;
-  }
-
-  if (state.currentTrack?.id) {
-    await appendRadioQueue(state.currentTrack.id);
-  }
-
-  if (!state.queue.length) {
-    const tracks = await fetchJson("/api/recommendations").catch(() => []);
-    state.queue = (tracks || []).filter(
-      track => track?.id && track.id !== state.currentTrack?.id
-    );
-  }
-}
-
-
-async function playNext(suppressTransitionSignal) {
-  await ensureQueue();
-
-  const next = state.queue.shift();
-  if (!next) {
-    showToast("NO NEXT TRACK YET");
-    return;
-  }
-
-  await playTrack(
-    next,
-    {
-      refreshQueue: false,
-      suppressTransitionSignal: !!suppressTransitionSignal
-    }
-  );
-
-  if (state.queue.length < 6) {
-    void appendRadioQueue(next.id);
-  }
-}
-
-
-async function playPrevious() {
-  const previous = state.history.pop();
-
-  if (!previous) {
-    if (audio.currentTime > 3) {
-      audio.currentTime = 0;
-      return;
-    }
-    showToast("NO PREVIOUS TRACK");
-    return;
-  }
-
-  if (state.currentTrack) {
-    state.queue.unshift(state.currentTrack);
-  }
-
-  await playTrack(
-    previous,
-    {
-      refreshQueue: false,
-      suppressTransitionSignal: true
-    }
-  );
-}
-
-
-async function openPlaylistModal(createOnly) {
-  const modal = document.getElementById("playlistModal");
-  modal.classList.remove("hidden");
-
-  const choices = document.getElementById("playlistChoices");
-  choices.innerHTML = '<div class="empty">LOADING PLAYLISTS...</div>';
-
-  const playlists = await fetchJson("/api/playlists").catch(() => []);
-  state.playlists = playlists;
-  choices.innerHTML = "";
-
-  if (createOnly || !state.currentTrack) {
-    choices.innerHTML = '<div class="empty">Create a playlist below.</div>';
-    return;
-  }
-
-  if (!playlists.length) {
-    choices.innerHTML = '<div class="empty">No playlists yet. Create one below.</div>';
-    return;
-  }
-
-  playlists.forEach(playlist => {
-    const button = document.createElement("button");
-    button.className = "playlist-choice";
-    button.innerHTML = \`<span>\${escapeHtml(playlist.name || "Playlist")}</span><i class="ph ph-plus"></i>\`;
-    button.onclick = async () => {
-      await addCurrentTrackToPlaylist(playlist.id);
-      closePlaylistModal();
-    };
-    choices.appendChild(button);
-  });
-}
-
-
-function closePlaylistModal() {
-  document.getElementById("playlistModal").classList.add("hidden");
-  document.getElementById("newPlaylistName").value = "";
-}
-
-
-async function addCurrentTrackToPlaylist(playlistId) {
-  if (!state.currentTrack) {
-    return;
-  }
-
-  await fetchJson(
-    "/api/playlists/" + encodeURIComponent(playlistId) + "/tracks",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.currentTrack)
-    }
-  );
-
-  showToast("ADDED TO PLAYLIST");
-}
-
-
-document.getElementById("playlistButton").onclick = () => openPlaylistModal(false);
-document.getElementById("playlistModalClose").onclick = closePlaylistModal;
-document.getElementById("playlistModal").onclick = event => {
-  if (event.target.id === "playlistModal") {
-    closePlaylistModal();
-  }
-};
-
-document.getElementById("newPlaylistCreate").onclick = async () => {
-  const name = document.getElementById("newPlaylistName").value.trim();
-  if (!name) {
-    return;
-  }
-
-  const playlist = await fetchJson(
-    "/api/playlists",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name })
-    }
-  );
-
-  if (state.currentTrack && playlist?.id) {
-    await addCurrentTrackToPlaylist(playlist.id);
-  } else {
-    showToast("PLAYLIST CREATED");
-  }
-
-  closePlaylistModal();
-  state.playlists.unshift(playlist);
-};
-
-
-audio.addEventListener(
-  "play",
-  () => {
-
-    document.getElementById(
-      "playButton"
-    ).innerHTML =
-      '<i class="ph ph-pause"></i>';
-
-    document.getElementById(
-      "expandedPlayButton"
-    ).innerHTML =
-      '<i class="ph ph-pause"></i>';
-
-    if (state.currentTrack) {
-      document.getElementById("nowArtist").textContent =
-        state.currentTrack.artist || "";
-    }
-
-    if ("mediaSession" in navigator) {
-      navigator.mediaSession.playbackState = "playing";
-    }
-
-    prefetchNextTrack();
-
-  }
-);
-
-
-audio.addEventListener(
-  "pause",
-  () => {
-
-    document.getElementById(
-      "playButton"
-    ).innerHTML =
-      '<i class="ph ph-play"></i>';
-
-    document.getElementById(
-      "expandedPlayButton"
-    ).innerHTML =
-      '<i class="ph ph-play"></i>';
-
-    if ("mediaSession" in navigator) {
-      navigator.mediaSession.playbackState = "paused";
-    }
-
-  }
-);
-
-
-audio.addEventListener(
-  "waiting",
-  () => {
-    if (state.currentTrack) {
-      document.getElementById(
-        "nowArtist"
-      ).textContent =
-        (state.currentTrack.artist || "") + " · BUFFERING";
-    }
-  }
-);
-
-
-audio.addEventListener(
-  "stalled",
-  () => {
-    if (state.currentTrack) {
-      document.getElementById(
-        "nowArtist"
-      ).textContent =
-        (state.currentTrack.artist || "") + " · BUFFERING";
-    }
-  }
-);
-
-
-audio.addEventListener(
-  "canplay",
-  () => {
-    if (!audio.paused) {
-      document.getElementById(
-        "playButton"
-      ).innerHTML =
-        '<i class="ph ph-pause"></i>';
-    }
-  }
-);
-
-
-audio.addEventListener(
-  "error",
-  () => {
-    const mediaError =
-      audio.error;
-
-    const currentSrc =
-      audio.currentSrc || "";
-
-    console.error(
-      "Veeb media element error:",
-      mediaError?.code,
-      mediaError?.message,
-      currentSrc
-    );
-
-    if (
-      currentSrc &&
-      state.expectedAudioSrc &&
-      currentSrc !== state.expectedAudioSrc
-    ) {
-      return;
-    }
-
-    if (
-      state.playbackPendingGeneration === state.playbackGeneration
-    ) {
-      return;
-    }
-
-    // Mid-song network/media errors get one quiet recovery attempt. The
-    // canonical Cloudflare/Render cache usually makes this second request cheap.
-    if (
-      state.currentTrack &&
-      state.mediaRecoveryGeneration !== state.playbackGeneration
-    ) {
-      state.mediaRecoveryGeneration =
-        state.playbackGeneration;
-
-      const resumeAt =
-        Number.isFinite(audio.currentTime)
-          ? audio.currentTime
-          : 0;
-
-      const recoverySrc =
-        "/api/audio/"
-        + encodeURIComponent(
-          state.currentTrack.id
-        )
-        + "?transport=v25&generation="
-        + state.playbackGeneration
-        + "&recover=1";
-
-      state.expectedAudioSrc =
-        new URL(
-          recoverySrc,
-          window.location.href
-        ).href;
-
-      document.getElementById(
-        "playButton"
-      ).innerHTML =
-        '<i class="ph ph-spinner-gap veeb-spin"></i>';
-
-      window.setTimeout(
-        async () => {
-          try {
-            audio.src =
-              recoverySrc;
-            audio.load();
-            await audio.play();
-            if (resumeAt > 0) {
-              try {
-                audio.currentTime =
-                  resumeAt;
-              } catch (_) {}
-            }
-          } catch (error) {
-            console.error(
-              "Veeb media recovery failed:",
-              error
-            );
-          }
+def format_has_drm(fmt: dict[str, Any]) -> bool:
+    return bool(fmt.get("drmFamilies") or fmt.get("licenseInfos") or fmt.get("drmTrackType"))
+
+
+def select_direct_format(data: dict[str, Any]) -> dict[str, Any] | None:
+    streaming = data.get("streamingData") or {}
+    formats = list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])
+    usable = [
+        fmt for fmt in formats
+        if isinstance(fmt, dict)
+        and isinstance(fmt.get("url"), str)
+        and fmt.get("url", "").startswith("http")
+        and not format_has_drm(fmt)
+    ]
+    for fmt in usable:
+        if str(fmt.get("itag")) == SOURCE_FORMAT:
+            return fmt
+    # Fallback to a directly signed MP4 that contains audio. Combined formats
+    # are preferred because every browser that handled itag 18 can play them.
+    combined_mp4 = [
+        fmt for fmt in usable
+        if str(fmt.get("mimeType", "")).startswith("video/mp4")
+        and "audioQuality" in fmt
+    ]
+    if combined_mp4:
+        return sorted(combined_mp4, key=lambda item: int(item.get("bitrate") or 0))[0]
+    audio_mp4 = [
+        fmt for fmt in usable
+        if str(fmt.get("mimeType", "")).startswith("audio/mp4")
+    ]
+    if audio_mp4:
+        return sorted(audio_mp4, key=lambda item: int(item.get("bitrate") or 0), reverse=True)[0]
+    return None
+
+
+def playability_error(data: dict[str, Any]) -> str:
+    status = data.get("playabilityStatus") or {}
+    return " | ".join(str(x) for x in [status.get("status"), status.get("reason")] if x)
+
+
+async def probe_direct_media(media_url: str, user_agent: str) -> None:
+    client = get_http_client()
+    response = await client.get(
+        media_url,
+        headers={
+            "Range": "bytes=0-0",
+            "Accept-Encoding": "identity",
+            "User-Agent": user_agent,
         },
-        450
-      );
-
-      return;
-    }
-
-    document.getElementById(
-      "playButton"
-    ).innerHTML =
-      '<i class="ph ph-play"></i>';
-
-    document.getElementById(
-      "expandedPlayButton"
-    ).innerHTML =
-      '<i class="ph ph-play"></i>';
-  }
-);
-
-
-
-audio.addEventListener(
-  "ended",
-  async () => {
-
-    await sendListeningEvent(
-      "complete"
-    );
-
-
-    await animatePlayerNavigation(
-      "next",
-      true
-    );
-
-  }
-);
-
-
-audio.addEventListener(
-  "timeupdate",
-  () => {
-
-    document.getElementById(
-      "currentTime"
-    ).textContent =
-      formatTime(
-        audio.currentTime
-      );
-
-
-    document.getElementById(
-      "totalTime"
-    ).textContent =
-      formatTime(
-        audio.duration
-      );
-
-
-    const seek =
-      document.getElementById(
-        "seek"
-      );
-
-
-    seek.max =
-      audio.duration || 0;
-
-
-    seek.value =
-      audio.currentTime || 0;
-
-
-    const expandedSeek =
-      document.getElementById(
-        "expandedSeek"
-      );
-
-    expandedSeek.max =
-      audio.duration || 0;
-
-    expandedSeek.value =
-      audio.currentTime || 0;
-
-    document.getElementById(
-      "expandedCurrentTime"
-    ).textContent =
-      formatTime(
-        audio.currentTime
-      );
-
-    document.getElementById(
-      "expandedTotalTime"
-    ).textContent =
-      formatTime(
-        audio.duration
-      );
-
-
-    if (
-      "mediaSession" in navigator &&
-      Number.isFinite(audio.duration) &&
-      audio.duration > 0
-    ) {
-      try {
-        navigator.mediaSession.setPositionState({
-          duration: audio.duration,
-          playbackRate: audio.playbackRate || 1,
-          position: Math.min(audio.currentTime || 0, audio.duration)
-        });
-      } catch (_) {}
-    }
-
-  }
-);
-
-
-document.getElementById(
-  "seek"
-).oninput =
-  event => {
-
-    audio.currentTime =
-      Number(
-        event.target.value
-      );
-
-  };
-
-
-async function sendListeningEvent(
-  type
-) {
-
-  if (
-    !state.currentTrack
-  ) {
-    return;
-  }
-
-
-  await fetch(
-    "/api/events",
-    {
-      method:
-        "POST",
-
-      headers: {
-        "Content-Type":
-          "application/json"
-      },
-
-      body:
-        JSON.stringify({
-          trackId:
-            state.currentTrack.id,
-
-          type,
-
-          positionSeconds:
-            audio.currentTime || 0,
-
-          durationSeconds:
-            audio.duration || 0
-        })
-    }
-  );
-
-}
-
-
-function setMediaSession(
-  track
-) {
-
-  if (
-    !(
-      "mediaSession"
-      in navigator
+        timeout=max(2.0, min(DIRECT_FAST_TIMEOUT_SECONDS, 4.0)),
     )
-  ) {
-    return;
-  }
+    try:
+        if response.status_code not in {200, 206}:
+            raise RuntimeError(f"Google Video probe returned HTTP {response.status_code}")
+    finally:
+        await response.aclose()
 
 
-  navigator.mediaSession.metadata =
-    new MediaMetadata({
+async def direct_resolve_one(video_id: str, client_name: str, purpose: str) -> ResolvedMedia:
+    global _visitor_data
+    started = time.monotonic()
+    if client_on_cooldown(client_name):
+        raise RuntimeError(f"{client_name} is on cooldown")
+    client = get_http_client()
+    try:
+        response = await client.post(
+            INNERTUBE_PLAYER_URL,
+            params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
+            headers=innertube_headers(client_name),
+            json=innertube_payload(video_id, client_name),
+            timeout=DIRECT_FAST_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Innertube transport failed: {exc}") from exc
+    if response.status_code != 200:
+        raise RuntimeError(f"Innertube HTTP {response.status_code}")
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Innertube returned invalid JSON: {exc}") from exc
 
-      title:
-        track.title || "",
+    visitor = ((data.get("responseContext") or {}).get("visitorData"))
+    if isinstance(visitor, str) and visitor:
+        _visitor_data = visitor
 
-      artist:
-        track.artist || "",
+    fmt = select_direct_format(data)
+    if not fmt:
+        reason = playability_error(data) or "no already-signed non-DRM direct format"
+        low = reason.lower()
+        if "sign in" in low or "bot" in low or "login_required" in low:
+            cool_down_client(client_name, reason)
+        raise RuntimeError(reason)
 
-      album:
-        track.album || "",
-
-      artwork:
-        track.artwork
-          ? [
-              {
-                src:
-                  track.artwork
-              }
-            ]
-          : []
-
-    });
-
-
-  navigator.mediaSession.setActionHandler(
-    "play",
-    () => audio.play()
-  );
-
-
-  navigator.mediaSession.setActionHandler(
-    "pause",
-    () => audio.pause()
-  );
-
-
-  navigator.mediaSession.setActionHandler(
-    "nexttrack",
-    () => animatePlayerNavigation("next", false)
-  );
-
-
-  navigator.mediaSession.setActionHandler(
-    "previoustrack",
-    () => animatePlayerNavigation("previous", true)
-  );
+    details = data.get("videoDetails") or {}
+    mime = str(fmt.get("mimeType") or "")
+    mime_base = mime.split(";", 1)[0].strip() or None
+    media_url = str(fmt["url"])
+    user_agent = str(DIRECT_CLIENTS[client_name].get("userAgent") or "Mozilla/5.0")
+    await probe_direct_media(media_url, user_agent)
+    headers = {"User-Agent": user_agent}
+    media = ResolvedMedia(
+        video_id=video_id,
+        url=media_url,
+        http_headers=headers,
+        client=client_name,
+        format_id=str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+        ext="mp4" if "mp4" in mime else None,
+        content_type=mime_base,
+        acodec=None,
+        vcodec=None,
+        abr=(float(fmt.get("averageBitrate") or fmt.get("bitrate")) / 1000) if isinstance(fmt.get("averageBitrate") or fmt.get("bitrate"), (int, float)) else None,
+        duration=float(details.get("lengthSeconds")) if str(details.get("lengthSeconds") or "").isdigit() else None,
+        title=str(details.get("title")) if details.get("title") is not None else None,
+        resolved_at=time.time(),
+        expires_at=resolved_expiry(media_url),
+        resolver_path="innertube-direct",
+    )
+    print("direct innertube resolve success", json.dumps({
+        "videoId": video_id,
+        "purpose": purpose,
+        "client": client_name,
+        "formatId": media.format_id,
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+    }), flush=True)
+    return media
 
 
-  try {
-    navigator.mediaSession.setActionHandler(
-      "seekto",
-      details => {
-        if (Number.isFinite(details.seekTime)) {
-          audio.currentTime = details.seekTime;
+async def resolve_direct_fast(video_id: str, purpose: str) -> ResolvedMedia:
+    candidates = [name for name in DIRECT_CLIENT_ORDER if not client_on_cooldown(name)]
+    if not candidates:
+        raise RuntimeError("all direct Innertube clients are on cooldown")
+
+    # Race the first two clients. The player API calls are tiny, so racing two is
+    # far cheaper than sequentially paying several seconds before fallback.
+    race = candidates[:2]
+    tasks = {asyncio.create_task(direct_resolve_one(video_id, name, purpose)): name for name in race}
+    errors: list[str] = []
+    try:
+        for done in asyncio.as_completed(tasks):
+            try:
+                winner = await done
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return winner
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append(str(exc))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    # If a third client exists, try it once after the race.
+    for name in candidates[2:]:
+        try:
+            return await direct_resolve_one(video_id, name, purpose)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    raise RuntimeError("direct fast path failed: " + " || ".join(errors)[-1800:])
+
+
+def append_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query[key] = [value]
+    encoded = urlencode([(k, item) for k, values in query.items() for item in values])
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, encoded, parsed.fragment))
+
+
+def mweb_context() -> dict[str, Any]:
+    cfg = dict(MWEB_DIRECT_CONFIG)
+    cfg.setdefault("timeZone", "UTC")
+    cfg.setdefault("utcOffsetMinutes", 0)
+    return {
+        "client": cfg,
+        "request": {"useSsl": True, "internalExperimentFlags": []},
+        "user": {"lockedSafetyMode": False},
+    }
+
+
+def mweb_headers() -> dict[str, str]:
+    origin = "https://www.youtube.com"
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "User-Agent": str(MWEB_DIRECT_CONFIG["userAgent"]),
+        "X-Youtube-Client-Name": "2",
+        "X-Youtube-Client-Version": str(MWEB_DIRECT_CONFIG["clientVersion"]),
+    }
+    if _visitor_data:
+        headers["X-Goog-Visitor-Id"] = _visitor_data
+    if load_youtube_cookie_session():
+        if _youtube_cookie_header:
+            headers["Cookie"] = _youtube_cookie_header
+        authorization = youtube_cookie_auth_header(origin)
+        if authorization:
+            headers["Authorization"] = authorization
+            headers["X-Origin"] = origin
+        headers["X-Goog-AuthUser"] = "0"
+        headers["X-Youtube-Bootstrap-Logged-In"] = "true"
+    return headers
+
+
+async def get_bgutil_gvs_pot(video_id: str, context: dict[str, Any]) -> tuple[str, str | None]:
+    """Ask the persistent bgutil server directly for a video-bound GVS proof."""
+    started = time.monotonic()
+    client = get_http_client()
+    response = await client.post(
+        BGUTIL_BASE_URL + "/get_pot",
+        json={
+            "content_binding": video_id,
+            "innertube_context": context,
+            "bypass_cache": False,
+        },
+        timeout=DIRECT_MWEB_POT_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"bgutil /get_pot returned HTTP {response.status_code}: {response.text[-500:]}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"bgutil returned invalid JSON: {exc}") from exc
+    token = payload.get("poToken")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("bgutil returned no poToken")
+    content_binding = payload.get("contentBinding")
+    print("v36 direct POT ready", json.dumps({
+        "videoId": video_id,
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+        "bindingMatchesVideo": content_binding == video_id,
+    }), flush=True)
+    return token, str(content_binding) if content_binding is not None else None
+
+
+async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
+    """Purpose-built mweb cold resolver: bgutil -> /player -> format 18 -> probe."""
+    global _visitor_data
+    started = time.monotonic()
+    context = mweb_context()
+    pot, _binding = await get_bgutil_gvs_pot(video_id, context)
+
+    payload: dict[str, Any] = {
+        "context": context,
+        "videoId": video_id,
+        "contentCheckOk": True,
+        "racyCheckOk": True,
+        "serviceIntegrityDimensions": {"poToken": pot},
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "lactMilliseconds": "-1",
+            }
+        },
+    }
+    client = get_http_client()
+    player_started = time.monotonic()
+    response = await client.post(
+        INNERTUBE_PLAYER_URL,
+        params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
+        headers=mweb_headers(),
+        json=payload,
+        timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"mweb /player returned HTTP {response.status_code}")
+    data = response.json()
+    visitor = ((data.get("responseContext") or {}).get("visitorData"))
+    if isinstance(visitor, str) and visitor:
+        _visitor_data = visitor
+    fmt = select_direct_format(data)
+    if not fmt:
+        raise RuntimeError("mweb /player returned no usable signed format: " + (playability_error(data) or "unknown"))
+
+    media_url = append_query_param(str(fmt["url"]), "pot", pot)
+    user_agent = str(MWEB_DIRECT_CONFIG["userAgent"])
+    probe_started = time.monotonic()
+    await probe_direct_media(media_url, user_agent)
+    mime = str(fmt.get("mimeType") or "")
+    mime_base = mime.split(";", 1)[0].strip() or None
+    details = data.get("videoDetails") or {}
+    media = ResolvedMedia(
+        video_id=video_id,
+        url=media_url,
+        http_headers={"User-Agent": user_agent},
+        client="mweb-direct-pot",
+        format_id=str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+        ext="mp4" if "mp4" in mime else None,
+        content_type=mime_base,
+        acodec=None,
+        vcodec=None,
+        abr=(float(fmt.get("averageBitrate") or fmt.get("bitrate")) / 1000) if isinstance(fmt.get("averageBitrate") or fmt.get("bitrate"), (int, float)) else None,
+        duration=float(details.get("lengthSeconds")) if str(details.get("lengthSeconds") or "").isdigit() else None,
+        title=str(details.get("title")) if details.get("title") is not None else None,
+        resolved_at=time.time(),
+        expires_at=resolved_expiry(media_url),
+        resolver_path="mweb-bgutil-direct-v36",
+    )
+    print("v36 direct mweb POT resolve success", json.dumps({
+        "videoId": video_id,
+        "purpose": purpose,
+        "formatId": media.format_id,
+        "playerSeconds": round(time.monotonic() - player_started, 3),
+        "probeSeconds": round(time.monotonic() - probe_started, 3),
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+    }), flush=True)
+    return media
+
+
+class YtdlpPhaseLogger:
+    """Tiny yt-dlp logger that emits only cold-start milestones, never secrets."""
+
+    def __init__(self, engine_id: str):
+        self.engine_id = engine_id
+        self._lock = threading.Lock()
+        self.video_id = ""
+        self.purpose = ""
+        self.started = 0.0
+        self._seen: set[str] = set()
+
+    def begin(self, video_id: str, purpose: str) -> None:
+        with self._lock:
+            self.video_id = video_id
+            self.purpose = purpose
+            self.started = time.monotonic()
+            self._seen = set()
+
+    def _phase(self, phase: str) -> None:
+        with self._lock:
+            if not self.video_id or phase in self._seen:
+                return
+            self._seen.add(phase)
+            elapsed = time.monotonic() - self.started
+            payload = {
+                "videoId": self.video_id,
+                "purpose": self.purpose,
+                "engine": self.engine_id,
+                "phase": phase,
+                "elapsedSeconds": round(elapsed, 3),
+            }
+        print("cold resolve phase", json.dumps(payload), flush=True)
+
+    def debug(self, message: str) -> None:
+        low = str(message).lower()
+        if "downloading webpage" in low:
+            self._phase("webpage")
+        elif "player api json" in low:
+            self._phase("player_api")
+        elif "generating a gvs po token" in low or "generating pot" in low:
+            self._phase("pot_request")
+        elif "solving js challenge" in low or "solving js challenges" in low:
+            self._phase("js_challenge")
+        elif "downloading player " in low:
+            self._phase("player_js")
+        elif "downloading 1 format" in low or "format(s):" in low:
+            self._phase("format_selected")
+
+    def warning(self, message: str) -> None:
+        self.debug(message)
+
+    def error(self, message: str) -> None:
+        self.debug(message)
+
+
+def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
+    args: dict[str, list[str]] = {}
+    if client:
+        args["player_client"] = [client]
+    if client in {"mweb", "web_music"}:
+        args["fetch_pot"] = ["auto"]
+        if not YOUTUBE_PREMIUM_ACCOUNT:
+            args["use_ad_playback_context"] = ["true"]
+    player_skip = ["configs"]
+    # Optional turbo mode. Current yt-dlp supports webpage/config skipping when
+    # visitor data is explicitly supplied, but its own docs warn this can be less
+    # stable. It is therefore available as an environment switch, not forced.
+    if YTDLP_SKIP_WEBPAGE_WITH_VISITOR and _visitor_data:
+        player_skip = ["webpage", "configs"]
+        args["visitor_data"] = [_visitor_data]
+    args["player_skip"] = player_skip
+    args["skip"] = ["hls", "dash"]
+    args["playback_wait"] = [f"{PLAYBACK_WAIT_SECONDS:g}"]
+    return args
+
+
+def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger) -> dict[str, Any]:
+    cookie_file = get_writable_cookie_file()
+    opts: dict[str, Any] = {
+        "format": SOURCE_FORMAT,
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": YTDLP_CACHE_DIR,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "retries": 0,
+        "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
+        "check_formats": False,
+        "js_runtimes": {JSC_RUNTIME: {}},
+        "extractor_args": {"youtube": youtube_extractor_args_dict(client_name)},
+        "logger": logger,
+    }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+    return opts
+
+
+class YtdlpEngine:
+    """A long-lived in-process yt-dlp instance dedicated to one extraction at a time."""
+
+    def __init__(self, engine_id: str, client_name: str, resolver_path: str):
+        self.engine_id = engine_id
+        self.client_name = client_name
+        self.resolver_path = resolver_path
+        self.logger = YtdlpPhaseLogger(engine_id)
+        self.ydl = yt_dlp.YoutubeDL(ytdlp_options(client_name, self.logger))
+        # Force the YouTube extractor class to be loaded during app startup, not
+        # on the user's first cold tap.
+        try:
+            self.ydl.get_info_extractor("Youtube")
+        except Exception:
+            pass
+
+    def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+        started = time.monotonic()
+        self.logger.begin(video_id, purpose)
+        # Refresh dynamic visitor data for this isolated engine just before use.
+        self.ydl.params["extractor_args"] = {
+            "youtube": youtube_extractor_args_dict(self.client_name)
         }
-      }
-    );
-  } catch (_) {}
+        try:
+            info = self.ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} failed: {exc}") from exc
+        if not isinstance(info, dict):
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} returned no metadata")
+        media_url = str(info.get("url") or "").strip()
+        if not media_url.startswith(("https://", "http://")):
+            raise RuntimeError(f"in-process yt-dlp {self.client_name} did not return a direct URL")
+        raw_headers = info.get("http_headers") or {}
+        media = ResolvedMedia(
+            video_id=video_id,
+            url=media_url,
+            http_headers={str(k): str(v) for k, v in raw_headers.items() if v is not None},
+            client=self.client_name,
+            format_id=str(info.get("format_id")) if info.get("format_id") is not None else None,
+            ext=str(info.get("ext")) if info.get("ext") is not None else None,
+            content_type=str(info.get("container")) if info.get("container") is not None else None,
+            acodec=str(info.get("acodec")) if info.get("acodec") is not None else None,
+            vcodec=str(info.get("vcodec")) if info.get("vcodec") is not None else None,
+            abr=float(info.get("abr")) if isinstance(info.get("abr"), (int, float)) else None,
+            duration=float(info.get("duration")) if isinstance(info.get("duration"), (int, float)) else None,
+            title=str(info.get("title")) if info.get("title") is not None else None,
+            resolved_at=time.time(),
+            expires_at=resolved_expiry(media_url),
+            resolver_path=self.resolver_path,
+        )
+        print("in-process yt-dlp resolve success", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "client": self.client_name,
+            "engine": self.engine_id,
+            "resolverPath": self.resolver_path,
+            "formatId": media.format_id,
+            "extractionSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+        return media
 
+    def close(self) -> None:
+        close = getattr(self.ydl, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+class YtdlpEnginePool:
+    def __init__(self, name: str, size: int, client_name: str, resolver_path: str):
+        self.name = name
+        self.client_name = client_name
+        self.resolver_path = resolver_path
+        self.engines = [
+            YtdlpEngine(f"{name}-{index + 1}", client_name, resolver_path)
+            for index in range(size)
+        ]
+        self.queue: asyncio.Queue[YtdlpEngine] = asyncio.Queue()
+        for engine in self.engines:
+            self.queue.put_nowait(engine)
+
+    async def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+        queued_at = time.monotonic()
+        engine = await self.queue.get()
+        queue_wait = time.monotonic() - queued_at
+        print("in-process yt-dlp slot acquired", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "pool": self.name,
+            "engine": engine.engine_id,
+            "queueWaitSeconds": round(queue_wait, 3),
+            "availableAfterAcquire": self.queue.qsize(),
+        }), flush=True)
+        try:
+            media = await asyncio.to_thread(engine.resolve, video_id, purpose)
+            # Validate the winning URL before allowing it to win a cold race.
+            await probe_resolved_media(media)
+            return media
+        finally:
+            self.queue.put_nowait(engine)
+
+    def close(self) -> None:
+        for engine in self.engines:
+            engine.close()
+
+
+def init_ytdlp_pools() -> None:
+    global _fg_auth_pool, _fg_pot_pool, _prefetch_pool
+    if _fg_auth_pool is None:
+        _fg_auth_pool = YtdlpEnginePool(
+            "fg-auth", YTDLP_FG_AUTH_ENGINES, YTDLP_AUTH_CLIENT, "yt-dlp-auth-inproc-v35"
+        )
+    if _fg_pot_pool is None:
+        _fg_pot_pool = YtdlpEnginePool(
+            "fg-pot", YTDLP_FG_POT_ENGINES, YTDLP_POT_CLIENT, "yt-dlp-mweb-pot-inproc-v35"
+        )
+    if _prefetch_pool is None:
+        _prefetch_pool = YtdlpEnginePool(
+            "prefetch", YTDLP_PREFETCH_ENGINES, YTDLP_AUTH_CLIENT, "yt-dlp-prefetch-inproc-v35"
+        )
+
+
+async def probe_resolved_media(media: ResolvedMedia) -> None:
+    client = get_http_client()
+    headers = {
+        k: v for k, v in media.http_headers.items()
+        if k.lower() not in {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding"}
+    }
+    headers["Range"] = "bytes=0-0"
+    headers["Accept-Encoding"] = "identity"
+    request = client.build_request("GET", media.url, headers=headers)
+    response = await client.send(request, stream=True)
+    try:
+        if response.status_code not in {200, 206}:
+            raise RuntimeError(f"resolved media probe returned HTTP {response.status_code}")
+    finally:
+        await response.aclose()
+
+
+def _consume_background_task(task: asyncio.Task[Any], label: str, video_id: str) -> None:
+    try:
+        result = task.result()
+        if isinstance(result, ResolvedMedia) and not get_cached_media(video_id):
+            _resolved_cache[video_id] = result
+            cleanup_resolved_cache()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print("cold race background path finished with error", json.dumps({
+            "videoId": video_id,
+            "path": label,
+            "error": str(exc)[-1200:],
+        }), flush=True)
+
+
+async def resolve_ytdlp_foreground_v35(video_id: str, purpose: str) -> ResolvedMedia:
+    """Foreground-first resolver. Run exactly one expensive mweb/PO job at a time.
+
+    On small Render instances, racing multiple yt-dlp/Deno/BotGuard jobs makes
+    each one slower. The known-working mweb+PO path gets the CPU to itself.
+    Only if it fails do we try the authenticated/default extractor.
+    """
+    init_ytdlp_pools()
+    started = time.monotonic()
+    try:
+        winner = await _fg_pot_pool.resolve(video_id, purpose + "-pot")
+        print("v35 foreground resolver won", json.dumps({
+            "videoId": video_id,
+            "client": winner.client,
+            "resolverPath": winner.resolver_path,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+        return winner
+    except asyncio.CancelledError:
+        raise
+    except Exception as pot_exc:
+        print("v35 mweb foreground failed, trying auth fallback", json.dumps({
+            "videoId": video_id,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+            "error": str(pot_exc)[-1200:],
+        }), flush=True)
+        try:
+            winner = await _fg_auth_pool.resolve(video_id, purpose + "-auth-fallback")
+            print("v35 auth fallback won", json.dumps({
+                "videoId": video_id,
+                "client": winner.client,
+                "resolverPath": winner.resolver_path,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+            return winner
+        except Exception as auth_exc:
+            raise RuntimeError(
+                "V35 foreground resolvers failed: "
+                + str(pot_exc)[-900:] + " || " + str(auth_exc)[-900:]
+            ) from auth_exc
+
+
+async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
+    """V36 true cold path.
+
+    Start two cheap direct HTTP strategies immediately. Give the purpose-built
+    mweb+bgutil resolver a short head start. If it has not produced verified
+    media quickly, start the proven in-process yt-dlp mweb fallback without
+    cancelling the direct work. First verified media wins.
+    """
+    init_ytdlp_pools()
+    started = time.monotonic()
+    generic_direct = asyncio.create_task(resolve_direct_fast(video_id, purpose + "-direct"))
+    direct_pot = asyncio.create_task(resolve_direct_mweb_pot(video_id, purpose + "-mweb-direct-pot"))
+    errors: list[str] = []
+
+    # Let pure HTTP resolution win without immediately competing for CPU with
+    # yt-dlp/Deno. This head start is intentionally tiny compared with V35's 12s.
+    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "1.25")))
+    if head_start:
+        done, _ = await asyncio.wait({generic_direct, direct_pot}, timeout=head_start, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                winner = task.result()
+                print("v36 cold direct won", json.dumps({
+                    "videoId": video_id,
+                    "client": winner.client,
+                    "resolverPath": winner.resolver_path,
+                    "elapsedSeconds": round(time.monotonic() - started, 3),
+                }), flush=True)
+                for pending in (generic_direct, direct_pot):
+                    if pending is not task and not pending.done():
+                        pending.cancel()
+                return winner
+            except Exception as exc:
+                errors.append(str(exc))
+
+    fallback = asyncio.create_task(resolve_ytdlp_foreground_v35(video_id, purpose))
+    tasks = {generic_direct, direct_pot, fallback}
+    for done in asyncio.as_completed(tasks):
+        try:
+            winner = await done
+            print("v36 cold race won", json.dumps({
+                "videoId": video_id,
+                "client": winner.client,
+                "resolverPath": winner.resolver_path,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+            for task in tasks:
+                if task.done():
+                    continue
+                task.add_done_callback(
+                    lambda finished, label="v36-loser": _consume_background_task(finished, label, video_id)
+                )
+            return winner
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors.append(str(exc))
+    raise RuntimeError("all V36 cold resolver paths failed: " + " || ".join(errors)[-2600:])
+
+
+async def resolve_prefetch_v35(video_id: str, purpose: str) -> ResolvedMedia:
+    """Keep speculation cheap so it cannot steal CPU from a true cold playback.
+
+    By default a prefetch only attempts the sub-second direct Innertube path.
+    Set VEEB_HEAVY_PREFETCH=true only if the host has enough CPU for background
+    yt-dlp challenge work without hurting foreground latency.
+    """
+    init_ytdlp_pools()
+    fast_started = time.monotonic()
+    try:
+        return await resolve_direct_fast(video_id, purpose)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print("direct innertube fast path missed", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "elapsedSeconds": round(time.monotonic() - fast_started, 3),
+            "error": str(exc)[-1500:],
+            "heavyPrefetch": HEAVY_PREFETCH,
+        }), flush=True)
+        if not HEAVY_PREFETCH:
+            raise RuntimeError("cheap prefetch fast path unavailable; heavy prefetch disabled") from exc
+    return await _prefetch_pool.resolve(video_id, purpose + "-prefetch")
+
+
+async def resolve_media_uncached(video_id: str, purpose: str) -> ResolvedMedia:
+    cached = get_cached_media(video_id)
+    if cached:
+        return cached
+    if purpose.startswith("live"):
+        media = await resolve_live_cold_v35(video_id, purpose)
+    else:
+        media = await resolve_prefetch_v35(video_id, purpose)
+    _resolved_cache[video_id] = media
+    cleanup_resolved_cache()
+    return media
+
+
+def resolve_task_finished(video_id: str, task: asyncio.Task[ResolvedMedia]) -> None:
+    if _resolve_tasks.get(video_id) is task:
+        _resolve_tasks.pop(video_id, None)
+        _resolve_task_purpose.pop(video_id, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print("background resolve failed", json.dumps({"videoId": video_id, "error": str(exc)[-1600:]}), flush=True)
+
+
+def start_resolve_task(video_id: str, purpose: str) -> asyncio.Task[ResolvedMedia]:
+    existing = _resolve_tasks.get(video_id)
+    if existing and not existing.done():
+        return existing
+
+    async def runner() -> ResolvedMedia:
+        # Prefetch HTTP fast paths can run concurrently. The yt-dlp fallback uses a dedicated background engine pool.
+        if purpose == "prefetch":
+            async with _direct_prefetch_sem:
+                return await resolve_media_uncached(video_id, purpose)
+        return await resolve_media_uncached(video_id, purpose)
+
+    task = asyncio.create_task(runner())
+    _resolve_tasks[video_id] = task
+    _resolve_task_purpose[video_id] = purpose
+    task.add_done_callback(lambda done: resolve_task_finished(video_id, done))
+    return task
+
+
+async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, str]:
+    cached = get_cached_media(video_id)
+    if cached:
+        return cached, "HIT"
+    task = _resolve_tasks.get(video_id)
+    if task and not task.done():
+        existing_purpose = _resolve_task_purpose.get(video_id, "")
+        if purpose == "live" and existing_purpose == "prefetch":
+            print("foreground bypassing speculative resolve", json.dumps({
+                "videoId": video_id
+            }), flush=True)
+            async def foreground_runner() -> ResolvedMedia:
+                return await resolve_media_uncached(video_id, "live")
+            foreground = asyncio.create_task(foreground_runner())
+            return await asyncio.shield(foreground), "MISS-FOREGROUND"
+        return await asyncio.shield(task), "WAIT"
+    task = start_resolve_task(video_id, purpose)
+    return await asyncio.shield(task), "MISS"
+
+
+def build_upstream_headers(media: ResolvedMedia, request: Request) -> dict[str, str]:
+    blocked = {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding"}
+    headers = {k: v for k, v in media.http_headers.items() if k.lower() not in blocked}
+    requested_range = request.headers.get("range")
+    if requested_range:
+        headers["Range"] = requested_range
+    headers["Accept-Encoding"] = "identity"
+    return headers
+
+
+PASSTHROUGH_RESPONSE_HEADERS = {
+    "accept-ranges", "content-length", "content-range", "content-type", "etag", "last-modified",
 }
 
 
-function setSection(
-  value
-) {
-
-  document.getElementById(
-    "sectionLabel"
-  ).textContent =
-    value;
-
-}
-
-
-function setResultsMessage(
-  value
-) {
-
-  const container = document.getElementById(
-    "results"
-  );
-
-  container.className = "";
-
-  container.innerHTML =
-    '<div class="empty">'
-    + escapeHtml(value)
-    + '</div>';
-
-}
+def build_downstream_headers(upstream: httpx.Response, media: ResolvedMedia, cache_state: str) -> dict[str, str]:
+    headers = {k: v for k, v in upstream.headers.items() if k.lower() in PASSTHROUGH_RESPONSE_HEADERS}
+    headers.setdefault("Content-Type", media.content_type or "video/mp4")
+    headers.setdefault("Accept-Ranges", "bytes")
+    headers["Cache-Control"] = "private, no-store"
+    headers["X-Veeb-Resolver"] = "direct-pot-v36"
+    headers["X-Veeb-Resolved-Cache"] = cache_state
+    headers["X-Veeb-Playback-Client"] = media.client
+    headers["X-Veeb-Source-Format"] = media.format_id or SOURCE_FORMAT
+    headers["X-Veeb-Resolver-Path"] = media.resolver_path
+    headers["X-Veeb-Direct-Proxy"] = "1"
+    return headers
 
 
-function formatTime(
-  seconds
-) {
-
-  if (
-    !Number.isFinite(
-      seconds
-    )
-  ) {
-    return "0:00";
-  }
+async def upstream_body(response: httpx.Response) -> AsyncIterator[bytes]:
+    try:
+        async for chunk in response.aiter_raw(PROXY_CHUNK_BYTES):
+            if chunk:
+                yield chunk
+    finally:
+        await response.aclose()
 
 
-  const minutes =
-    Math.floor(
-      seconds / 60
-    );
+async def open_media_upstream(media: ResolvedMedia, request: Request) -> httpx.Response:
+    client = get_http_client()
+    upstream_request = client.build_request(request.method, media.url, headers=build_upstream_headers(media, request))
+    return await client.send(upstream_request, stream=True)
 
 
-  const remaining =
-    Math.floor(
-      seconds % 60
-    );
+async def proxy_media(request: Request, video_id: str):
+    media, cache_state = await get_or_resolve(video_id, "live")
+    response = await open_media_upstream(media, request)
+
+    # A direct Innertube URL can still be rejected at GVS even though the player
+    # endpoint returned it. If so, invalidate and go straight to the mature
+    # fallback instead of retrying the same experimental client ladder.
+    if response.status_code in {403, 410}:
+        rejected_path = media.resolver_path
+        await response.aclose()
+        invalidate_media(video_id)
+        print("media url rejected", json.dumps({
+            "videoId": video_id,
+            "status": response.status_code,
+            "client": media.client,
+            "resolverPath": rejected_path,
+        }), flush=True)
+        if rejected_path in {"innertube-direct", "mweb-bgutil-direct-v36"}:
+            media = await resolve_ytdlp_foreground_v35(video_id, "live-gvs-fallback")
+            _resolved_cache[video_id] = media
+        else:
+            media = await resolve_media_uncached(video_id, "live-refresh")
+        cache_state = "REFRESH"
+        response = await open_media_upstream(media, request)
+
+    if response.status_code >= 400:
+        status = response.status_code
+        body = await response.aread()
+        await response.aclose()
+        detail = body[:800].decode("utf-8", "replace") if body else ""
+        raise HTTPException(status_code=502, detail=f"Upstream media server returned HTTP {status}" + (f": {detail}" if detail else ""))
+
+    headers = build_downstream_headers(response, media, cache_state)
+    print("direct media proxy open", json.dumps({
+        "videoId": video_id,
+        "client": media.client,
+        "formatId": media.format_id,
+        "resolverPath": media.resolver_path,
+        "resolvedCache": cache_state,
+        "range": request.headers.get("range"),
+        "upstreamStatus": response.status_code,
+    }), flush=True)
+    if request.method == "HEAD":
+        await response.aclose()
+        return Response(status_code=response.status_code, headers=headers)
+    return StreamingResponse(upstream_body(response), status_code=response.status_code, headers=headers, media_type=headers.get("Content-Type"))
 
 
-  return (
-    minutes
-    + ":"
-    + String(
-        remaining
-      ).padStart(
-        2,
-        "0"
-      )
-  );
-
-}
-
-
-function showToast(
-  text
-) {
-
-  const toast =
-    document.getElementById(
-      "toast"
-    );
+@app.on_event("startup")
+async def startup_session() -> None:
+    started = time.monotonic()
+    load_youtube_cookie_session(force=True)
+    get_http_client()
+    # Pay Python/plugin/extractor construction at process startup, before the
+    # first user tap. Docker already warms Deno and the bgutil POT service.
+    init_ytdlp_pools()
+    print("v36 resolver stack warm", json.dumps({
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+        "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
+        "foregroundPotEngines": YTDLP_FG_POT_ENGINES,
+        "prefetchEngines": YTDLP_PREFETCH_ENGINES,
+        "potHttpReady": pot_http_server_ready(),
+    }), flush=True)
 
 
-  toast.textContent =
-    text;
+@app.on_event("shutdown")
+async def shutdown_http_client() -> None:
+    global _http_client
+    for pool in (_fg_auth_pool, _fg_pot_pool, _prefetch_pool):
+        if pool is not None:
+            pool.close()
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
-  toast.style.display =
-    "block";
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {"ok": True, "service": "veeb-resolver", "version": "v36-direct-pot"}
 
 
-  clearTimeout(
-    window.toastTimer
-  );
+@app.get("/health")
+async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    cleanup_resolved_cache()
+    try:
+        ytdlp_version = importlib.metadata.version("yt-dlp")
+    except importlib.metadata.PackageNotFoundError:
+        ytdlp_version = "unknown"
+    return {
+        "ok": True,
+        "service": "veeb-resolver",
+        "version": "v36-direct-pot",
+        "ytDlpVersion": ytdlp_version,
+        "sourceFormat": SOURCE_FORMAT,
+        "directClients": DIRECT_CLIENT_ORDER,
+        "authFallbackClient": YTDLP_AUTH_CLIENT,
+        "potFallbackClient": YTDLP_POT_CLIENT,
+        "authenticatedCookies": _youtube_cookie_authenticated,
+        "potHttpReady": pot_http_server_ready(),
+        "resolvedUrlCacheEntries": len(_resolved_cache),
+        "activeResolves": len([t for t in _resolve_tasks.values() if not t.done()]),
+        "foregroundAuthSlotsFree": _fg_auth_pool.queue.qsize() if _fg_auth_pool else 0,
+        "foregroundPotSlotsFree": _fg_pot_pool.queue.qsize() if _fg_pot_pool else 0,
+        "prefetchSlotsFree": _prefetch_pool.queue.qsize() if _prefetch_pool else 0,
+        "inProcessYtDlp": True,
+        "directClientCooldowns": {
+            name: max(0, int(until - time.time()))
+            for name, until in _direct_client_cooldown_until.items()
+            if until > time.time()
+        },
+        "heavyPrefetch": HEAVY_PREFETCH,
+        "architecture": "v36-bgutil-direct-mweb-first-with-ytdlp-safety-fallback",
+    }
 
 
-  window.toastTimer =
-    setTimeout(
-      () => {
-
-        toast.style.display =
-          "none";
-
-      },
-      1700
-    );
-
-}
-
-
-function escapeHtml(
-  value
-) {
-
-  return String(
-    value
-  )
-
-    .replaceAll(
-      "&",
-      "&amp;"
-    )
-
-    .replaceAll(
-      "<",
-      "&lt;"
-    )
-
-    .replaceAll(
-      ">",
-      "&gt;"
-    )
-
-    .replaceAll(
-      '"',
-      "&quot;"
-    )
-
-    .replaceAll(
-      "'",
-      "&#039;"
-    );
-
-}
+@app.get("/resolve/{video_id}")
+async def resolve_endpoint(video_id: str, authorization: str | None = Header(default=None)) -> JSONResponse:
+    require_auth(authorization)
+    video_id = validate_video_id(video_id)
+    media, cache_state = await get_or_resolve(video_id, "metadata")
+    return JSONResponse({
+        "provider": "veeb-v36-direct-pot-resolver",
+        "videoId": video_id,
+        "title": media.title,
+        "duration": media.duration,
+        "formatId": media.format_id,
+        "client": media.client,
+        "resolverPath": media.resolver_path,
+        "cache": cache_state,
+        "expiresInSeconds": max(0, int(media.expires_at - time.time())),
+        "proxied": True,
+    })
 
 
-initialise();
+@app.post("/prefetch/{video_id}")
+async def prefetch_endpoint(
+    video_id: str,
+    intent: int = Query(default=0),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    require_auth(authorization)
+    video_id = validate_video_id(video_id)
+    if get_cached_media(video_id):
+        return JSONResponse({"ok": True, "status": "cached", "videoId": video_id})
+    existing = _resolve_tasks.get(video_id)
+    if existing and not existing.done():
+        return JSONResponse({"ok": True, "status": "warming", "videoId": video_id}, status_code=202)
+    start_resolve_task(video_id, "prefetch")
+    return JSONResponse({"ok": True, "status": "warming", "videoId": video_id, "intent": bool(intent)}, status_code=202)
 
-</script>
 
-</body>
+@app.post("/prefetch-batch")
+async def prefetch_batch_endpoint(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    require_auth(authorization)
+    body = await request.json()
+    raw_ids = body.get("videoIds") if isinstance(body, dict) else None
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=400, detail="videoIds must be an array")
+    video_ids: list[str] = []
+    for raw in raw_ids[:8]:
+        value = str(raw)
+        if VIDEO_ID_RE.fullmatch(value) and value not in video_ids:
+            video_ids.append(value)
+    statuses = []
+    for video_id in video_ids:
+        if get_cached_media(video_id):
+            statuses.append({"videoId": video_id, "status": "cached"})
+            continue
+        task = _resolve_tasks.get(video_id)
+        if not task or task.done():
+            start_resolve_task(video_id, "prefetch")
+        statuses.append({"videoId": video_id, "status": "warming"})
+    return JSONResponse({"ok": True, "tracks": statuses}, status_code=202)
 
-</html>
-`;
+
+@app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
+async def stream_endpoint(
+    request: Request,
+    video_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    video_id = validate_video_id(video_id)
+    return await proxy_media(request, video_id)
