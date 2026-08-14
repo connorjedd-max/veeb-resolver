@@ -1,20 +1,35 @@
-# Veeb Render Resolver V27
+# Veeb Render Resolver V28
 
-V27 restores fast progressive playback while preserving V26's completed-file cache.
+V28 changes the playback architecture from download/remux/cache to resolve/proxy.
 
-Key changes:
+## Hot path
 
-- Prefer YouTube audio-only format 140, with format 18 as fallback.
-- Build fragmented MP4 exactly as before.
-- Start browser playback after a 512 KiB prebuffer instead of waiting for the whole track.
-- Continue building the same file in the background until it becomes the normal Range-capable cache entry.
-- Preserve single-flight foreground/preload behaviour and preemption of speculative work.
-- Completed files still expose Content-Length and byte-range support.
+1. yt-dlp resolves the selected YouTube format to a signed Google Video media URL.
+2. The URL, required request headers and its expiry are cached in memory.
+3. `/stream/:videoId` forwards the browser's HTTP Range request directly to that media URL.
+4. Render streams the upstream bytes straight back to Veeb. There is no ffmpeg process, whole-song download or audio temp file.
 
-Keep the same `RESOLVER_SECRET` and `youtube-cookies.txt` secret file.
+## Prefetch
 
-Recommended Cloudflare Cron Trigger for a Render Free deployment:
+`POST /prefetch/:videoId` resolves and caches only the signed media URL. It does not download the song.
 
-    */10 * * * *
+## Required secrets / variables
 
-The Veeb Worker already contains the `scheduled()` handler that calls `/health`.
+Keep the same:
+
+- `RESOLVER_SECRET`
+- `/etc/secrets/youtube-cookies.txt` if you currently use cookies
+
+The existing bgutil PO-token provider remains installed.
+
+## Optional variables
+
+- `YOUTUBE_STREAM_FORMAT=18`
+- `YOUTUBE_CLIENTS=mweb,android_vr,web_embedded`
+- `VEEB_RESOLVED_URL_TTL=1800`
+- `VEEB_RESOLVED_URL_EXPIRY_MARGIN=120`
+- `VEEB_RESOLVE_TIMEOUT=45`
+
+## Important
+
+Deploy the matching V28 Cloudflare Worker as well. V28 forwards Range headers end-to-end and intentionally bypasses Cloudflare's full-object audio cache.

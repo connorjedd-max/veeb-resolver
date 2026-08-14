@@ -6,11 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv git ca-certificates ffmpeg curl unzip \
+        python3 python3-venv git ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Native Deno avoids npm-wrapper startup overhead. yt-dlp recommends Deno
-# for YouTube EJS challenge solving.
+# Native Deno is used by yt-dlp for YouTube EJS challenge solving.
 ENV DENO_INSTALL=/usr/local \
     DENO_DIR=/tmp/deno-cache
 RUN curl -fsSL https://deno.land/install.sh | sh -s v2.8.1 \
