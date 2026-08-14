@@ -1,0 +1,8 @@
+{
+  "name": "veeb-resolver-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtubei.js": "17.2.0"
+  }
+}

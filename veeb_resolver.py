@@ -22,7 +22,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.14", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.15 YouTube.js", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -31,7 +31,7 @@ WRITABLE_COOKIE_FILE = os.environ.get("WRITABLE_COOKIE_FILE", "/tmp/veeb-youtube
 YTDLP_CACHE_DIR = os.environ.get("YTDLP_CACHE_DIR", "/tmp/veeb-yt-dlp-cache")
 JSC_RUNTIME = os.environ.get("YOUTUBE_JSC_RUNTIME", "deno").strip() or "deno"
 JSC_TRACE = os.environ.get("VEEB_JSC_TRACE", "true").strip().lower() in {"1", "true", "yes", "on"}
-JSC_PLAYER_VARIANT = os.environ.get("VEEB_JSC_PLAYER_VARIANT", "tv").strip().lower() or "tv"
+JSC_PLAYER_VARIANT = os.environ.get("VEEB_JSC_PLAYER_VARIANT", "actual").strip().lower() or "actual"
 JSC_REMOTE_COMPONENTS = [
     item.strip()
     for item in os.environ.get("VEEB_JSC_REMOTE_COMPONENTS", "ejs:npm").split(",")
@@ -53,7 +53,10 @@ DIRECT_FAST_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_FAST_TI
 DIRECT_CLIENT_COOLDOWN_SECONDS = max(60, int(os.environ.get("VEEB_DIRECT_CLIENT_COOLDOWN", "1800")))
 DIRECT_PREFETCH_CONCURRENCY = max(1, int(os.environ.get("VEEB_DIRECT_PREFETCH_CONCURRENCY", "3")))
 BGUTIL_BASE_URL = os.environ.get("VEEB_BGUTIL_BASE_URL", "http://127.0.0.1:4416").rstrip("/")
-DIRECT_MWEB_POT_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_MWEB_POT_TIMEOUT", "8.0")))
+YOUTUBEJS_BASE_URL = os.environ.get("VEEB_YOUTUBEJS_BASE_URL", "http://127.0.0.1:4417").rstrip("/")
+YOUTUBEJS_DECIPHER_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_YOUTUBEJS_DECIPHER_TIMEOUT", "5.0")))
+BGUTIL_WARM_VIDEO_ID = os.environ.get("VEEB_BGUTIL_WARM_VIDEO_ID", "dQw4w9WgXcQ").strip()
+DIRECT_MWEB_POT_TIMEOUT_SECONDS = max(3.0, float(os.environ.get("VEEB_DIRECT_MWEB_POT_TIMEOUT", "15.0")))
 DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VEEB_DIRECT_MWEB_PLAYER_TIMEOUT", "4.0")))
 YTDLP_FG_AUTH_ENGINES = max(1, int(os.environ.get("VEEB_YTDLP_FG_AUTH_ENGINES", "1")))
 YTDLP_FG_POT_ENGINES = max(1, int(os.environ.get("VEEB_YTDLP_FG_POT_ENGINES", "1")))
@@ -174,6 +177,9 @@ _global_player_bootstrap_expires_at = 0.0
 _global_player_bootstrap_lock = asyncio.Lock()
 GLOBAL_PLAYER_BOOTSTRAP_TTL_SECONDS = max(60, int(os.environ.get("VEEB_GLOBAL_PLAYER_TTL", "900")))
 _mweb_bootstrap_lock = asyncio.Lock()
+_active_intent_video_id: str | None = None
+_youtubejs_ready = False
+_youtubejs_player_id: str | None = None
 
 
 def require_auth(authorization: str | None) -> None:
@@ -550,6 +556,40 @@ async def probe_direct_media(media_url: str, user_agent: str) -> None:
         await response.aclose()
 
 
+async def probe_media_url(
+    media_url: str,
+    source_headers: dict[str, str],
+    video_id: str,
+    label: str,
+) -> None:
+    """Verify that a signed Google Video URL returns media without downloading it."""
+    started = time.monotonic()
+    allowed = {"user-agent", "referer", "origin"}
+    headers = {
+        key: value for key, value in source_headers.items()
+        if key.lower() in allowed
+    }
+    headers.setdefault("User-Agent", str(MWEB_DIRECT_CONFIG.get("userAgent") or "Mozilla/5.0"))
+    headers.setdefault("Referer", "https://www.youtube.com/")
+    headers["Range"] = "bytes=0-0"
+    headers["Accept-Encoding"] = "identity"
+
+    client = get_http_client()
+    request = client.build_request("GET", media_url, headers=headers)
+    response = await client.send(request, stream=True)
+    try:
+        if response.status_code not in {200, 206}:
+            raise RuntimeError(f"{label} Google Video probe returned HTTP {response.status_code}")
+        print("v36.15 media probe success", json.dumps({
+            "videoId": video_id,
+            "label": label,
+            "status": response.status_code,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+    finally:
+        await response.aclose()
+
+
 async def direct_resolve_one(video_id: str, client_name: str, purpose: str) -> ResolvedMedia:
     global _visitor_data
     started = time.monotonic()
@@ -655,12 +695,90 @@ async def resolve_direct_fast(video_id: str, purpose: str) -> ResolvedMedia:
     raise RuntimeError("direct fast path failed: " + " || ".join(errors)[-1800:])
 
 
+def resolved_from_direct_format(
+    video_id: str,
+    media_url: str,
+    fmt: dict[str, Any],
+    client_name: str,
+    resolver_path: str,
+    details: dict[str, Any] | None = None,
+) -> ResolvedMedia:
+    """Convert one verified Innertube format into Veeb's proxy metadata."""
+    details = details or {}
+    mime = str(fmt.get("mimeType") or "")
+    mime_base = mime.split(";", 1)[0].strip() or None
+    codecs_match = re.search(r'codecs="([^"]+)"', mime)
+    codecs = [item.strip() for item in codecs_match.group(1).split(",")] if codecs_match else []
+    acodec = None
+    vcodec = None
+    if mime_base and mime_base.startswith("audio/"):
+        acodec = codecs[0] if codecs else None
+        vcodec = "none"
+    elif mime_base and mime_base.startswith("video/"):
+        vcodec = codecs[0] if codecs else None
+        acodec = codecs[1] if len(codecs) > 1 else None
+
+    raw_bitrate = fmt.get("averageBitrate") or fmt.get("bitrate")
+    try:
+        abr = float(raw_bitrate) / 1000 if raw_bitrate is not None else None
+    except (TypeError, ValueError):
+        abr = None
+
+    duration = None
+    raw_duration_ms = fmt.get("approxDurationMs")
+    try:
+        if raw_duration_ms is not None:
+            duration = float(raw_duration_ms) / 1000
+        elif details.get("lengthSeconds") is not None:
+            duration = float(details.get("lengthSeconds"))
+    except (TypeError, ValueError):
+        duration = None
+
+    ext = None
+    if mime_base:
+        if "mp4" in mime_base:
+            ext = "mp4"
+        elif "webm" in mime_base:
+            ext = "webm"
+
+    user_agent = str(MWEB_DIRECT_CONFIG.get("userAgent") or "Mozilla/5.0") if client_name == "mweb" else "Mozilla/5.0"
+    return ResolvedMedia(
+        video_id=video_id,
+        url=media_url,
+        http_headers={
+            "User-Agent": user_agent,
+            "Referer": "https://www.youtube.com/",
+        },
+        client=client_name,
+        format_id=str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+        ext=ext,
+        content_type=mime_base,
+        acodec=acodec,
+        vcodec=vcodec,
+        abr=abr,
+        duration=duration,
+        title=str(details.get("title")) if details.get("title") is not None else None,
+        resolved_at=time.time(),
+        expires_at=resolved_expiry(media_url),
+        resolver_path=resolver_path,
+    )
+
+
 def append_query_param(url: str, key: str, value: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    query[key] = [value]
-    encoded = urlencode([(k, item) for k, values in query.items() for item in values])
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, encoded, parsed.fragment))
+    """Add one query value without re-encoding YouTube's signed URL.
+
+    Rebuilding the entire query string can change escaping inside signed Google
+    Video URLs and invalidate the signature. Only the new value is encoded.
+    """
+    base, marker, fragment = url.partition("#")
+    encoded_pair = urlencode({key: value})
+    encoded_key = encoded_pair.split("=", 1)[0]
+    existing = re.compile(rf"([?&]){re.escape(encoded_key)}=[^&#]*")
+    if existing.search(base):
+        base = existing.sub(lambda match: match.group(1) + encoded_pair, base, count=1)
+    else:
+        base += ("&" if "?" in base else "?") + encoded_pair
+    return base + (("#" + fragment) if marker else "")
 
 
 def mweb_context() -> dict[str, Any]:
@@ -750,7 +868,7 @@ async def get_bgutil_pot(content_binding: str, context: dict[str, Any], label: s
     else:
         raise RuntimeError(f"bgutil returned unsupported expiresAt type: {type(raw_expires_at).__name__}")
 
-    print("v36.14 POT ready", json.dumps({
+    print("v36.15 POT ready", json.dumps({
         "bindingType": label,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "bindingMatches": str(returned_binding) == content_binding,
@@ -929,7 +1047,7 @@ async def fetch_global_player_bootstrap(video_id: str | None = None, force: bool
         }
         _global_player_bootstrap = result
         _global_player_bootstrap_expires_at = time.time() + GLOBAL_PLAYER_BOOTSTRAP_TTL_SECONDS
-        print('v36.14 global player bootstrap ready', json.dumps({
+        print('v36.15 global player bootstrap ready', json.dumps({
             'source': source,
             'playerId': result.get('playerId'),
             'playerVariant': JSC_PLAYER_VARIANT,
@@ -943,7 +1061,7 @@ async def warm_global_player_bootstrap() -> None:
     try:
         await fetch_global_player_bootstrap()
     except Exception as exc:
-        print('v36.14 global player warm missed', json.dumps({
+        print('v36.15 global player warm missed', json.dumps({
             'error': str(exc)[-1200:],
         }), flush=True)
 
@@ -1040,7 +1158,7 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
         "visitorData": visitor,
         "dataSyncId": data_sync_id,
     }
-    print("v36.14 mweb bootstrap ready", json.dumps({
+    print("v36.15 mweb bootstrap ready", json.dumps({
         "videoId": video_id,
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "hasSts": sts is not None,
@@ -1051,160 +1169,213 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
     return result
 
 
-async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
-    """Bootstrap-free direct mweb resolver.
+async def ensure_youtubejs_helper_ready() -> dict[str, Any]:
+    """Verify that the persistent YouTube.js player-decipher helper is warm."""
+    started = time.monotonic()
+    client = get_http_client()
+    response = await client.get(
+        YOUTUBEJS_BASE_URL + "/health",
+        timeout=min(5.0, YOUTUBEJS_DECIPHER_TIMEOUT_SECONDS),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"YouTube.js helper health returned HTTP {response.status_code}")
+    payload = response.json()
+    if not payload.get("ready"):
+        raise RuntimeError("YouTube.js helper is not ready")
+    print("v36.15 YouTube.js helper ready", json.dumps({
+        "playerId": payload.get("playerId"),
+        "signatureTimestamp": payload.get("signatureTimestamp"),
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+    }), flush=True)
+    return payload
 
-    Media discovery is one direct authenticated mweb Innertube /player request.
-    Player JS metadata is global infrastructure state discovered from iframe_api,
-    not from the per-video /watch page. The selected itag is deciphered once and
-    raced in parallel with the video-bound GVS PO token.
+
+async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> str:
+    """Decipher one Innertube format through the persistent YouTube.js Player.
+
+    YouTube.js extracts and caches the active player's signature and nsig logic.
+    This avoids launching Deno/EJS for every track while preserving the fast
+    direct mweb Innertube discovery path.
+    """
+    started = time.monotonic()
+    direct_url = fmt.get("url") if isinstance(fmt.get("url"), str) else None
+    signature_cipher = fmt.get("signatureCipher") if isinstance(fmt.get("signatureCipher"), str) else None
+    cipher = fmt.get("cipher") if isinstance(fmt.get("cipher"), str) else None
+    if not direct_url and not signature_cipher and not cipher:
+        raise RuntimeError("selected Innertube format has no URL or signature cipher")
+
+    client = get_http_client()
+    response = await client.post(
+        YOUTUBEJS_BASE_URL + "/decipher",
+        json={
+            "videoId": video_id,
+            "url": direct_url,
+            "signatureCipher": signature_cipher,
+            "cipher": cipher,
+        },
+        timeout=YOUTUBEJS_DECIPHER_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 200:
+        detail = response.text[-1200:]
+        raise RuntimeError(
+            f"YouTube.js decipher returned HTTP {response.status_code}"
+            + (f": {detail}" if detail else "")
+        )
+    payload = response.json()
+    media_url = payload.get("url")
+    if not isinstance(media_url, str) or not media_url.startswith("http"):
+        raise RuntimeError("YouTube.js helper returned no media URL")
+
+    global _youtubejs_ready, _youtubejs_player_id
+    _youtubejs_ready = True
+    if isinstance(payload.get("playerId"), str):
+        _youtubejs_player_id = payload.get("playerId")
+    print("v36.15 YouTube.js decipher success", json.dumps({
+        "videoId": video_id,
+        "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+        "playerId": payload.get("playerId"),
+        "helperElapsedMs": payload.get("elapsedMs"),
+        "elapsedSeconds": round(time.monotonic() - started, 3),
+    }), flush=True)
+    return media_url
+
+
+async def warm_bgutil_integrity() -> None:
+    """Prime bgutil's expensive integrity state before the first user presses play."""
+    if not VIDEO_ID_RE.fullmatch(BGUTIL_WARM_VIDEO_ID):
+        print("v36.15 bgutil warm skipped", json.dumps({
+            "reason": "VEEB_BGUTIL_WARM_VIDEO_ID is invalid",
+        }), flush=True)
+        return
+    started = time.monotonic()
+    try:
+        await get_bgutil_pot(BGUTIL_WARM_VIDEO_ID, mweb_context(), "startup-integrity-warm")
+        print("v36.15 bgutil integrity warm", json.dumps({
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+    except Exception as exc:
+        print("v36.15 bgutil warm failed", json.dumps({
+            "error": str(exc)[-1200:],
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+
+
+async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
+    """Resolve a cold track with direct Innertube + YouTube.js + bgutil.
+
+    The direct mweb /player request, YouTube.js signature/nsig decipher and the
+    video-bound GVS token are independent pieces. Player discovery starts first;
+    deciphering begins as soon as itag 18 arrives, while bgutil generates the PO
+    token in parallel. The slow generic yt-dlp extractor is only a fallback.
     """
     global _visitor_data
     started = time.monotonic()
     context = mweb_context()
     client = get_http_client()
 
-    async def call_plain_player():
+    async def call_plain_player() -> tuple[dict[str, Any], dict[str, Any]]:
+        global _visitor_data
         payload: dict[str, Any] = {
-            'context': context,
-            'videoId': video_id,
-            'contentCheckOk': True,
-            'racyCheckOk': True,
-            'playbackContext': {
-                'contentPlaybackContext': {
-                    'html5Preference': 'HTML5_PREF_WANTS',
+            "context": context,
+            "videoId": video_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS",
                 },
-                'adPlaybackContext': {'pyv': True},
+                "adPlaybackContext": {"pyv": True},
             },
         }
         t0 = time.monotonic()
         response = await client.post(
             INNERTUBE_PLAYER_URL,
-            params={'key': INNERTUBE_API_KEY, 'prettyPrint': 'false'},
+            params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
             headers=mweb_headers(),
             json=payload,
             timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:
-            raise RuntimeError(f'plain mweb /player returned HTTP {response.status_code}')
+            raise RuntimeError(f"plain mweb /player returned HTTP {response.status_code}")
         data = response.json()
-        visitor = ((data.get('responseContext') or {}).get('visitorData'))
+        visitor = ((data.get("responseContext") or {}).get("visitorData"))
         if isinstance(visitor, str) and visitor:
             _visitor_data = visitor
         fmt = select_direct_format(data)
         if not fmt:
-            streaming = data.get('streamingData') or {}
+            streaming = data.get("streamingData") or {}
             diagnostics = {
-                'status': ((data.get('playabilityStatus') or {}).get('status')),
-                'formats': len(streaming.get('formats') or []),
-                'adaptiveFormats': len(streaming.get('adaptiveFormats') or []),
-                'hasServerAbr': bool(streaming.get('serverAbrStreamingUrl')),
-                'itag18Present': any(
-                    str(f.get('itag')) == SOURCE_FORMAT
-                    for f in (list(streaming.get('formats') or []) + list(streaming.get('adaptiveFormats') or []))
-                    if isinstance(f, dict)
+                "status": ((data.get("playabilityStatus") or {}).get("status")),
+                "formats": len(streaming.get("formats") or []),
+                "adaptiveFormats": len(streaming.get("adaptiveFormats") or []),
+                "hasServerAbr": bool(streaming.get("serverAbrStreamingUrl")),
+                "itag18Present": any(
+                    str(item.get("itag")) == SOURCE_FORMAT
+                    for item in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or []))
+                    if isinstance(item, dict)
                 ),
             }
             raise RuntimeError(
-                'plain mweb /player returned no usable format: '
-                + (playability_error(data) or 'unknown')
-                + ' diagnostics=' + json.dumps(diagnostics, separators=(',', ':'))
+                "plain mweb /player returned no usable format: "
+                + (playability_error(data) or "unknown")
+                + " diagnostics=" + json.dumps(diagnostics, separators=(",", ":"))
             )
-        response_player_url = player_url_from_response(data)
-        direct_url = isinstance(fmt.get('url'), str) and fmt.get('url', '').startswith('http')
-        print('v36.14 mweb player candidate ready', json.dumps({
-            'videoId': video_id,
-            'purpose': purpose,
-            'candidate': 'plain',
-            'formatId': str(fmt.get('itag')) if fmt.get('itag') is not None else None,
-            'urlMode': 'direct' if direct_url else 'cipher',
-            'hasSignatureCipher': bool(fmt.get('signatureCipher') or fmt.get('cipher')),
-            'hasResponsePlayerUrl': bool(response_player_url),
-            'elapsedSeconds': round(time.monotonic() - t0, 3),
+        print("v36.15 mweb player candidate ready", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "candidate": "plain",
+            "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+            "urlMode": "direct" if isinstance(fmt.get("url"), str) else "cipher",
+            "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
+            "elapsedSeconds": round(time.monotonic() - t0, 3),
         }), flush=True)
-        return data, fmt, response_player_url
+        return data, fmt
 
     player_task = asyncio.create_task(call_plain_player())
-    pot_task = asyncio.create_task(get_bgutil_pot(video_id, context, 'gvs-video-candidate'))
-    global_player_task = asyncio.create_task(fetch_global_player_bootstrap(video_id))
+    pot_task = asyncio.create_task(get_bgutil_pot(video_id, context, "gvs-video-candidate"))
 
-    data, fmt, response_player_url = await player_task
+    try:
+        _data, fmt = await player_task
+    except BaseException:
+        if not pot_task.done():
+            pot_task.cancel()
+        raise
+    decipher_task = asyncio.create_task(youtubejs_decipher_format_url(video_id, fmt))
 
-    direct_url = fmt.get('url') if isinstance(fmt.get('url'), str) and fmt.get('url', '').startswith('http') else None
-    player_url = response_player_url
-    player_source = 'innertube-response' if player_url else None
+    try:
+        base_url, pot_result = await asyncio.gather(decipher_task, pot_task)
+    except Exception:
+        for task in (decipher_task, pot_task):
+            if not task.done():
+                task.cancel()
+        raise
 
-    if not direct_url and not player_url:
-        try:
-            global_player = await global_player_task
-            player_url = global_player.get('playerUrl')
-            player_source = global_player.get('source') or 'global'
-        except Exception as exc:
-            # /watch is emergency-only now. A 429 here can no longer block the fast
-            # path when iframe/global metadata is healthy.
-            print('v36.14 global player bootstrap missed', json.dumps({
-                'videoId': video_id,
-                'error': str(exc)[-1000:],
-                'elapsedSeconds': round(time.monotonic() - started, 3),
-            }), flush=True)
-            try:
-                legacy = await fetch_mweb_player_bootstrap(video_id)
-                player_url = legacy.get('playerUrl')
-                player_source = 'watch-emergency'
-            except Exception as legacy_exc:
-                raise RuntimeError(
-                    'ciphered Innertube format had no usable player JS metadata: '
-                    + str(legacy_exc)[-800:]
-                ) from legacy_exc
-
-    if direct_url:
-        base_task = asyncio.create_task(asyncio.sleep(0, result=direct_url))
-    else:
-        if not player_url:
-            raise RuntimeError('ciphered Innertube format had no player JS URL')
-        decipher_player_url = jsc_player_url(player_url)
-        print('v36.14 cipher solve started', json.dumps({
-            'videoId': video_id,
-            'playerCandidate': 'plain',
-            'formatId': str(fmt.get('itag')) if fmt.get('itag') is not None else None,
-            'playerUrlSource': player_source,
-            'playerVariant': JSC_PLAYER_VARIANT,
-            'decipherPlayerUrl': decipher_player_url[-120:],
-            'elapsedSeconds': round(time.monotonic() - started, 3),
-        }), flush=True)
-        base_task = asyncio.create_task(solve_direct_format_url(video_id, fmt, decipher_player_url))
-
-    video_token, returned_binding, expires_at = await pot_task
+    video_token, returned_binding, expires_at = pot_result
     if returned_binding and returned_binding != video_id:
-        raise RuntimeError('bgutil returned unexpected video binding')
-    print('v36.14 POT ready', json.dumps({
-        'bindingType': 'gvs-video-candidate',
-        'elapsedSeconds': round(time.monotonic() - started, 3),
-        'bindingMatches': not returned_binding or returned_binding == video_id,
-        'expiresInSeconds': max(0, round(expires_at - time.time())),
-    }), flush=True)
+        raise RuntimeError("bgutil returned unexpected video binding")
 
-    base_url = await base_task
-    media_url = add_query_param(base_url, 'pot', video_token)
+    media_url = append_query_param(base_url, "pot", video_token)
     await probe_media_url(
         media_url,
         mweb_headers(),
         video_id,
-        'v36.14-plain-video',
+        "v36.15-youtubejs-video",
     )
     media = resolved_from_direct_format(
         video_id,
         media_url,
         fmt,
-        'mweb',
-        'mweb-innertube-bootstrapless-v36.14',
+        "mweb",
+        "mweb-innertube-youtubejs-v36.15",
+        details=(_data.get("videoDetails") or {}),
     )
-    print('v36.14 direct mweb resolve success', json.dumps({
-        'videoId': video_id,
-        'playerCandidate': 'plain',
-        'proofCandidate': 'video',
-        'formatId': media.format_id,
-        'elapsedSeconds': round(time.monotonic() - started, 3),
+    print("v36.15 direct mweb resolve success", json.dumps({
+        "videoId": video_id,
+        "playerCandidate": "plain",
+        "proofCandidate": "video",
+        "formatId": media.format_id,
+        "expiresInSeconds": max(0, round(expires_at - time.time())),
+        "elapsedSeconds": round(time.monotonic() - started, 3),
     }), flush=True)
     return media
 
@@ -1243,7 +1414,7 @@ class JscDiagnosticLogger:
         with self._lock:
             self._recent.append(f"{level}: {text}")
             self._recent = self._recent[-12:]
-        print("v36.14 jsc yt-dlp", json.dumps({
+        print("v36.15 jsc yt-dlp", json.dumps({
             "level": level,
             "message": text,
         }), flush=True)
@@ -1344,7 +1515,7 @@ class DirectCipherSolver:
                 "supportedTypes": self._supported_types(provider),
                 "runtimePath": str(runtime_path) if runtime_path else None,
             })
-        print("v36.14 JSC provider snapshot", json.dumps({
+        print("v36.15 JSC provider snapshot", json.dumps({
             "reason": reason,
             "runtime": JSC_RUNTIME,
             "runtimeBinary": shutil.which(JSC_RUNTIME),
@@ -1393,7 +1564,7 @@ class DirectCipherSolver:
                         ),
                     ))
                 else:
-                    print("v36.14 SIG permutation cache hit", json.dumps({
+                    print("v36.15 SIG permutation cache hit", json.dumps({
                         "videoId": video_id,
                         "signatureLength": len(encrypted_sig),
                     }), flush=True)
@@ -1408,18 +1579,18 @@ class DirectCipherSolver:
             if requests:
                 self._provider_snapshot("before-solve", requests)
                 player_load_started = time.monotonic()
-                print("v36.14 cipher player load started", json.dumps({
+                print("v36.15 cipher player load started", json.dumps({
                     "videoId": video_id,
                     "playerUrl": player_url[-120:],
                 }), flush=True)
                 self.ie._load_player(video_id=video_id, player_url=player_url, fatal=True)
-                print("v36.14 cipher player loaded", json.dumps({
+                print("v36.15 cipher player loaded", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(time.monotonic() - player_load_started, 3),
                 }), flush=True)
 
                 challenge_started = time.monotonic()
-                print("v36.14 cipher challenge solve entered", json.dumps({
+                print("v36.15 cipher challenge solve entered", json.dumps({
                     "videoId": video_id,
                     "hasSig": bool(encrypted_sig),
                     "hasN": bool(n_challenge),
@@ -1427,7 +1598,7 @@ class DirectCipherSolver:
                 }), flush=True)
                 results = self.ie._jsc_director.bulk_solve(requests)
                 challenge_elapsed = time.monotonic() - challenge_started
-                print("v36.14 cipher challenge solve returned", json.dumps({
+                print("v36.15 cipher challenge solve returned", json.dumps({
                     "videoId": video_id,
                     "elapsedSeconds": round(challenge_elapsed, 3),
                     "resultCount": len(results),
@@ -1458,7 +1629,7 @@ class DirectCipherSolver:
                             raise RuntimeError("signature permutation contained an out-of-range index")
                         assert sig_spec_key is not None
                         self._sig_spec_cache[sig_spec_key] = sig_spec
-                        print("v36.14 SIG permutation cached", json.dumps({
+                        print("v36.15 SIG permutation cached", json.dumps({
                             "videoId": video_id,
                             "signatureLength": len(encrypted_sig),
                             "specLength": len(sig_spec),
@@ -1498,7 +1669,7 @@ async def solve_direct_format_url(video_id: str, fmt: dict[str, Any], player_url
     assert _direct_cipher_solver is not None
     started = time.monotonic()
     url = await asyncio.to_thread(_direct_cipher_solver.solve, video_id, fmt, player_url)
-    print("v36.14 cipher solved", json.dumps({
+    print("v36.15 cipher solved", json.dumps({
         "videoId": video_id,
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "hadSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
@@ -1580,7 +1751,8 @@ def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
     args["player_skip"] = player_skip
     args["skip"] = ["hls", "dash"]
     args["playback_wait"] = [f"{PLAYBACK_WAIT_SECONDS:g}"]
-    args["player_js_variant"] = [JSC_PLAYER_VARIANT]
+    if JSC_PLAYER_VARIANT not in {"", "actual"}:
+        args["player_js_variant"] = [JSC_PLAYER_VARIANT]
     return args
 
 
@@ -1824,7 +1996,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
 
     # Give the real direct POT/cipher path an actual head start. A failure from
     # the cheap direct probe must NOT end this window early.
-    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "5.0")))
+    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "3.5")))
     deadline = time.monotonic() + head_start
     head_tasks = {generic_direct, direct_pot}
     while head_tasks and time.monotonic() < deadline:
@@ -1848,7 +2020,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
                 return winner
             except Exception as exc:
                 errors.append(str(exc))
-                print("v36.14 direct head-start path failed", json.dumps({
+                print("v36.15 direct head-start path failed", json.dumps({
                     "videoId": video_id,
                     "path": "generic-direct" if task is generic_direct else "direct-pot",
                     "error": str(exc)[-1200:],
@@ -1872,6 +2044,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             for task in tasks:
                 if task.done():
                     continue
+                task.cancel()
                 task.add_done_callback(
                     lambda finished, label="v36-loser": _consume_background_task(finished, label, video_id)
                 )
@@ -1880,7 +2053,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.14 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
+            print("v36.15 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
     raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
@@ -1961,6 +2134,15 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
     task = _resolve_tasks.get(video_id)
     if task and not task.done():
         existing_purpose = _resolve_task_purpose.get(video_id, "")
+        if purpose == "live" and existing_purpose == "live-intent":
+            global _active_intent_video_id
+            _resolve_task_purpose[video_id] = "live"
+            if _active_intent_video_id == video_id:
+                _active_intent_video_id = None
+            print("foreground joining intent resolver", json.dumps({
+                "videoId": video_id,
+            }), flush=True)
+            return await asyncio.shield(task), "WAIT-INTENT"
         if purpose == "live" and existing_purpose == "prefetch":
             print("foreground promoting speculative resolve to single-flight", json.dumps({
                 "videoId": video_id
@@ -2041,7 +2223,13 @@ async def proxy_media(request: Request, video_id: str):
             "client": media.client,
             "resolverPath": rejected_path,
         }), flush=True)
-        if rejected_path in {"innertube-direct", "mweb-bgutil-direct-v36", "mweb-adaptive-gvs-direct-v36.2", "mweb-resilient-direct-v36.3"}:
+        if rejected_path in {
+            "innertube-direct",
+            "mweb-bgutil-direct-v36",
+            "mweb-adaptive-gvs-direct-v36.2",
+            "mweb-resilient-direct-v36.3",
+            "mweb-innertube-youtubejs-v36.15",
+        }:
             media = await resolve_ytdlp_foreground_v35(video_id, "live-gvs-fallback")
             _resolved_cache[video_id] = media
         else:
@@ -2077,21 +2265,34 @@ async def startup_session() -> None:
     started = time.monotonic()
     load_youtube_cookie_session(force=True)
     get_http_client()
-    # Pay Python/plugin/extractor construction at process startup, before the
-    # first user tap. Docker already warms Deno and the bgutil POT service.
+    # Keep the proven yt-dlp fallback warm, but do not construct the broken
+    # standalone EJS decipher engine. The hot path uses a persistent YouTube.js
+    # Player helper that is already warm before Uvicorn starts.
     init_ytdlp_pools()
-    init_direct_cipher_solver()
-    global _session_gvs_task
+    global _session_gvs_task, _youtubejs_ready, _youtubejs_player_id
     _session_gvs_task = None
-    await warm_global_player_bootstrap()
-    print("v36.14 resolver stack warm", json.dumps({
+    helper_result, _warm_result = await asyncio.gather(
+        ensure_youtubejs_helper_ready(),
+        warm_bgutil_integrity(),
+        return_exceptions=True,
+    )
+    if isinstance(helper_result, Exception):
+        print("v36.15 YouTube.js helper warm failed", json.dumps({
+            "error": str(helper_result)[-1200:],
+        }), flush=True)
+        helper_state: dict[str, Any] = {}
+    else:
+        helper_state = helper_result
+    _youtubejs_ready = bool(helper_state.get("ready"))
+    _youtubejs_player_id = helper_state.get("playerId") if isinstance(helper_state.get("playerId"), str) else None
+    print("v36.15 resolver stack warm", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
         "foregroundPotEngines": YTDLP_FG_POT_ENGINES,
         "prefetchEngines": YTDLP_PREFETCH_ENGINES,
         "potHttpReady": pot_http_server_ready(),
-        "jscRuntime": JSC_RUNTIME,
-        "jscRemoteComponents": JSC_REMOTE_COMPONENTS,
+        "youtubejsReady": bool(helper_state.get("ready")),
+        "youtubejsPlayerId": helper_state.get("playerId"),
     }), flush=True)
 
 
@@ -2108,9 +2309,14 @@ async def shutdown_http_client() -> None:
         _http_client = None
 
 
+@app.head("/")
+async def root_head() -> Response:
+    return Response(status_code=200)
+
+
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.14-innertube-bootstrapless"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v36.15-youtubejs"}
 
 
 @app.get("/health")
@@ -2124,7 +2330,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.14-innertube-bootstrapless",
+        "version": "v36.15-youtubejs",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -2132,6 +2338,8 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
         "potFallbackClient": YTDLP_POT_CLIENT,
         "authenticatedCookies": _youtube_cookie_authenticated,
         "potHttpReady": pot_http_server_ready(),
+        "youtubejsReady": _youtubejs_ready,
+        "youtubejsPlayerId": _youtubejs_player_id,
         "resolvedUrlCacheEntries": len(_resolved_cache),
         "activeResolves": len([t for t in _resolve_tasks.values() if not t.done()]),
         "foregroundAuthSlotsFree": _fg_auth_pool.queue.qsize() if _fg_auth_pool else 0,
@@ -2144,7 +2352,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             if until > time.time()
         },
         "heavyPrefetch": HEAVY_PREFETCH,
-        "architecture": "v36.3-resilient-innertube-video-gvs-first-with-optional-session-gvs-and-ytdlp-fallback",
+        "architecture": "direct-mweb-innertube-plus-persistent-youtubejs-decipher-plus-warm-bgutil-with-ytdlp-fallback",
     }
 
 
@@ -2154,7 +2362,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.14-innertube-bootstrapless-resolver",
+        "provider": "veeb-v36.15-youtubejs-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
@@ -2177,10 +2385,36 @@ async def prefetch_endpoint(
     video_id = validate_video_id(video_id)
     if get_cached_media(video_id):
         return JSONResponse({"ok": True, "status": "cached", "videoId": video_id})
+    global _active_intent_video_id
+    if intent and _active_intent_video_id and _active_intent_video_id != video_id:
+        old_id = _active_intent_video_id
+        old_task = _resolve_tasks.get(old_id)
+        if old_task and not old_task.done() and _resolve_task_purpose.get(old_id) == "live-intent":
+            _resolve_tasks.pop(old_id, None)
+            _resolve_task_purpose.pop(old_id, None)
+            old_task.cancel()
+            print("intent prefetch replacing previous intent", json.dumps({
+                "fromVideoId": old_id,
+                "toVideoId": video_id,
+            }), flush=True)
+
     existing = _resolve_tasks.get(video_id)
     if existing and not existing.done():
-        return JSONResponse({"ok": True, "status": "warming", "videoId": video_id}, status_code=202)
-    start_resolve_task(video_id, "prefetch")
+        existing_purpose = _resolve_task_purpose.get(video_id, "")
+        if intent and existing_purpose == "prefetch":
+            if _resolve_tasks.get(video_id) is existing:
+                _resolve_tasks.pop(video_id, None)
+                _resolve_task_purpose.pop(video_id, None)
+            existing.cancel()
+            print("intent prefetch replacing speculative resolve", json.dumps({
+                "videoId": video_id,
+            }), flush=True)
+            start_resolve_task(video_id, "live-intent")
+            _active_intent_video_id = video_id
+        return JSONResponse({"ok": True, "status": "warming", "videoId": video_id, "intent": bool(intent)}, status_code=202)
+    start_resolve_task(video_id, "live-intent" if intent else "prefetch")
+    if intent:
+        _active_intent_video_id = video_id
     return JSONResponse({"ok": True, "status": "warming", "videoId": video_id, "intent": bool(intent)}, status_code=202)
 
 

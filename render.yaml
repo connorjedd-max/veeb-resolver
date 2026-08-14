@@ -3,7 +3,7 @@ services:
     name: veeb-resolver
     runtime: docker
     plan: free
-    healthCheckPath: /health
+    healthCheckPath: /
     envVars:
       - key: RESOLVER_SECRET
         sync: false
