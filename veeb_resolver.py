@@ -20,7 +20,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
     JsChallengeRequest, JsChallengeType, NChallengeInput, SigChallengeInput,
 )
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 app = FastAPI(title="Veeb YouTube Resolver V36.15 YouTube.js", docs_url=None, redoc_url=None)
 
@@ -127,7 +127,18 @@ UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_UPSTREAM_
 UPSTREAM_READ_TIMEOUT_SECONDS = max(10.0, float(os.environ.get("VEEB_UPSTREAM_READ_TIMEOUT", "45")))
 PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", str(256 * 1024))))
 
+# Optional audio-only derivative edge. The resolver still resolves the proven
+# SOURCE_FORMAT exactly as before. This layer only strips the video track from
+# the already-resolved progressive MP4 and caches a seekable M4A derivative.
+AUDIO_DERIVATIVE_DIR = os.environ.get("VEEB_AUDIO_DERIVATIVE_DIR", "/tmp/veeb-audio-derivatives")
+AUDIO_DERIVATIVE_TTL_SECONDS = max(300, int(os.environ.get("VEEB_AUDIO_DERIVATIVE_TTL", "21600")))
+AUDIO_DERIVATIVE_MAX_ENTRIES = max(4, int(os.environ.get("VEEB_AUDIO_DERIVATIVE_MAX_ENTRIES", "48")))
+AUDIO_DERIVATIVE_BUILD_TIMEOUT = max(15.0, float(os.environ.get("VEEB_AUDIO_DERIVATIVE_TIMEOUT", "90")))
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+LOCAL_PORT = int(os.environ.get("PORT", "10000"))
+
 os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
+os.makedirs(AUDIO_DERIVATIVE_DIR, exist_ok=True)
 
 
 @dataclass
@@ -180,6 +191,274 @@ _mweb_bootstrap_lock = asyncio.Lock()
 _active_intent_video_id: str | None = None
 _youtubejs_ready = False
 _youtubejs_player_id: str | None = None
+
+# Single-flight registry for audio-only derivative builds. This is deliberately
+# separate from the URL resolver caches so V36.15 resolution behaviour remains
+# unchanged.
+_audio_derivative_tasks: dict[str, asyncio.Task[str]] = {}
+
+
+def audio_derivative_path(video_id: str) -> str:
+    return os.path.join(AUDIO_DERIVATIVE_DIR, f"{video_id}-{SOURCE_FORMAT}.m4a")
+
+
+def get_cached_audio_derivative(video_id: str) -> str | None:
+    path = audio_derivative_path(video_id)
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    if stat.st_size < 1024:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    if time.time() - stat.st_mtime > AUDIO_DERIVATIVE_TTL_SECONDS:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return path
+
+
+def cleanup_audio_derivative_cache() -> None:
+    try:
+        entries = []
+        for name in os.listdir(AUDIO_DERIVATIVE_DIR):
+            if not name.endswith(".m4a"):
+                continue
+            path = os.path.join(AUDIO_DERIVATIVE_DIR, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            if time.time() - stat.st_mtime > AUDIO_DERIVATIVE_TTL_SECONDS:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            entries.append((stat.st_mtime, path))
+        if len(entries) <= AUDIO_DERIVATIVE_MAX_ENTRIES:
+            return
+        entries.sort()
+        for _, path in entries[: len(entries) - AUDIO_DERIVATIVE_MAX_ENTRIES]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        return
+
+
+def _audio_derivative_task_finished(video_id: str, task: asyncio.Task[str]) -> None:
+    if _audio_derivative_tasks.get(video_id) is task:
+        _audio_derivative_tasks.pop(video_id, None)
+
+
+async def _download_audio_derivative_source(video_id: str, target: str) -> tuple[str, str]:
+    """Download the already-resolved V36.15 media object to a local file.
+
+    This deliberately avoids making ffmpeg call back through this same Uvicorn
+    process. Resolution stays exactly V36.15; the derivative layer only consumes
+    the resolved media URL after that work has completed.
+    """
+    temp = target + ".source.part.mp4"
+    try:
+        os.unlink(temp)
+    except FileNotFoundError:
+        pass
+
+    media, cache_state = await get_or_resolve(video_id, "live")
+    rejected_paths = {
+        "innertube-direct",
+        "mweb-bgutil-direct-v36",
+        "mweb-adaptive-gvs-direct-v36.2",
+        "mweb-resilient-direct-v36.3",
+        "mweb-innertube-youtubejs-v36.15",
+    }
+
+    for attempt in range(2):
+        blocked = {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding"}
+        headers = {k: v for k, v in media.http_headers.items() if k.lower() not in blocked}
+        headers["Accept-Encoding"] = "identity"
+
+        client = get_http_client()
+        upstream_request = client.build_request("GET", media.url, headers=headers)
+        response = await client.send(upstream_request, stream=True)
+
+        if response.status_code in {403, 410} and attempt == 0:
+            rejected_path = media.resolver_path
+            await response.aclose()
+            invalidate_media(video_id)
+            print("audio derivative source rejected", json.dumps({
+                "videoId": video_id,
+                "status": response.status_code,
+                "client": media.client,
+                "resolverPath": rejected_path,
+            }), flush=True)
+            if rejected_path in rejected_paths:
+                media = await resolve_ytdlp_foreground_v35(video_id, "live-audio-derivative-gvs-fallback")
+                _resolved_cache[video_id] = media
+            else:
+                media = await resolve_media_uncached(video_id, "live-audio-derivative-refresh")
+            cache_state = "REFRESH"
+            continue
+
+        if response.status_code >= 400:
+            status = response.status_code
+            body = await response.aread()
+            await response.aclose()
+            detail = body[:800].decode("utf-8", "replace") if body else ""
+            raise RuntimeError(
+                f"audio derivative source returned HTTP {status}"
+                + (f": {detail}" if detail else "")
+            )
+
+        total = 0
+        try:
+            with open(temp, "wb") as output:
+                async for chunk in response.aiter_raw(PROXY_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    output.write(chunk)
+                    total += len(chunk)
+        finally:
+            await response.aclose()
+
+        if total < 1024:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise RuntimeError(f"audio derivative source unexpectedly small ({total} bytes)")
+
+        print("audio derivative source ready", json.dumps({
+            "videoId": video_id,
+            "sourceFormat": media.format_id or SOURCE_FORMAT,
+            "resolverPath": media.resolver_path,
+            "resolvedCache": cache_state,
+            "contentType": media.content_type,
+            "bytes": total,
+        }), flush=True)
+        return temp, media.format_id or SOURCE_FORMAT
+
+    raise RuntimeError("audio derivative source refresh exhausted")
+
+
+async def _run_ffmpeg_audio_derivative(source: str, target: str, copy_audio: bool) -> tuple[int, str]:
+    # Local-file input is intentional. It removes Uvicorn/self-HTTP/Range/header
+    # handling from ffmpeg completely, leaving only a deterministic container remux.
+    temp = target + (".copy.part.m4a" if copy_audio else ".aac.part.m4a")
+    try:
+        os.unlink(temp)
+    except FileNotFoundError:
+        pass
+
+    codec_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "160k"]
+    args = [
+        FFMPEG_BIN,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", source,
+        "-map", "0:a:0",
+        "-vn",
+        *codec_args,
+        "-movflags", "+faststart",
+        "-f", "ipod",
+        temp,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=AUDIO_DERIVATIVE_BUILD_TIMEOUT)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        return 124, "ffmpeg derivative build timed out"
+
+    detail = (stderr or b"").decode("utf-8", "replace")[-2000:]
+    if process.returncode == 0:
+        try:
+            size = os.path.getsize(temp)
+            if size < 1024:
+                raise OSError("derivative output is unexpectedly small")
+            os.replace(temp, target)
+            return 0, detail
+        except OSError as exc:
+            detail = (detail + " " + str(exc)).strip()
+    try:
+        os.unlink(temp)
+    except OSError:
+        pass
+    return int(process.returncode or 1), detail
+
+
+async def build_audio_derivative(video_id: str) -> str:
+    cached = get_cached_audio_derivative(video_id)
+    if cached:
+        return cached
+
+    target = audio_derivative_path(video_id)
+    source = ""
+    source_format = SOURCE_FORMAT
+    try:
+        source, source_format = await _download_audio_derivative_source(video_id, target)
+
+        code, detail = await _run_ffmpeg_audio_derivative(source, target, copy_audio=True)
+        mode = "copy"
+        if code != 0:
+            # Safety fallback for an unexpected non-AAC source.
+            code, detail = await _run_ffmpeg_audio_derivative(source, target, copy_audio=False)
+            mode = "aac-transcode"
+        if code != 0:
+            raise RuntimeError(f"audio derivative ffmpeg failed ({code}): {detail}")
+
+        cleanup_audio_derivative_cache()
+        print("audio derivative ready", json.dumps({
+            "videoId": video_id,
+            "sourceFormat": source_format,
+            "mode": mode,
+            "bytes": os.path.getsize(target),
+        }), flush=True)
+        return target
+    finally:
+        if source:
+            try:
+                os.unlink(source)
+            except OSError:
+                pass
+
+
+def start_audio_derivative_task(video_id: str) -> asyncio.Task[str]:
+    task = _audio_derivative_tasks.get(video_id)
+    if task and not task.done():
+        return task
+    task = asyncio.create_task(build_audio_derivative(video_id))
+    _audio_derivative_tasks[video_id] = task
+    task.add_done_callback(lambda done: _audio_derivative_task_finished(video_id, done))
+    return task
+
+
+async def get_or_build_audio_derivative(video_id: str) -> tuple[str, str]:
+    cached = get_cached_audio_derivative(video_id)
+    if cached:
+        return cached, "HIT"
+    existing = _audio_derivative_tasks.get(video_id)
+    task = start_audio_derivative_task(video_id)
+    state = "WAIT" if existing and not existing.done() else "MISS"
+    return await asyncio.shield(task), state
 
 
 def require_auth(authorization: str | None) -> None:
@@ -2454,3 +2733,69 @@ async def stream_endpoint(
     require_auth(authorization)
     video_id = validate_video_id(video_id)
     return await proxy_media(request, video_id)
+
+
+@app.post("/prefetch-audio/{video_id}")
+async def prefetch_audio_endpoint(
+    video_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    video_id = validate_video_id(video_id)
+    cached = get_cached_audio_derivative(video_id)
+    if cached:
+        return JSONResponse({
+            "ok": True,
+            "status": "cached",
+            "videoId": video_id,
+            "sourceFormat": SOURCE_FORMAT,
+            "derivative": "audio-m4a-remux-v1",
+        })
+    start_audio_derivative_task(video_id)
+    return JSONResponse({
+        "ok": True,
+        "status": "warming",
+        "videoId": video_id,
+        "sourceFormat": SOURCE_FORMAT,
+        "derivative": "audio-m4a-remux-v1",
+    }, status_code=202)
+
+
+@app.api_route("/stream-audio/{video_id}", methods=["GET", "HEAD"])
+async def stream_audio_endpoint(
+    request: Request,
+    video_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    video_id = validate_video_id(video_id)
+    try:
+        path, cache_state = await get_or_build_audio_derivative(video_id)
+    except Exception as exc:
+        message = str(exc)[-2400:]
+        print("audio derivative request failed", json.dumps({
+            "videoId": video_id,
+            "error": message,
+        }), flush=True)
+        return JSONResponse(
+            {"detail": "audio derivative failed", "error": message, "videoId": video_id},
+            status_code=502,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Veeb-Audio-Derivative": "error-v2",
+            },
+        )
+    headers = {
+        "Cache-Control": "private, max-age=21600, no-transform",
+        "Accept-Ranges": "bytes",
+        "X-Veeb-Resolver": "innertube-resilient-v36.15-audio-edge",
+        "X-Veeb-Resolved-Cache": "DERIVATIVE-" + cache_state,
+        "X-Veeb-Source-Format": SOURCE_FORMAT,
+        "X-Veeb-Audio-Derivative": "m4a-local-remux-v2",
+        "X-Veeb-Resolver-Path": "audio-derivative-edge",
+    }
+    return FileResponse(
+        path,
+        media_type="audio/mp4",
+        headers=headers,
+    )
