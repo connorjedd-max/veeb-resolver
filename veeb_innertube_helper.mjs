@@ -1,9 +1,6 @@
 import http from 'node:http';
 import { Player, UniversalCache, Platform } from 'youtubei.js';
 
-// youtubei.js 17.x ships no JS interpreter. Without this, every decipher()
-// call throws "you must provide your own JavaScript evaluator" and the entire
-// direct path silently collapses into the yt-dlp cold resolver.
 Platform.shim.eval = async (data) => new Function(data.output)();
 
 const HOST = process.env.VEEB_YOUTUBEJS_HOST || '127.0.0.1';
