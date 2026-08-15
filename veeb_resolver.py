@@ -2038,7 +2038,7 @@ def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
 def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger) -> dict[str, Any]:
     cookie_file = get_writable_cookie_file()
     opts: dict[str, Any] = {
-        "format": SOURCE_FORMAT,
+"format": f"{SOURCE_FORMAT}/bestaudio[ext=m4a]/bestaudio",
         "skip_download": True,
         "noplaylist": True,
         "quiet": True,
