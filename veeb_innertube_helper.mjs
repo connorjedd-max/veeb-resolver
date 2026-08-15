@@ -1,5 +1,10 @@
 import http from 'node:http';
-import { Player, UniversalCache } from 'youtubei.js';
+import { Player, UniversalCache, Platform } from 'youtubei.js';
+
+// youtubei.js 17.x ships no JS interpreter. Without this, every decipher()
+// call throws "you must provide your own JavaScript evaluator" and the entire
+// direct path silently collapses into the yt-dlp cold resolver.
+Platform.shim.eval = async (data) => new Function(data.output)();
 
 const HOST = process.env.VEEB_YOUTUBEJS_HOST || '127.0.0.1';
 const PORT = Number.parseInt(process.env.VEEB_YOUTUBEJS_PORT || '4417', 10);
@@ -145,8 +150,9 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, ready ? 200 : 503, {
         ok: ready,
         ready,
-        playerId: player?.player_id || null,
+playerId: player?.player_id || null,
         signatureTimestamp: player?.signature_timestamp || null,
+        evaluator: typeof Platform.shim.eval === 'function',
         lastError,
       });
       return;
