@@ -1,6 +1,7 @@
 import asyncio
 import importlib.metadata
 import hashlib
+import hmac
 import http.cookiejar
 import json
 import os
@@ -22,7 +23,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.15 YouTube.js", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.16 Background Spool", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -127,7 +128,18 @@ UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_UPSTREAM_
 UPSTREAM_READ_TIMEOUT_SECONDS = max(10.0, float(os.environ.get("VEEB_UPSTREAM_READ_TIMEOUT", "45")))
 PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", str(256 * 1024))))
 
+# Background-stable transport. The browser receives a track-scoped signed ticket
+# from the Worker and connects directly to this service. Separately, the resolver
+# drains the Google Video response into a bounded local cache so phone-side
+# throttling/backpressure cannot stall the upstream media fetch.
+STREAM_TICKET_MAX_SECONDS = max(3600, int(os.environ.get("VEEB_STREAM_TICKET_MAX_SECONDS", "21600")))
+MEDIA_CACHE_DIR = os.environ.get("VEEB_MEDIA_CACHE_DIR", "/tmp/veeb-media-cache")
+MEDIA_CACHE_MAX_BYTES = max(64 * 1024 * 1024, int(os.environ.get("VEEB_MEDIA_CACHE_MAX_BYTES", str(192 * 1024 * 1024))))
+MEDIA_CACHE_MAX_FILES = max(2, int(os.environ.get("VEEB_MEDIA_CACHE_MAX_FILES", "16")))
+MEDIA_CACHE_CHUNK_BYTES = max(128 * 1024, int(os.environ.get("VEEB_MEDIA_CACHE_CHUNK_BYTES", str(512 * 1024))))
+
 os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
+os.makedirs(MEDIA_CACHE_DIR, exist_ok=True)
 
 
 @dataclass
@@ -152,8 +164,20 @@ class ResolvedMedia:
         return time.time() < self.expires_at
 
 
+@dataclass
+class CachedMediaFile:
+    video_id: str
+    path: str
+    content_type: str
+    size: int
+    created_at: float
+    last_used_at: float
+
+
 _resolved_cache: dict[str, ResolvedMedia] = {}
 _resolve_tasks: dict[str, asyncio.Task[ResolvedMedia]] = {}
+_media_file_cache: dict[str, CachedMediaFile] = {}
+_media_cache_tasks: dict[str, asyncio.Task[None]] = {}
 _http_client: httpx.AsyncClient | None = None
 _fg_auth_pool = None
 _fg_pot_pool = None
@@ -187,6 +211,36 @@ def require_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=503, detail="RESOLVER_SECRET is not configured")
     if authorization != f"Bearer {RESOLVER_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_stream_auth(
+    video_id: str,
+    authorization: str | None,
+    exp: int | None,
+    sig: str | None,
+) -> None:
+    # Server-to-server callers may continue using the existing Bearer secret.
+    if authorization == f"Bearer {RESOLVER_SECRET}" and RESOLVER_SECRET:
+        return
+
+    if not RESOLVER_SECRET:
+        raise HTTPException(status_code=503, detail="RESOLVER_SECRET is not configured")
+    if exp is None or not sig:
+        raise HTTPException(status_code=401, detail="Missing playback ticket")
+
+    now = int(time.time())
+    if exp < now - 30 or exp > now + STREAM_TICKET_MAX_SECONDS:
+        raise HTTPException(status_code=401, detail="Expired playback ticket")
+
+    message = f"veeb-stream-v1:{video_id}:{exp}".encode("utf-8")
+    expected = hmac.new(
+        RESOLVER_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(str(sig), expected):
+        raise HTTPException(status_code=401, detail="Invalid playback ticket")
 
 
 def validate_video_id(video_id: str) -> str:
@@ -2097,11 +2151,14 @@ async def resolve_media_uncached(video_id: str, purpose: str) -> ResolvedMedia:
 
 
 def resolve_task_finished(video_id: str, task: asyncio.Task[ResolvedMedia]) -> None:
+    purpose = _resolve_task_purpose.get(video_id, "")
     if _resolve_tasks.get(video_id) is task:
         _resolve_tasks.pop(video_id, None)
         _resolve_task_purpose.pop(video_id, None)
     try:
-        task.result()
+        media = task.result()
+        if purpose == "live-intent":
+            start_media_cache_task(media)
     except asyncio.CancelledError:
         pass
     except Exception as exc:
@@ -2162,6 +2219,233 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
     return await asyncio.shield(task), "MISS"
 
 
+def cleanup_media_file_cache() -> None:
+    stale_ids = [
+        video_id for video_id, item in _media_file_cache.items()
+        if not os.path.isfile(item.path)
+    ]
+    for video_id in stale_ids:
+        _media_file_cache.pop(video_id, None)
+
+    items = sorted(_media_file_cache.values(), key=lambda item: item.last_used_at)
+    total = sum(max(0, item.size) for item in items)
+
+    while items and (len(items) > MEDIA_CACHE_MAX_FILES or total > MEDIA_CACHE_MAX_BYTES):
+        victim = items.pop(0)
+        if video_id_task_active(victim.video_id):
+            items.append(victim)
+            if all(video_id_task_active(item.video_id) for item in items):
+                break
+            continue
+        _media_file_cache.pop(victim.video_id, None)
+        total -= max(0, victim.size)
+        try:
+            os.remove(victim.path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print("media cache eviction failed", json.dumps({"videoId": victim.video_id, "error": str(exc)}), flush=True)
+
+
+def video_id_task_active(video_id: str) -> bool:
+    task = _media_cache_tasks.get(video_id)
+    return bool(task and not task.done())
+
+
+def get_cached_media_file(video_id: str) -> CachedMediaFile | None:
+    item = _media_file_cache.get(video_id)
+    if not item:
+        return None
+    if not os.path.isfile(item.path) or os.path.getsize(item.path) != item.size:
+        _media_file_cache.pop(video_id, None)
+        return None
+    item.last_used_at = time.time()
+    return item
+
+
+def media_cache_path(video_id: str) -> str:
+    return os.path.join(MEDIA_CACHE_DIR, f"{video_id}.media")
+
+
+def media_download_headers(media: ResolvedMedia) -> dict[str, str]:
+    blocked = {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding", "range"}
+    headers = {k: v for k, v in media.http_headers.items() if k.lower() not in blocked}
+    headers["Range"] = "bytes=0-"
+    headers["Accept-Encoding"] = "identity"
+    return headers
+
+
+async def populate_media_file_cache(media: ResolvedMedia) -> None:
+    if get_cached_media_file(media.video_id):
+        return
+
+    final_path = media_cache_path(media.video_id)
+    temp_path = final_path + f".part-{os.getpid()}-{int(time.time() * 1000)}"
+    response: httpx.Response | None = None
+
+    try:
+        client = get_http_client()
+        request = client.build_request("GET", media.url, headers=media_download_headers(media))
+        response = await client.send(request, stream=True)
+
+        if response.status_code not in {200, 206}:
+            print("media cache upstream rejected", json.dumps({
+                "videoId": media.video_id,
+                "status": response.status_code,
+                "resolverPath": media.resolver_path,
+            }), flush=True)
+            return
+
+        content_type = str(response.headers.get("content-type") or media.content_type or "video/mp4")
+        written = 0
+        with open(temp_path, "wb") as handle:
+            async for chunk in response.aiter_raw(MEDIA_CACHE_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                written += len(chunk)
+
+        if written <= 0:
+            return
+
+        os.replace(temp_path, final_path)
+        now = time.time()
+        _media_file_cache[media.video_id] = CachedMediaFile(
+            video_id=media.video_id,
+            path=final_path,
+            content_type=content_type,
+            size=written,
+            created_at=now,
+            last_used_at=now,
+        )
+        cleanup_media_file_cache()
+        print("media cache ready", json.dumps({
+            "videoId": media.video_id,
+            "bytes": written,
+            "resolverPath": media.resolver_path,
+        }), flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print("media cache fill failed", json.dumps({
+            "videoId": media.video_id,
+            "error": str(exc)[-1200:],
+        }), flush=True)
+    finally:
+        if response is not None:
+            await response.aclose()
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def media_cache_task_finished(video_id: str, task: asyncio.Task[None]) -> None:
+    if _media_cache_tasks.get(video_id) is task:
+        _media_cache_tasks.pop(video_id, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print("media cache task failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:]}), flush=True)
+
+
+def start_media_cache_task(media: ResolvedMedia) -> None:
+    if get_cached_media_file(media.video_id):
+        return
+    existing = _media_cache_tasks.get(media.video_id)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(populate_media_file_cache(media))
+    _media_cache_tasks[media.video_id] = task
+    task.add_done_callback(lambda done: media_cache_task_finished(media.video_id, done))
+
+
+def parse_byte_range(value: str | None, size: int) -> tuple[int, int, int]:
+    if not value:
+        return 0, size - 1, 200
+    if not value.lower().startswith("bytes=") or "," in value:
+        raise ValueError("unsupported range")
+
+    raw = value[6:].strip()
+    start_text, sep, end_text = raw.partition("-")
+    if not sep:
+        raise ValueError("invalid range")
+
+    if start_text:
+        start = int(start_text)
+        if start < 0 or start >= size:
+            raise ValueError("range start outside file")
+        end = size - 1 if not end_text else min(size - 1, int(end_text))
+        if end < start:
+            raise ValueError("range end before start")
+    else:
+        suffix = int(end_text)
+        if suffix <= 0:
+            raise ValueError("invalid suffix range")
+        suffix = min(size, suffix)
+        start = size - suffix
+        end = size - 1
+
+    return start, end, 206
+
+
+async def cached_file_body(path: str, start: int, end: int) -> AsyncIterator[bytes]:
+    remaining = end - start + 1
+    with open(path, "rb") as handle:
+        handle.seek(start)
+        while remaining > 0:
+            chunk = handle.read(min(MEDIA_CACHE_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+            await asyncio.sleep(0)
+
+
+def cached_media_response(request: Request, item: CachedMediaFile) -> Response | StreamingResponse:
+    try:
+        start, end, status = parse_byte_range(request.headers.get("range"), item.size)
+    except (TypeError, ValueError):
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{item.size}",
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "private, no-store",
+                "Access-Control-Allow-Origin": "*",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+            },
+        )
+
+    length = end - start + 1
+    headers = {
+        "Content-Type": item.content_type,
+        "Content-Length": str(length),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, X-Veeb-Media-Cache",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "X-Veeb-Media-Cache": "HIT",
+        "X-Veeb-Transport": "resolver-local-spool-v1",
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{item.size}"
+
+    item.last_used_at = time.time()
+    if request.method == "HEAD":
+        return Response(status_code=status, headers=headers)
+    return StreamingResponse(
+        cached_file_body(item.path, start, end),
+        status_code=status,
+        headers=headers,
+        media_type=item.content_type,
+    )
+
+
 def build_upstream_headers(media: ResolvedMedia, request: Request) -> dict[str, str]:
     blocked = {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding"}
     headers = {k: v for k, v in media.http_headers.items() if k.lower() not in blocked}
@@ -2188,6 +2472,11 @@ def build_downstream_headers(upstream: httpx.Response, media: ResolvedMedia, cac
     headers["X-Veeb-Source-Format"] = media.format_id or SOURCE_FORMAT
     headers["X-Veeb-Resolver-Path"] = media.resolver_path
     headers["X-Veeb-Direct-Proxy"] = "1"
+    headers["Access-Control-Allow-Origin"] = "*"
+    headers["Access-Control-Expose-Headers"] = "Accept-Ranges, Content-Length, Content-Range, X-Veeb-Media-Cache"
+    headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+    headers["X-Veeb-Media-Cache"] = "MISS"
+    headers["X-Veeb-Transport"] = "resolver-direct-spool-v1"
     return headers
 
 
@@ -2207,7 +2496,22 @@ async def open_media_upstream(media: ResolvedMedia, request: Request) -> httpx.R
 
 
 async def proxy_media(request: Request, video_id: str):
+    cached_file = get_cached_media_file(video_id)
+    if cached_file:
+        print("local media cache hit", json.dumps({
+            "videoId": video_id,
+            "range": request.headers.get("range"),
+            "bytes": cached_file.size,
+        }), flush=True)
+        return cached_media_response(request, cached_file)
+
     media, cache_state = await get_or_resolve(video_id, "live")
+
+    # A just-finished intent prefetch may have completed while resolution was
+    # being joined. Prefer the local file before opening another GVS socket.
+    cached_file = get_cached_media_file(video_id)
+    if cached_file:
+        return cached_media_response(request, cached_file)
     response = await open_media_upstream(media, request)
 
     # A direct Innertube URL can still be rejected at GVS even though the player
@@ -2243,6 +2547,11 @@ async def proxy_media(request: Request, video_id: str):
         await response.aclose()
         detail = body[:800].decode("utf-8", "replace") if body else ""
         raise HTTPException(status_code=502, detail=f"Upstream media server returned HTTP {status}" + (f": {detail}" if detail else ""))
+
+    # Decouple upstream progress from the phone. This detached task drains the
+    # same resolved media into bounded local storage even if the handset stops
+    # reading while locked. A later Range request can then resume locally.
+    start_media_cache_task(media)
 
     headers = build_downstream_headers(response, media, cache_state)
     print("direct media proxy open", json.dumps({
@@ -2316,7 +2625,7 @@ async def root_head() -> Response:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.15-youtubejs"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v36.16-background-spool"}
 
 
 @app.get("/health")
@@ -2330,7 +2639,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.15-youtubejs",
+        "version": "v36.16-background-spool",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -2352,7 +2661,10 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             if until > time.time()
         },
         "heavyPrefetch": HEAVY_PREFETCH,
-        "architecture": "direct-mweb-innertube-plus-persistent-youtubejs-decipher-plus-warm-bgutil-with-ytdlp-fallback",
+        "architecture": "direct-mweb-innertube-plus-persistent-youtubejs-decipher-plus-warm-bgutil-with-ytdlp-fallback-plus-native-ticketed-stream-plus-local-byte-spool",
+        "mediaCacheEntries": len(_media_file_cache),
+        "mediaCacheBytes": sum(item.size for item in _media_file_cache.values()),
+        "mediaCacheTasks": len([task for task in _media_cache_tasks.values() if not task.done()]),
     }
 
 
@@ -2362,7 +2674,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.15-youtubejs-resolver",
+        "provider": "veeb-v36.16-background-spool-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
@@ -2449,8 +2761,10 @@ async def prefetch_batch_endpoint(
 async def stream_endpoint(
     request: Request,
     video_id: str,
+    exp: int | None = Query(default=None),
+    sig: str | None = Query(default=None),
     authorization: str | None = Header(default=None),
 ):
-    require_auth(authorization)
     video_id = validate_video_id(video_id)
+    require_stream_auth(video_id, authorization, exp, sig)
     return await proxy_media(request, video_id)
