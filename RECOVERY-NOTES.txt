@@ -1,0 +1,11 @@
+V36.15 recovery package, 2026-08-15
+
+Application resolver source is unchanged.
+Recovered helper: exact veeb_innertube_helper.mjs supplied in files.zip.
+Docker-only recovery changes:
+- VEEB_MWEB_CLIENT_VERSION defaults to 2.20260708.05.00 to match MWEB_DIRECT_CONFIG.
+- POT provider is given the CPU first and up to 90 seconds to become ready.
+- YouTube.js helper starts after POT is ready and is given up to 60 seconds to warm.
+
+Do not set YOUTUBE_STREAM_FORMAT=140. Leave it unset for the resolver's default 18.
+Expected helper log includes: "evaluator":"node:vm".
