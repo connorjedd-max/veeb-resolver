@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: veeb-resolver
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: RESOLVER_SECRET
+        sync: false
