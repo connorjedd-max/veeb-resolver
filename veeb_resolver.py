@@ -31,7 +31,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.16.5 Session Mirror", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.16.6 Session Mirror", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -191,6 +191,9 @@ _mweb_bootstrap_lock = asyncio.Lock()
 _active_intent_video_id: str | None = None
 _youtubejs_ready = False
 _youtubejs_player_id: str | None = None
+_youtubejs_signature_timestamp: int | None = None
+_youtubejs_state_at: float = 0.0
+YOUTUBEJS_STATE_TTL_SECONDS = max(60, int(os.environ.get("VEEB_YOUTUBEJS_STATE_TTL", "900")))
 
 
 def require_auth(authorization: str | None) -> None:
@@ -845,8 +848,19 @@ def ytdlp_media_headers() -> dict[str, str]:
 
 
 def mweb_media_headers() -> dict[str, str]:
-    """Headers for googlevideo media, deliberately matching yt-dlp's media request."""
-    return ytdlp_media_headers()
+    """Googlevideo headers pinned to the same MWEB client used for /player.
+
+    A signed media URL is issued in the context of the MWEB request. Keep the
+    media User-Agent consistent with that client rather than borrowing yt-dlp's
+    unrelated process-wide desktop UA.
+    """
+    return {
+        "User-Agent": str(MWEB_DIRECT_CONFIG["userAgent"]),
+        "Accept": "*/*",
+        "Accept-Language": "en-us,en;q=0.5",
+        "Sec-Fetch-Mode": "navigate",
+        "Origin": "https://www.youtube.com",
+    }
 
 
 def mweb_context(visitor_data: str | None = None) -> dict[str, Any]:
@@ -1000,7 +1014,7 @@ async def fetch_watch_session_identity(video_id: str) -> dict[str, str | None]:
     if visitor:
         _visitor_data = visitor
     delegated, user_session = parse_data_sync_session(data_sync_id)
-    print("v36.16.5 watch session identity", json.dumps({
+    print("v36.16.6 watch session identity", json.dumps({
         "videoId": video_id,
         "status": response.status_code,
         "hasDataSyncId": bool(data_sync_id),
@@ -1119,7 +1133,7 @@ async def get_session_gvs_pot(binding: str | None = None) -> tuple[str, str]:
         _session_gvs_pot = token
         _session_gvs_pot_expires_at = expires_at
         _session_gvs_binding = binding
-        print("v36.16.5 session GVS POT cached", json.dumps({
+        print("v36.16.6 session GVS POT cached", json.dumps({
             "expiresInSeconds": max(0, round(expires_at - time.time())),
             "bindingLength": len(binding),
         }), flush=True)
@@ -1362,6 +1376,21 @@ async def fetch_mweb_player_bootstrap(video_id: str) -> dict[str, Any]:
     return result
 
 
+def cache_youtubejs_player_state(payload: dict[str, Any]) -> tuple[str | None, int | None]:
+    global _youtubejs_ready, _youtubejs_player_id, _youtubejs_signature_timestamp, _youtubejs_state_at
+    ready = bool(payload.get("ready"))
+    player_id = payload.get("playerId") if isinstance(payload.get("playerId"), str) else None
+    sts_raw = payload.get("signatureTimestamp")
+    sts = int(sts_raw) if isinstance(sts_raw, int) and sts_raw > 0 else None
+    _youtubejs_ready = ready
+    if player_id:
+        _youtubejs_player_id = player_id
+    if sts:
+        _youtubejs_signature_timestamp = sts
+    _youtubejs_state_at = time.time()
+    return _youtubejs_player_id, _youtubejs_signature_timestamp
+
+
 async def ensure_youtubejs_helper_ready() -> dict[str, Any]:
     """Verify that the persistent YouTube.js player-decipher helper is warm."""
     started = time.monotonic()
@@ -1375,6 +1404,7 @@ async def ensure_youtubejs_helper_ready() -> dict[str, Any]:
     payload = response.json()
     if not payload.get("ready"):
         raise RuntimeError("YouTube.js helper is not ready")
+    cache_youtubejs_player_state(payload)
     print("v36.15 YouTube.js helper ready", json.dumps({
         "playerId": payload.get("playerId"),
         "signatureTimestamp": payload.get("signatureTimestamp"),
@@ -1383,7 +1413,27 @@ async def ensure_youtubejs_helper_ready() -> dict[str, Any]:
     return payload
 
 
-async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> str:
+async def get_youtubejs_player_state(force: bool = False) -> tuple[str | None, int | None]:
+    """Return the exact player id + STS the helper will use to decipher."""
+    if (
+        not force
+        and _youtubejs_ready
+        and _youtubejs_player_id
+        and _youtubejs_signature_timestamp
+        and (time.time() - _youtubejs_state_at) < YOUTUBEJS_STATE_TTL_SECONDS
+    ):
+        return _youtubejs_player_id, _youtubejs_signature_timestamp
+
+    payload = await ensure_youtubejs_helper_ready()
+    return cache_youtubejs_player_state(payload)
+
+
+async def youtubejs_decipher_format_url(
+    video_id: str,
+    fmt: dict[str, Any],
+    player_id: str | None = None,
+    signature_timestamp: int | None = None,
+) -> str:
     """Decipher one Innertube format through the persistent YouTube.js Player.
 
     YouTube.js extracts and caches the active player's signature and nsig logic.
@@ -1405,6 +1455,7 @@ async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> s
             "url": direct_url,
             "signatureCipher": signature_cipher,
             "cipher": cipher,
+            "playerId": player_id,
             "clientName": str(MWEB_DIRECT_CONFIG["clientName"]),
             "clientVersion": str(MWEB_DIRECT_CONFIG["clientVersion"]),
         },
@@ -1421,6 +1472,17 @@ async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> s
     if not isinstance(media_url, str) or not media_url.startswith("http"):
         raise RuntimeError("YouTube.js helper returned no media URL")
 
+    returned_player_id = payload.get("playerId") if isinstance(payload.get("playerId"), str) else None
+    returned_sts = payload.get("signatureTimestamp") if isinstance(payload.get("signatureTimestamp"), int) else None
+    if player_id and returned_player_id and returned_player_id != player_id:
+        raise RuntimeError(
+            f"YouTube.js decipher player mismatch: requested {player_id}, got {returned_player_id}"
+        )
+    if signature_timestamp and returned_sts and returned_sts != signature_timestamp:
+        raise RuntimeError(
+            f"YouTube.js decipher STS mismatch: requested {signature_timestamp}, got {returned_sts}"
+        )
+
     global _youtubejs_ready, _youtubejs_player_id
     _youtubejs_ready = True
     if isinstance(payload.get("playerId"), str):
@@ -1429,6 +1491,9 @@ async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> s
         "videoId": video_id,
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "playerId": payload.get("playerId"),
+        "signatureTimestamp": payload.get("signatureTimestamp"),
+        "requestedPlayerId": player_id,
+        "requestedSignatureTimestamp": signature_timestamp,
         "helperElapsedMs": payload.get("elapsedMs"),
         "client": payload.get("client"),
         "clientVersion": payload.get("clientVersion"),
@@ -1471,7 +1536,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     started = time.monotonic()
     client = get_http_client()
 
-    # V36.16.5 mirrors yt-dlp's cheap webpage phase first. The fallback extractor
+    # V36.16.6 mirrors yt-dlp's cheap webpage phase first. The fallback extractor
     # reaches POT generation only after this webpage phase and its successful GVS
     # token is Data Sync-bound. Recover just that identity without running yt-dlp.
     session_identity: dict[str, str | None] = {"dataSyncId": _data_sync_id, "visitorData": _visitor_data}
@@ -1479,7 +1544,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         try:
             session_identity = await fetch_watch_session_identity(video_id)
         except Exception as exc:
-            print("v36.16.5 watch session identity unavailable", json.dumps({
+            print("v36.16.6 watch session identity unavailable", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1000:],
             }), flush=True)
@@ -1487,18 +1552,26 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     bootstrap_visitor = session_identity.get("visitorData") or _visitor_data
     context = mweb_context(bootstrap_visitor)
 
+    # V36.16.6: pin the Innertube /player response to the same player build
+    # YouTube.js will use for sig/nsig decipher. yt-dlp does the same by
+    # supplying the active player's signatureTimestamp in playbackContext.
+    helper_player_id, helper_sts = await get_youtubejs_player_state()
+
     async def call_plain_player() -> tuple[dict[str, Any], dict[str, Any]]:
         global _visitor_data
+        content_playback_context: dict[str, Any] = {
+            "html5Preference": "HTML5_PREF_WANTS",
+        }
+        if helper_sts:
+            content_playback_context["signatureTimestamp"] = helper_sts
+
         payload: dict[str, Any] = {
             "context": context,
             "videoId": video_id,
             "contentCheckOk": True,
             "racyCheckOk": True,
             "playbackContext": {
-                "contentPlaybackContext": {
-                    "html5Preference": "HTML5_PREF_WANTS",
-                },
-                "adPlaybackContext": {"pyv": True},
+                "contentPlaybackContext": content_playback_context,
             },
         }
         t0 = time.monotonic()
@@ -1542,11 +1615,13 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
             "urlMode": "direct" if isinstance(fmt.get("url"), str) else "cipher",
             "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
+            "playerId": helper_player_id,
+            "signatureTimestamp": helper_sts,
             "elapsedSeconds": round(time.monotonic() - t0, 3),
         }), flush=True)
         return data, fmt
 
-    # V36.16.5: mirror yt-dlp webpage identity first, then make the authenticated /player call. yt-dlp learns
+    # V36.16.6: mirror yt-dlp webpage identity first, then make the authenticated /player call. yt-dlp learns
     # dataSyncId from Innertube responseContext; the old V36.16.3 attempted an
     # unnecessary HTML bootstrap request first, and that request now returns 400.
     _data, fmt = await call_plain_player()
@@ -1554,12 +1629,16 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
 
     # Decipher and the very cheap GVS mint can run together once /player has
     # supplied the exact account/session binding.
-    decipher_task = asyncio.create_task(youtubejs_decipher_format_url(video_id, fmt))
+    decipher_task = asyncio.create_task(
+        youtubejs_decipher_format_url(
+            video_id, fmt, helper_player_id, helper_sts
+        )
+    )
     session_pot_task: asyncio.Task[tuple[str, str]] | None = None
     if data_sync_id:
         session_pot_task = asyncio.create_task(get_session_gvs_pot(data_sync_id))
     else:
-        print("v36.16.5 no Data Sync ID available after watch/player", json.dumps({
+        print("v36.16.6 no Data Sync ID available after watch/player", json.dumps({
             "videoId": video_id,
         }), flush=True)
 
@@ -1569,7 +1648,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     # Remove only that raw query pair; do not parse/re-encode the signed URL.
     base_url = remove_raw_query_param(base_url, "cver")
     if decipher_shape.get("clientVersion") is not None:
-        print("v36.16.5 removed helper cver to mirror yt-dlp", json.dumps({
+        print("v36.16.6 removed helper cver to mirror yt-dlp", json.dumps({
             "videoId": video_id,
             "previousClientVersion": decipher_shape.get("clientVersion"),
             "sparamsHasCver": decipher_shape.get("sparamsHasCver"),
@@ -1580,7 +1659,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         try:
             session_token, data_sync_id = await session_pot_task
         except Exception as exc:
-            print("v36.16.5 session GVS token unavailable; using video-bound fallback", json.dumps({
+            print("v36.16.6 session GVS token unavailable; using video-bound fallback", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1000:],
             }), flush=True)
@@ -1588,7 +1667,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
     # First choice: the reusable authenticated session/Data Sync GVS token.
     if session_token and data_sync_id:
         media_url = append_query_param(base_url, "pot", session_token)
-        print("v36.16.5 direct GVS candidate", json.dumps({
+        print("v36.16.6 direct GVS candidate", json.dumps({
             "videoId": video_id,
             "binding": "datasync",
             "urlShape": safe_media_url_shape(media_url),
@@ -1598,9 +1677,9 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 media_url,
                 mweb_media_headers(),
                 video_id,
-                "v36.16.5-youtubejs-session-gvs",
+                "v36.16.6-youtubejs-session-gvs",
             )
-            print("v36.16.5 session-bound GVS probe won", json.dumps({
+            print("v36.16.6 session-bound GVS probe won", json.dumps({
                 "videoId": video_id,
                 "binding": "datasync",
             }), flush=True)
@@ -1608,7 +1687,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         except Exception as session_exc:
             # YouTube can experiment with video-ID-bound GVS tokens. Preserve that
             # as a very cheap second direct attempt before falling back to yt-dlp.
-            print("v36.16.5 session-bound GVS probe failed", json.dumps({
+            print("v36.16.6 session-bound GVS probe failed", json.dumps({
                 "videoId": video_id,
                 "error": str(session_exc)[-1000:],
             }), flush=True)
@@ -1618,7 +1697,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             if returned_binding and returned_binding != video_id:
                 raise RuntimeError("bgutil returned unexpected video binding")
             media_url = append_query_param(base_url, "pot", video_token)
-            print("v36.16.5 direct GVS candidate", json.dumps({
+            print("v36.16.6 direct GVS candidate", json.dumps({
                 "videoId": video_id,
                 "binding": "video-fallback",
                 "urlShape": safe_media_url_shape(media_url),
@@ -1627,7 +1706,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 media_url,
                 mweb_media_headers(),
                 video_id,
-                "v36.16.5-youtubejs-video-gvs",
+                "v36.16.6-youtubejs-video-gvs",
             )
     else:
         video_token, returned_binding, expires_at = await get_bgutil_pot(
@@ -1636,7 +1715,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         if returned_binding and returned_binding != video_id:
             raise RuntimeError("bgutil returned unexpected video binding")
         media_url = append_query_param(base_url, "pot", video_token)
-        print("v36.16.5 direct GVS candidate", json.dumps({
+        print("v36.16.6 direct GVS candidate", json.dumps({
             "videoId": video_id,
             "binding": "video-only",
             "urlShape": safe_media_url_shape(media_url),
@@ -1645,17 +1724,17 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
             media_url,
             mweb_media_headers(),
             video_id,
-            "v36.16.5-youtubejs-video-gvs",
+            "v36.16.6-youtubejs-video-gvs",
         )
     media = resolved_from_direct_format(
         video_id,
         media_url,
         fmt,
         "mweb",
-        "mweb-innertube-youtubejs-v36.16.5",
+        "mweb-innertube-youtubejs-v36.16.6",
         details=(_data.get("videoDetails") or {}),
     )
-    print("v36.16.5 direct mweb resolve success", json.dumps({
+    print("v36.16.6 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "playerCandidate": "plain",
         "proofCandidate": "datasync" if session_token and data_sync_id else "video",
@@ -2306,7 +2385,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16.5 direct head-start failed", json.dumps({
+            print("v36.16.6 direct head-start failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2340,7 +2419,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
     for done in asyncio.as_completed(tasks):
         try:
             winner = await done
-            print("v36.16.5 cold race won", json.dumps({
+            print("v36.16.6 cold race won", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
@@ -2357,7 +2436,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16.5 cold race path failed", json.dumps({
+            print("v36.16.6 cold race path failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2579,7 +2658,7 @@ async def startup_session() -> None:
     # standalone EJS decipher engine. The hot path uses a persistent YouTube.js
     # Player helper that is already warm before Uvicorn starts.
     init_ytdlp_pools()
-    global _session_gvs_task, _youtubejs_ready, _youtubejs_player_id
+    global _session_gvs_task, _youtubejs_ready, _youtubejs_player_id, _youtubejs_signature_timestamp, _youtubejs_state_at
     _session_gvs_task = None
     helper_result, _warm_result = await asyncio.gather(
         ensure_youtubejs_helper_ready(),
@@ -2595,6 +2674,9 @@ async def startup_session() -> None:
         helper_state = helper_result
     _youtubejs_ready = bool(helper_state.get("ready"))
     _youtubejs_player_id = helper_state.get("playerId") if isinstance(helper_state.get("playerId"), str) else None
+    sts_raw = helper_state.get("signatureTimestamp")
+    _youtubejs_signature_timestamp = int(sts_raw) if isinstance(sts_raw, int) and sts_raw > 0 else None
+    _youtubejs_state_at = time.time() if helper_state else 0.0
     print("v36.15 resolver stack warm", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "foregroundAuthEngines": YTDLP_FG_AUTH_ENGINES,
@@ -2603,6 +2685,7 @@ async def startup_session() -> None:
         "potHttpReady": pot_http_server_ready(),
         "youtubejsReady": bool(helper_state.get("ready")),
         "youtubejsPlayerId": helper_state.get("playerId"),
+        "youtubejsSignatureTimestamp": helper_state.get("signatureTimestamp"),
         "sessionGvsReady": bool(_session_gvs_pot),
         "dataSyncReady": bool(_data_sync_id),
     }), flush=True)

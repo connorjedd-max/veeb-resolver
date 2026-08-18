@@ -1,39 +1,60 @@
-# Veeb Render Resolver V36.16.5 - session mirror
+# Veeb Render Resolver V36.16.6 - STS / player pin parity test
 
-This build is based on V36.16.4 and leaves the Render/Docker startup and the YouTube.js evaluator unchanged.
+This build is deliberately conservative. It keeps the complete V36.16.5 resolver,
+yt-dlp fallback, bgutil, cookies, itag 18, Render startup and YouTube.js helper.
+It does **not** delete the fallback ladder.
 
-## Why this revision exists
+## What changed
 
-The V36.16.4 Render log finally showed the same playable track through both paths:
+1. The direct MWEB `/player` request now includes the `signatureTimestamp` (STS)
+   reported by the exact YouTube.js player helper that will decipher the URL.
+2. The same helper `playerId` is explicitly sent back to `/decipher`, pinning both
+   sides to the same player build.
+3. The resolver verifies that the helper actually returned the requested player ID
+   and STS. A mismatch becomes an explicit diagnostic instead of a mysterious GVS 403.
+4. `adPlaybackContext: {pyv: true}` was removed from the direct MWEB request.
+5. Google Video probe/proxy headers now use the same MWEB iPad/Safari User-Agent as
+   the `/player` request, rather than yt-dlp's unrelated desktop process UA.
+6. Startup logs now include `youtubejsSignatureTimestamp`.
 
-- direct YouTube.js path: same googlevideo host, POT length 124, `cver` present, HTTP 403
-- yt-dlp winning path: same googlevideo host, POT length 140, no `cver`, HTTP 200/206
+## Why
 
-For `HJstyRBLqBQ`, the query-key sets were otherwise effectively identical. This makes session binding and URL/header parity the highest-value differences to close.
+V36.16.5 requested a cipher without STS and later deciphered it using an independently
+loaded YouTube.js player. Current yt-dlp pins the player API request to the active
+player's STS. If those player builds disagree, a URL can look structurally correct and
+still be rejected by GVS with HTTP 403.
 
-## Changes
+## Expected log on a useful test track
 
-1. Adds a lightweight authenticated YouTube watch-page identity fetch before the direct MWEB `/player` call. It extracts only `DATASYNC_ID` and visitor data. It does not run yt-dlp, fetch player JS, or solve challenges.
-2. Uses that Data Sync ID for the reusable bgutil GVS token, matching yt-dlp's authenticated GVS binding model.
-3. Uses the Data Sync ID and visitor data in the direct `/player` auth/context too.
-4. Removes only the raw `cver` query pair after YouTube.js decipher, because the successful yt-dlp URL for the same track has `c=MWEB` but no `cver`.
-5. Uses yt-dlp's process-wide `std_headers` for direct googlevideo probes and direct media proxying, matching the successful fallback header shape (`accept`, `accept-language`, `sec-fetch-mode`, `user-agent`).
-6. Adds safe diagnostics for `n`/`sig` lengths and whether `cver` appears in `sparams` or `lsparams`. No signed URL or PO token is logged.
-
-## Expected fast-path log
-
-A successful test should look roughly like:
+Look for the same values on both lines:
 
 ```
-v36.16.5 watch session identity {"hasDataSyncId":true,...}
-v36.15 mweb player candidate ready ...
-v36.15 YouTube.js decipher success ...
-v36.16.5 removed helper cver to mirror yt-dlp ...
-v36.15 POT ready {"bindingType":"gvs-session-watch",...}
-v36.16.5 session GVS POT cached ...
-v36.16.5 direct GVS candidate {"binding":"datasync","urlShape":{"potLength":140,"clientVersion":null,...}}
-v36.15 media probe success {"label":"v36.16.5-youtubejs-session-gvs",...}
-v36.16.5 direct mweb resolve success ...
+v36.15 mweb player candidate ready {...
+  "playerId":"...",
+  "signatureTimestamp":2067x
+}
+
+v36.15 YouTube.js decipher success {...
+  "playerId":"...",
+  "signatureTimestamp":2067x,
+  "requestedPlayerId":"...",
+  "requestedSignatureTimestamp":2067x
+}
 ```
 
-If the direct probe still returns 403, compare its `urlShape` with the logged yt-dlp winning `urlShape`, especially `potLength`, `nLength`, `sigLength`, `sparamsHasCver`, and query keys.
+Then the decisive line is either:
+
+```
+v36.15 media probe success
+v36.16.6 direct mweb resolve success
+```
+
+or another direct GVS 403.
+
+If it still returns 403 with the player ID and STS matching, keep this build and inspect
+the remaining GVS POT/session-binding difference. Do not remove yt-dlp yet.
+
+## Validation
+
+- `python3 -m py_compile veeb_resolver.py`
+- `node --check veeb_innertube_helper.mjs`
