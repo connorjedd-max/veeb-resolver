@@ -1,3 +1,27 @@
+# Veeb Render Resolver V36.16 direct repair
+
+This build is based on the recovered V36.15 Node-VM resolver. It keeps the working bgutil + persistent YouTube.js architecture and repairs the direct path:
+
+- re-stamps only the raw `c` / `cver` fields on deciphered Google Video URLs so they match the MWEB `/player` request without re-encoding the signed URL;
+- passes the Python MWEB client version into the helper as the single source of truth;
+- adds `GET /selftest` to verify the Node VM evaluator and warm Player are alive;
+- removes the known-dead generic direct race from live cold resolution;
+- defaults the direct head-start to 1.5s and starts yt-dlp immediately on a real direct-path failure;
+- makes speculative prefetch use the same mweb + POT + YouTube.js path instead of the old always-missing generic direct path.
+
+Expected fast-path log sequence:
+
+```text
+youtubejs-mweb-url-restamped ... clientVersion=2.20260708.05.00
+v36.16 media probe success ...
+v36.16 direct mweb resolve success ...
+v36.16 cold direct won ...
+```
+
+If `v36.16-youtubejs-video Google Video probe returned HTTP 403` remains, the cver mismatch was not the only GVS rejection and the new logs will make that explicit while yt-dlp falls back immediately instead of waiting.
+
+---
+
 # Veeb Render Resolver V36.15. YouTube.js decipher path
 
 Deploy this **entire folder as a Docker service**. Do not copy only `veeb_resolver.py`.

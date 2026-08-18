@@ -22,7 +22,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.15 YouTube.js", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V36.16 Direct Repair", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -94,9 +94,10 @@ DIRECT_CLIENTS: dict[str, dict[str, Any]] = {
         "supportsCookies": True,
     },
 }
+MWEB_CLIENT_VERSION = os.environ.get("VEEB_MWEB_CLIENT_VERSION", "2.20260708.05.00").strip() or "2.20260708.05.00"
 MWEB_DIRECT_CONFIG: dict[str, Any] = {
     "clientName": "MWEB",
-    "clientVersion": "2.20260708.05.00",
+    "clientVersion": MWEB_CLIENT_VERSION,
     "userAgent": "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)",
     "hl": "en",
 }
@@ -1212,6 +1213,8 @@ async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> s
             "url": direct_url,
             "signatureCipher": signature_cipher,
             "cipher": cipher,
+            "clientName": str(MWEB_DIRECT_CONFIG["clientName"]),
+            "clientVersion": str(MWEB_DIRECT_CONFIG["clientVersion"]),
         },
         timeout=YOUTUBEJS_DECIPHER_TIMEOUT_SECONDS,
     )
@@ -1235,6 +1238,10 @@ async def youtubejs_decipher_format_url(video_id: str, fmt: dict[str, Any]) -> s
         "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
         "playerId": payload.get("playerId"),
         "helperElapsedMs": payload.get("elapsedMs"),
+        "client": payload.get("client"),
+        "clientVersion": payload.get("clientVersion"),
+        "previousClientVersion": payload.get("previousClientVersion"),
+        "cverRestamped": bool(payload.get("cverRestamped")),
         "elapsedSeconds": round(time.monotonic() - started, 3),
     }), flush=True)
     return media_url
@@ -1359,17 +1366,17 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         media_url,
         mweb_headers(),
         video_id,
-        "v36.15-youtubejs-video",
+        "v36.16-youtubejs-video",
     )
     media = resolved_from_direct_format(
         video_id,
         media_url,
         fmt,
         "mweb",
-        "mweb-innertube-youtubejs-v36.15",
+        "mweb-innertube-youtubejs-v36.16",
         details=(_data.get("videoDetails") or {}),
     )
-    print("v36.15 direct mweb resolve success", json.dumps({
+    print("v36.16 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "playerCandidate": "plain",
         "proofCandidate": "video",
@@ -1981,97 +1988,118 @@ async def resolve_ytdlp_foreground_v35(video_id: str, purpose: str) -> ResolvedM
 
 
 async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
-    """V36 true cold path.
+    """V36.16 cold path: verified mweb direct first, yt-dlp only as fallback.
 
-    Start two cheap direct HTTP strategies immediately. Give the purpose-built
-    mweb+bgutil resolver a short head start. If it has not produced verified
-    media quickly, start the proven in-process yt-dlp mweb fallback without
-    cancelling the direct work. First verified media wins.
+    The generic direct client race was a permanent loser on Render and only added
+    requests/noise. Give the actual mweb + POT + YouTube.js path a short head
+    start. If it fails, start yt-dlp immediately. If it is merely slow, keep it
+    alive while yt-dlp starts and let the first verified media URL win.
     """
     init_ytdlp_pools()
     started = time.monotonic()
-    generic_direct = asyncio.create_task(resolve_direct_fast(video_id, purpose + "-direct"))
-    direct_pot = asyncio.create_task(resolve_direct_mweb_pot(video_id, purpose + "-mweb-direct-pot"))
+    direct_pot = asyncio.create_task(
+        resolve_direct_mweb_pot(video_id, purpose + "-mweb-direct-pot")
+    )
     errors: list[str] = []
 
-    # Give the real direct POT/cipher path an actual head start. A failure from
-    # the cheap direct probe must NOT end this window early.
-    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "3.5")))
-    deadline = time.monotonic() + head_start
-    head_tasks = {generic_direct, direct_pot}
-    while head_tasks and time.monotonic() < deadline:
-        timeout = max(0.0, deadline - time.monotonic())
-        done, pending = await asyncio.wait(head_tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            break
-        for task in done:
-            head_tasks.discard(task)
-            try:
-                winner = task.result()
-                print("v36 cold direct won", json.dumps({
-                    "videoId": video_id,
-                    "client": winner.client,
-                    "resolverPath": winner.resolver_path,
-                    "elapsedSeconds": round(time.monotonic() - started, 3),
-                }), flush=True)
-                for pending_task in (generic_direct, direct_pot):
-                    if pending_task is not task and not pending_task.done():
-                        pending_task.cancel()
-                return winner
-            except Exception as exc:
-                errors.append(str(exc))
-                print("v36.15 direct head-start path failed", json.dumps({
-                    "videoId": video_id,
-                    "path": "generic-direct" if task is generic_direct else "direct-pot",
-                    "error": str(exc)[-1200:],
-                    "elapsedSeconds": round(time.monotonic() - started, 3),
-                }), flush=True)
-        # If the real direct path failed, there is no reason to hold the fallback.
-        if direct_pot.done():
-            break
+    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "1.5")))
+    if head_start > 0:
+        try:
+            winner = await asyncio.wait_for(asyncio.shield(direct_pot), timeout=head_start)
+            print("v36.16 cold direct won", json.dumps({
+                "videoId": video_id,
+                "client": winner.client,
+                "resolverPath": winner.resolver_path,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+            return winner
+        except asyncio.TimeoutError:
+            print("v36.16 direct head-start expired", json.dumps({
+                "videoId": video_id,
+                "headStartSeconds": head_start,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+        except asyncio.CancelledError:
+            direct_pot.cancel()
+            raise
+        except Exception as exc:
+            errors.append(str(exc))
+            print("v36.16 direct head-start failed", json.dumps({
+                "videoId": video_id,
+                "error": str(exc)[-1600:],
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
 
+    # Close the tiny race where the direct task finishes just after the
+    # head-start timeout but before the fallback task is created.
+    if direct_pot.done():
+        try:
+            winner = direct_pot.result()
+            print("v36.16 cold direct won after head-start", json.dumps({
+                "videoId": video_id,
+                "client": winner.client,
+                "resolverPath": winner.resolver_path,
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+            return winner
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if str(exc) not in errors:
+                errors.append(str(exc))
+
+    # A real direct failure should never make the user wait out an arbitrary
+    # head-start window. Start the known-working fallback immediately.
     fallback = asyncio.create_task(resolve_ytdlp_foreground_v35(video_id, purpose))
-    tasks = {generic_direct, direct_pot, fallback}
+    tasks = {fallback}
+    if not direct_pot.done():
+        tasks.add(direct_pot)
+
     for done in asyncio.as_completed(tasks):
         try:
             winner = await done
-            print("v36 cold race won", json.dumps({
+            print("v36.16 cold race won", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }), flush=True)
             for task in tasks:
-                if task.done():
-                    continue
-                task.cancel()
-                task.add_done_callback(
-                    lambda finished, label="v36-loser": _consume_background_task(finished, label, video_id)
-                )
+                if not task.done():
+                    task.cancel()
+                    task.add_done_callback(
+                        lambda finished, label="v36.16-loser": _consume_background_task(finished, label, video_id)
+                    )
             return winner
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.15 cold race path failed", json.dumps({"videoId": video_id, "error": str(exc)[-1200:], "elapsedSeconds": round(time.monotonic() - started, 3)}), flush=True)
-    raise RuntimeError("all V36.3 cold resolver paths failed: " + " || ".join(errors)[-2600:])
+            print("v36.16 cold race path failed", json.dumps({
+                "videoId": video_id,
+                "error": str(exc)[-1600:],
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }), flush=True)
+
+    raise RuntimeError("all V36.16 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
 async def resolve_prefetch_v35(video_id: str, purpose: str) -> ResolvedMedia:
-    """Keep speculation cheap so it cannot steal CPU from a true cold playback.
+    """Warm the same direct path real playback uses.
 
-    By default a prefetch only attempts the sub-second direct Innertube path.
-    Set VEEB_HEAVY_PREFETCH=true only if the host has enough CPU for background
-    yt-dlp challenge work without hurting foreground latency.
+    V36.15 prefetch called resolve_direct_fast(), which was a permanent miss on
+    Render. That meant a successful 202 from /prefetch often warmed nothing.
+    V36.16 uses mweb + POT + persistent YouTube.js instead. Heavy yt-dlp
+    speculation remains opt-in.
     """
     init_ytdlp_pools()
     fast_started = time.monotonic()
     try:
-        return await resolve_direct_fast(video_id, purpose)
+        return await resolve_direct_mweb_pot(video_id, purpose + "-mweb-direct-pot")
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        print("direct innertube fast path missed", json.dumps({
+        print("v36.16 direct prefetch missed", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "elapsedSeconds": round(time.monotonic() - fast_started, 3),
@@ -2079,7 +2107,7 @@ async def resolve_prefetch_v35(video_id: str, purpose: str) -> ResolvedMedia:
             "heavyPrefetch": HEAVY_PREFETCH,
         }), flush=True)
         if not HEAVY_PREFETCH:
-            raise RuntimeError("cheap prefetch fast path unavailable; heavy prefetch disabled") from exc
+            raise RuntimeError("direct mweb prefetch unavailable; heavy prefetch disabled") from exc
     return await _prefetch_pool.resolve(video_id, purpose + "-prefetch")
 
 
@@ -2228,7 +2256,7 @@ async def proxy_media(request: Request, video_id: str):
             "mweb-bgutil-direct-v36",
             "mweb-adaptive-gvs-direct-v36.2",
             "mweb-resilient-direct-v36.3",
-            "mweb-innertube-youtubejs-v36.15",
+            "mweb-innertube-youtubejs-v36.16",
         }:
             media = await resolve_ytdlp_foreground_v35(video_id, "live-gvs-fallback")
             _resolved_cache[video_id] = media
@@ -2352,7 +2380,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             if until > time.time()
         },
         "heavyPrefetch": HEAVY_PREFETCH,
-        "architecture": "direct-mweb-innertube-plus-persistent-youtubejs-decipher-plus-warm-bgutil-with-ytdlp-fallback",
+        "architecture": "v36.16-restamped-mweb-direct-plus-warm-bgutil-with-ytdlp-fallback",
     }
 
 
