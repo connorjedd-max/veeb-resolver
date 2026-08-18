@@ -893,10 +893,14 @@ async def fetch_data_sync_id() -> str:
     if response.status_code != 200:
         raise RuntimeError(f"YouTube session bootstrap returned HTTP {response.status_code}")
     text = response.text
+    # Keep these patterns deliberately simple. The previous dormant helper had
+    # malformed character classes (``[^"\]+``), which only surfaced once the
+    # session-GVS path was activated. These variants cover normal and JSON-escaped
+    # ytcfg without attempting to parse the entire page.
     patterns = (
-        r'"DATASYNC_ID"\s*:\s*"([^"\]+)"',
-        r'"datasyncId"\s*:\s*"([^"\]+)"',
-        r'DATASYNC_ID\\?"\s*:\s*\\?"([^"\]+)',
+        r'"DATASYNC_ID"\s*:\s*"([^"]+)"',
+        r'"datasyncId"\s*:\s*"([^"]+)"',
+        r'DATASYNC_ID\\?"\s*:\s*\\?"([^"\\]+)',
     )
     value = None
     for pattern in patterns:
@@ -905,7 +909,16 @@ async def fetch_data_sync_id() -> str:
             value = match.group(1).replace("\\u003d", "=").replace("\\/", "/")
             break
     if not value:
-        raise RuntimeError("authenticated YouTube page did not expose DATASYNC_ID")
+        # Some YouTube layouts omit DATASYNC_ID from the homepage but expose it
+        # in the watch-page ytcfg. Reuse the existing lightweight bootstrap parser
+        # rather than giving up and silently falling back to the wrong GVS binding.
+        try:
+            await fetch_mweb_player_bootstrap(BGUTIL_WARM_VIDEO_ID)
+            value = _data_sync_id
+        except Exception:
+            value = None
+    if not value:
+        raise RuntimeError("authenticated YouTube session did not expose DATASYNC_ID")
     _data_sync_id = value
     print("v36.1 Data Sync ID ready", json.dumps({
         "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -1338,45 +1351,155 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         }), flush=True)
         return data, fmt
 
-    player_task = asyncio.create_task(call_plain_player())
-    pot_task = asyncio.create_task(get_bgutil_pot(video_id, context, "gvs-video-candidate"))
+    # IMPORTANT: this resolver runs with authenticated YouTube cookies. Current
+    # yt-dlp WebPO semantics bind an authenticated MWEB GVS token to the account
+    # Data Sync ID unless YouTube explicitly opts the session into the video-ID
+    # binding experiment. The old fast path always bound the token to video_id,
+    # which produced a correctly deciphered URL that GVS still rejected with 403.
+    #
+    # Warm/cache the session-bound token once and reuse it across tracks. This also
+    # mirrors the successful yt-dlp fallback visible in Render logs, where bgutil
+    # is asked for a binding such as "1159...||" rather than the video ID.
+    session_pot_task = asyncio.create_task(get_session_gvs_pot())
 
     try:
-        _data, fmt = await player_task
-    except BaseException:
-        if not pot_task.done():
-            pot_task.cancel()
-        raise
-    decipher_task = asyncio.create_task(youtubejs_decipher_format_url(video_id, fmt))
+        session_token, data_sync_id = await session_pot_task
+    except Exception as exc:
+        print("v36.16.3 session GVS token unavailable; using video-bound fallback", json.dumps({
+            "videoId": video_id,
+            "error": str(exc)[-1000:],
+        }), flush=True)
+        session_token = None
+        data_sync_id = None
 
-    try:
-        base_url, pot_result = await asyncio.gather(decipher_task, pot_task)
-    except Exception:
-        for task in (decipher_task, pot_task):
-            if not task.done():
-                task.cancel()
-        raise
+    # Use the same authenticated Data Sync identity on the /player request when
+    # available, so the player response, GVS token and subsequent media request
+    # all belong to the same session context.
+    async def call_bound_player() -> tuple[dict[str, Any], dict[str, Any]]:
+        global _visitor_data
+        payload: dict[str, Any] = {
+            "context": context,
+            "videoId": video_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS",
+                },
+                "adPlaybackContext": {"pyv": True},
+            },
+        }
+        t0 = time.monotonic()
+        response = await client.post(
+            INNERTUBE_PLAYER_URL,
+            params={"key": INNERTUBE_API_KEY, "prettyPrint": "false"},
+            headers=mweb_headers(data_sync_id=data_sync_id),
+            json=payload,
+            timeout=DIRECT_MWEB_PLAYER_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"bound mweb /player returned HTTP {response.status_code}")
+        data = response.json()
+        visitor = ((data.get("responseContext") or {}).get("visitorData"))
+        if isinstance(visitor, str) and visitor:
+            _visitor_data = visitor
+        fmt = select_direct_format(data)
+        if not fmt:
+            streaming = data.get("streamingData") or {}
+            diagnostics = {
+                "status": ((data.get("playabilityStatus") or {}).get("status")),
+                "formats": len(streaming.get("formats") or []),
+                "adaptiveFormats": len(streaming.get("adaptiveFormats") or []),
+                "hasServerAbr": bool(streaming.get("serverAbrStreamingUrl")),
+                "itag18Present": any(
+                    str(item.get("itag")) == SOURCE_FORMAT
+                    for item in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or []))
+                    if isinstance(item, dict)
+                ),
+            }
+            raise RuntimeError(
+                "bound mweb /player returned no usable format: "
+                + (playability_error(data) or "unknown")
+                + " diagnostics=" + json.dumps(diagnostics, separators=(",", ":"))
+            )
+        print("v36.16.3 mweb player candidate ready", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "candidate": "datasync" if data_sync_id else "plain",
+            "formatId": str(fmt.get("itag")) if fmt.get("itag") is not None else None,
+            "urlMode": "direct" if isinstance(fmt.get("url"), str) else "cipher",
+            "hasSignatureCipher": bool(fmt.get("signatureCipher") or fmt.get("cipher")),
+            "elapsedSeconds": round(time.monotonic() - t0, 3),
+        }), flush=True)
+        return data, fmt
 
-    video_token, returned_binding, expires_at = pot_result
-    if returned_binding and returned_binding != video_id:
-        raise RuntimeError("bgutil returned unexpected video binding")
-
-    media_url = append_query_param(base_url, "pot", video_token)
-    await probe_media_url(
-        media_url,
-        mweb_headers(),
-        video_id,
-        "v36.16.2-youtubejs-video",
+    # The session token is normally already warm at startup, so choosing the
+    # correctly bound /player request adds no per-track network round trip. If
+    # session binding was unavailable, retain the proven plain player request.
+    player_task = asyncio.create_task(
+        call_bound_player() if data_sync_id else call_plain_player()
     )
+    _data, fmt = await player_task
+
+    decipher_task = asyncio.create_task(youtubejs_decipher_format_url(video_id, fmt))
+    base_url = await decipher_task
+
+    # First choice: the reusable authenticated session/Data Sync GVS token.
+    if session_token and data_sync_id:
+        media_url = append_query_param(base_url, "pot", session_token)
+        try:
+            await probe_media_url(
+                media_url,
+                mweb_headers(data_sync_id=data_sync_id),
+                video_id,
+                "v36.16.3-youtubejs-session-gvs",
+            )
+            print("v36.16.3 session-bound GVS probe won", json.dumps({
+                "videoId": video_id,
+                "binding": "datasync",
+            }), flush=True)
+            expires_at = _session_gvs_pot_expires_at
+        except Exception as session_exc:
+            # YouTube can experiment with video-ID-bound GVS tokens. Preserve that
+            # as a very cheap second direct attempt before falling back to yt-dlp.
+            print("v36.16.3 session-bound GVS probe failed", json.dumps({
+                "videoId": video_id,
+                "error": str(session_exc)[-1000:],
+            }), flush=True)
+            video_token, returned_binding, expires_at = await get_bgutil_pot(
+                video_id, context, "gvs-video-fallback"
+            )
+            if returned_binding and returned_binding != video_id:
+                raise RuntimeError("bgutil returned unexpected video binding")
+            media_url = append_query_param(base_url, "pot", video_token)
+            await probe_media_url(
+                media_url,
+                mweb_headers(data_sync_id=data_sync_id),
+                video_id,
+                "v36.16.3-youtubejs-video-gvs",
+            )
+    else:
+        video_token, returned_binding, expires_at = await get_bgutil_pot(
+            video_id, context, "gvs-video-fallback"
+        )
+        if returned_binding and returned_binding != video_id:
+            raise RuntimeError("bgutil returned unexpected video binding")
+        media_url = append_query_param(base_url, "pot", video_token)
+        await probe_media_url(
+            media_url,
+            mweb_headers(),
+            video_id,
+            "v36.16.3-youtubejs-video-gvs",
+        )
     media = resolved_from_direct_format(
         video_id,
         media_url,
         fmt,
         "mweb",
-        "mweb-innertube-youtubejs-v36.16",
+        "mweb-innertube-youtubejs-v36.16.3",
         details=(_data.get("videoDetails") or {}),
     )
-    print("v36.16.2 direct mweb resolve success", json.dumps({
+    print("v36.16.3 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "playerCandidate": "plain",
         "proofCandidate": "video",
@@ -2024,7 +2147,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16.2 direct head-start failed", json.dumps({
+            print("v36.16.3 direct head-start failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2058,7 +2181,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
     for done in asyncio.as_completed(tasks):
         try:
             winner = await done
-            print("v36.16.2 cold race won", json.dumps({
+            print("v36.16.3 cold race won", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
@@ -2075,7 +2198,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16.2 cold race path failed", json.dumps({
+            print("v36.16.3 cold race path failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2299,9 +2422,10 @@ async def startup_session() -> None:
     init_ytdlp_pools()
     global _session_gvs_task, _youtubejs_ready, _youtubejs_player_id
     _session_gvs_task = None
-    helper_result, _warm_result = await asyncio.gather(
+    helper_result, _warm_result, session_gvs_result = await asyncio.gather(
         ensure_youtubejs_helper_ready(),
         warm_bgutil_integrity(),
+        warm_session_gvs_pot(),
         return_exceptions=True,
     )
     if isinstance(helper_result, Exception):
@@ -2321,6 +2445,8 @@ async def startup_session() -> None:
         "potHttpReady": pot_http_server_ready(),
         "youtubejsReady": bool(helper_state.get("ready")),
         "youtubejsPlayerId": helper_state.get("playerId"),
+        "sessionGvsReady": bool(_session_gvs_pot),
+        "dataSyncReady": bool(_data_sync_id),
     }), flush=True)
 
 
