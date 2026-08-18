@@ -71,11 +71,11 @@ const PLAYER_TTL_MS = Number.parseInt(process.env.VEEB_YOUTUBEJS_PLAYER_TTL_MS |
 const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.VEEB_YOUTUBEJS_FETCH_TIMEOUT_MS || '8000', 10);
 const CACHE_DIR = process.env.VEEB_YOUTUBEJS_CACHE_DIR || '/tmp/veeb-youtubejs-cache';
 
-// Re-stamp cver to match the client version the resolver actually used for
-// its /player call. youtubei.js hardcodes its own MWEB version
-// (2.20260205.04.01 in 17.2.0) and overwrites cver during decipher. A cver
-// that disagrees with the /player request is a known 403 source at GVS.
-const MWEB_CVER = process.env.VEEB_MWEB_CLIENT_VERSION || '';
+// The Python resolver sends the exact client identity/version used for the
+// MWEB /player request with every decipher call. Keep environment defaults only
+// as a safety net so Render configuration cannot silently disable the repair.
+const DEFAULT_MWEB_CLIENT_NAME = process.env.VEEB_MWEB_CLIENT_NAME || 'MWEB';
+const DEFAULT_MWEB_CLIENT_VERSION = process.env.VEEB_MWEB_CLIENT_VERSION || '2.20260708.05.00';
 
 const cache = new UniversalCache(true, CACHE_DIR);
 let player = null;
@@ -141,16 +141,45 @@ function requestPlayer(base, poToken) {
   return scoped;
 }
 
-function restampClientVersion(deciphered) {
-  if (!MWEB_CVER) return deciphered;
-  try {
-    const url = new URL(deciphered);
-    if (url.searchParams.get('c') === 'MWEB')
-      url.searchParams.set('cver', MWEB_CVER);
-    return url.toString();
-  } catch {
-    return deciphered;
-  }
+function rawQueryParam(value, key) {
+  const match = String(value || '').match(new RegExp('(?:[?&])' + key + '=([^&#]*)'));
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
+}
+
+// Google Video URLs are signed. Do not rebuild them with URL/URLSearchParams,
+// because normalising unrelated parameters can invalidate the signature.
+// Replace only c/cver in the existing query string.
+function replaceRawQueryParam(value, key, nextValue) {
+  const input = String(value || '');
+  const hashIndex = input.indexOf('#');
+  const base = hashIndex >= 0 ? input.slice(0, hashIndex) : input;
+  const fragment = hashIndex >= 0 ? input.slice(hashIndex) : '';
+  const encodedKey = encodeURIComponent(key);
+  const encodedValue = encodeURIComponent(String(nextValue));
+  const pair = encodedKey + '=' + encodedValue;
+  const pattern = new RegExp('([?&])' + encodedKey + '=[^&#]*');
+  const nextBase = pattern.test(base)
+    ? base.replace(pattern, (_match, prefix) => prefix + pair)
+    : base + (base.includes('?') ? '&' : '?') + pair;
+  return nextBase + fragment;
+}
+
+function restampClientVersion(deciphered, clientName, clientVersion) {
+  const original = String(deciphered || '');
+  const previousClient = rawQueryParam(original, 'c');
+  const previousClientVersion = rawQueryParam(original, 'cver');
+  let url = original;
+  if (clientName) url = replaceRawQueryParam(url, 'c', clientName);
+  if (clientVersion) url = replaceRawQueryParam(url, 'cver', clientVersion);
+  return {
+    url,
+    previousClient,
+    previousClientVersion,
+    client: rawQueryParam(url, 'c'),
+    clientVersion: rawQueryParam(url, 'cver'),
+    changed: url !== original,
+  };
 }
 
 // Only a stale/rotated player is worth a forced re-download. An evaluator or
@@ -174,6 +203,12 @@ async function decipher(body) {
   const cipher = typeof body.cipher === 'string' && body.cipher ? body.cipher : undefined;
   const poToken = typeof body.poToken === 'string' && body.poToken ? body.poToken : undefined;
   const requestedPlayerId = typeof body.playerId === 'string' && body.playerId ? body.playerId : undefined;
+  const clientName = typeof body.clientName === 'string' && body.clientName
+    ? body.clientName
+    : DEFAULT_MWEB_CLIENT_NAME;
+  const clientVersion = typeof body.clientVersion === 'string' && body.clientVersion
+    ? body.clientVersion
+    : DEFAULT_MWEB_CLIENT_VERSION;
 
   if (!url && !signatureCipher && !cipher)
     throw new Error('No URL or signature cipher was supplied');
@@ -183,12 +218,28 @@ async function decipher(body) {
 
   try {
     const result = await requestPlayer(base, poToken).decipher(url, signatureCipher, cipher);
+    const stamped = restampClientVersion(result, clientName, clientVersion);
+    if (stamped.changed) {
+      console.log(JSON.stringify({
+        event: 'youtubejs-mweb-url-restamped',
+        videoId,
+        previousClient: stamped.previousClient,
+        previousClientVersion: stamped.previousClientVersion,
+        client: stamped.client,
+        clientVersion: stamped.clientVersion,
+      }));
+    }
     return {
-      url: restampClientVersion(result),
+      url: stamped.url,
       playerId: base.player_id,
       signatureTimestamp: base.signature_timestamp,
       elapsedMs: Math.round(performance.now() - started),
       retried: false,
+      client: stamped.client,
+      clientVersion: stamped.clientVersion,
+      previousClient: stamped.previousClient,
+      previousClientVersion: stamped.previousClientVersion,
+      cverRestamped: stamped.changed,
     };
   } catch (firstError) {
     if (!isStalePlayerError(firstError)) {
@@ -211,12 +262,28 @@ async function decipher(body) {
 
     base = await loadPlayer({ force: true });
     const result = await requestPlayer(base, poToken).decipher(url, signatureCipher, cipher);
+    const stamped = restampClientVersion(result, clientName, clientVersion);
+    if (stamped.changed) {
+      console.log(JSON.stringify({
+        event: 'youtubejs-mweb-url-restamped',
+        videoId,
+        previousClient: stamped.previousClient,
+        previousClientVersion: stamped.previousClientVersion,
+        client: stamped.client,
+        clientVersion: stamped.clientVersion,
+      }));
+    }
     return {
-      url: restampClientVersion(result),
+      url: stamped.url,
       playerId: base.player_id,
       signatureTimestamp: base.signature_timestamp,
       elapsedMs: Math.round(performance.now() - started),
       retried: true,
+      client: stamped.client,
+      clientVersion: stamped.clientVersion,
+      previousClient: stamped.previousClient,
+      previousClientVersion: stamped.previousClientVersion,
+      cverRestamped: stamped.changed,
     };
   }
 }
@@ -255,6 +322,8 @@ const server = http.createServer(async (req, res) => {
         playerId: player?.player_id || null,
         signatureTimestamp: player?.signature_timestamp || null,
         evaluator: 'node:vm',
+        mwebClientName: DEFAULT_MWEB_CLIENT_NAME,
+        mwebClientVersion: DEFAULT_MWEB_CLIENT_VERSION,
         lastError,
       });
       return;
@@ -268,13 +337,21 @@ const server = http.createServer(async (req, res) => {
         'https://r1---sn-veeb.googlevideo.com/videoplayback?n=SELFTESTN&c=MWEB'
       ) + '&s=SELFTESTSIG&sp=sig';
       const out = await requestPlayer(base).decipher(undefined, fake);
-      const params = new URL(out).searchParams;
-      const ok = params.get('n') !== 'SELFTESTN' && Boolean(params.get('sig'));
+      const stamped = restampClientVersion(out, DEFAULT_MWEB_CLIENT_NAME, DEFAULT_MWEB_CLIENT_VERSION);
+      const params = new URL(stamped.url).searchParams;
+      const nTransformed = params.get('n') !== 'SELFTESTN';
+      const sigPresent = Boolean(params.get('sig'));
+      const cverCorrect = params.get('c') === DEFAULT_MWEB_CLIENT_NAME
+        && params.get('cver') === DEFAULT_MWEB_CLIENT_VERSION;
+      const ok = nTransformed && sigPresent && cverCorrect;
       sendJson(res, ok ? 200 : 500, {
         ok,
         playerId: base.player_id,
-        nTransformed: params.get('n') !== 'SELFTESTN',
-        sigPresent: Boolean(params.get('sig')),
+        nTransformed,
+        sigPresent,
+        cverCorrect,
+        mwebClientName: params.get('c'),
+        mwebClientVersion: params.get('cver'),
       });
       return;
     }

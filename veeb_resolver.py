@@ -1366,7 +1366,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         media_url,
         mweb_headers(),
         video_id,
-        "v36.16-youtubejs-video",
+        "v36.16.2-youtubejs-video",
     )
     media = resolved_from_direct_format(
         video_id,
@@ -1376,7 +1376,7 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
         "mweb-innertube-youtubejs-v36.16",
         details=(_data.get("videoDetails") or {}),
     )
-    print("v36.16 direct mweb resolve success", json.dumps({
+    print("v36.16.2 direct mweb resolve success", json.dumps({
         "videoId": video_id,
         "playerCandidate": "plain",
         "proofCandidate": "video",
@@ -2006,7 +2006,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
     if head_start > 0:
         try:
             winner = await asyncio.wait_for(asyncio.shield(direct_pot), timeout=head_start)
-            print("v36.16 cold direct won", json.dumps({
+            print("v36.16.2 cold direct won", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
@@ -2014,7 +2014,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             }), flush=True)
             return winner
         except asyncio.TimeoutError:
-            print("v36.16 direct head-start expired", json.dumps({
+            print("v36.16.2 direct head-start expired", json.dumps({
                 "videoId": video_id,
                 "headStartSeconds": head_start,
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2024,7 +2024,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16 direct head-start failed", json.dumps({
+            print("v36.16.2 direct head-start failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -2035,7 +2035,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
     if direct_pot.done():
         try:
             winner = direct_pot.result()
-            print("v36.16 cold direct won after head-start", json.dumps({
+            print("v36.16.2 cold direct won after head-start", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
@@ -2058,7 +2058,7 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
     for done in asyncio.as_completed(tasks):
         try:
             winner = await done
-            print("v36.16 cold race won", json.dumps({
+            print("v36.16.2 cold race won", json.dumps({
                 "videoId": video_id,
                 "client": winner.client,
                 "resolverPath": winner.resolver_path,
@@ -2075,13 +2075,13 @@ async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
             raise
         except Exception as exc:
             errors.append(str(exc))
-            print("v36.16 cold race path failed", json.dumps({
+            print("v36.16.2 cold race path failed", json.dumps({
                 "videoId": video_id,
                 "error": str(exc)[-1600:],
                 "elapsedSeconds": round(time.monotonic() - started, 3),
             }), flush=True)
 
-    raise RuntimeError("all V36.16 cold resolver paths failed: " + " || ".join(errors)[-2600:])
+    raise RuntimeError("all V36.16.2 cold resolver paths failed: " + " || ".join(errors)[-2600:])
 
 
 async def resolve_prefetch_v35(video_id: str, purpose: str) -> ResolvedMedia:
