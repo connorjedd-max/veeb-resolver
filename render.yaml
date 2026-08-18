@@ -7,5 +7,3 @@ services:
     envVars:
       - key: RESOLVER_SECRET
         sync: false
-      - key: VEEB_MWEB_CLIENT_VERSION
-        value: 2.20260708.05.00
