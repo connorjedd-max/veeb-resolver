@@ -1,4 +1,3 @@
-V37.8 supersedes the old format-18 recovery instructions.
-Follow README.md. Do not restore YOUTUBE_STREAM_FORMAT=18 to troubleshoot this
-release. MP3 conversion and acquisition are tested by /admin -> TEST PLAYBACK.
-For rollback, revert the resolver Git commit and Worker deployment together.
+V37.9 supersedes V37.8 for resolver source acquisition.
+Do not set YOUTUBE_STREAM_FORMAT=140 or force the old V35/V36 format-18 architecture.
+The canonical Veeb/R2 output remains MP3.

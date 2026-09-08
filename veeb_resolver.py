@@ -14,13 +14,14 @@ from media_jobs import MediaJobs, JobError
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import parse_qs, urlparse
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-app = FastAPI(title='Veeb YouTube Resolver V37.8 MP3 Stream', docs_url=None, redoc_url=None)
+app = FastAPI(title='Veeb YouTube Resolver V37.9 MP3 Stream', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
 YOUTUBE_COOKIE_FILE = os.environ.get('YOUTUBE_COOKIE_FILE', '/etc/secrets/youtube-cookies.txt')
@@ -73,6 +74,7 @@ _fg_pot_pool = None
 _fg_android_pool = None
 _fg_safari_pool = None
 _fg_embedded_pool = None
+_fg_visionos_pool = None
 _direct_prefetch_sem = asyncio.Semaphore(DIRECT_PREFETCH_CONCURRENCY)
 _mp3_transcode_sem = asyncio.Semaphore(MP3_MAX_CONCURRENT_TRANSCODES)
 _mp3_cache_fill_sem = asyncio.Semaphore(1)
@@ -243,10 +245,9 @@ def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
     args: dict[str, list[str]] = {}
     if client not in {'', 'default', 'anonymous'}:
         args['player_client'] = [client]
+    if client in {'visionos', 'android'}:
+        args['player_skip'] = ['webpage']
     if client == 'mweb':
-        # V37.8: make this a real POT path, not merely a client label. Current
-        # yt-dlp supports provider-driven POT fetching and the bgutil 1.3.2
-        # provider contains the current WebPO bootstrap fixes.
         args['fetch_pot'] = ['always']
         args['pot_trace'] = ['true']
         args['use_ad_playback_context'] = ['true']
@@ -254,7 +255,7 @@ def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
 
 def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=False) -> dict[str, Any]:
     cookie_file = get_writable_cookie_file() if use_cookies else None
-    # V37.8: Android currently still exposes the old combined itag 18 on many
+    # V37.9: Android currently still exposes the old combined itag 18 on many
     # public videos even when the newer web-family clients expose no selectable
     # progressive format. Prefer it for this one client only. FFmpeg validates
     # the returned source by actually decoding MP3 startup bytes, so yt-dlp's
@@ -287,31 +288,34 @@ async def spawn_owned_process(*args, **kwargs):
 
 
 class YtdlpEnginePool:
-    """Compatibility adapter. Each extraction owns a killable process group."""
+    """Each extraction/download owns a killable yt-dlp child process."""
 
     def __init__(self, name: str, size: int, client_name: str, resolver_path: str):
         self.name, self.client_name, self.resolver_path = (name, client_name, resolver_path)
 
-    async def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+    async def _child(self, video_id: str, *, download: bool, timeout: float) -> dict[str, Any]:
         async with _extraction_sem:
             options = ytdlp_options(self.client_name, YtdlpPhaseLogger(self.name), use_cookies=self.name == 'fg-auth')
             options.pop('logger', None)
-            started = time.monotonic()
-            process = await spawn_owned_process(sys.executable, os.path.join(os.path.dirname(__file__), 'extract_source.py'), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
-            communication = asyncio.create_task(process.communicate(json.dumps({'videoId': video_id, 'options': options}).encode()))
+            process = await spawn_owned_process(
+                sys.executable, os.path.join(os.path.dirname(__file__), 'extract_source.py'),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            communication = asyncio.create_task(process.communicate(json.dumps({
+                'videoId': video_id, 'options': options, 'download': download,
+            }).encode()))
             try:
-                stdout, _stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=18.0)
+                stdout, _stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
                 result = json.loads(stdout)
                 child_diag = result.get('diagnostics') or []
                 if not result.get('ok'):
                     suffix = (' | diagnostics=' + json.dumps(child_diag[-10:], separators=(',', ':'))) if child_diag else ''
                     raise RuntimeError((result.get('error') or 'extractor failed') + suffix)
-                info = result['media']
-                media = ResolvedMedia(video_id=video_id, url=info['url'], http_headers=info.get('http_headers') or {}, client=self.client_name, format_id=info.get('format_id'), ext=info.get('ext'), content_type=info.get('container'), acodec=info.get('acodec'), vcodec=info.get('vcodec'), abr=info.get('abr'), duration=info.get('duration'), title=info.get('title'), resolved_at=time.time(), expires_at=resolved_expiry(info['url']), resolver_path=self.resolver_path)
-                print('v37.8 source selected', json.dumps({'videoId': video_id, 'client': self.client_name, 'formatId': media.format_id, 'seconds': round(time.monotonic() - started, 3)}), flush=True)
-                return media
+                return result
             except asyncio.TimeoutError as exc:
-                raise RuntimeError('extraction timed out: ' + self.client_name) from exc
+                label = 'source download' if download else 'extraction'
+                raise RuntimeError(label + ' timed out: ' + self.client_name) from exc
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -319,23 +323,52 @@ class YtdlpEnginePool:
                     pass
                 await asyncio.gather(communication, return_exceptions=True)
 
+    def _media(self, video_id: str, info: dict[str, Any], *, resolver_path: str) -> ResolvedMedia:
+        media = ResolvedMedia(
+            video_id=video_id, url=info.get('url') or '', http_headers=info.get('http_headers') or {},
+            client=self.client_name, format_id=info.get('format_id'), ext=info.get('ext'),
+            content_type=info.get('container'), acodec=info.get('acodec'), vcodec=info.get('vcodec'),
+            abr=info.get('abr'), duration=info.get('duration'), title=info.get('title'),
+            resolved_at=time.time(), expires_at=resolved_expiry(info.get('url') or ''), resolver_path=resolver_path,
+        )
+        if info.get('local_path'):
+            media._local_path = str(info['local_path'])
+        return media
+
+    async def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
+        started = time.monotonic()
+        result = await self._child(video_id, download=False, timeout=18.0)
+        media = self._media(video_id, result['media'], resolver_path=self.resolver_path)
+        print('v37.9 source selected', json.dumps({'videoId': video_id, 'client': self.client_name, 'formatId': media.format_id, 'seconds': round(time.monotonic() - started, 3)}), flush=True)
+        return media
+
+    async def download_source(self, video_id: str, purpose: str) -> ResolvedMedia:
+        started = time.monotonic()
+        result = await self._child(video_id, download=True, timeout=45.0)
+        media = self._media(video_id, result['media'], resolver_path=self.resolver_path + '-yt-dlp-download')
+        if not getattr(media, '_local_path', None):
+            raise RuntimeError('yt-dlp source download returned no local file')
+        print('v37.9 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name, 'formatId': media.format_id, 'bytes': result.get('downloadBytes'), 'seconds': round(time.monotonic() - started, 3)}), flush=True)
+        return media
+
     def close(self) -> None:
         pass
 
 def init_ytdlp_pools() -> None:
-    global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_android_pool, _fg_safari_pool, _fg_embedded_pool
+    global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_android_pool, _fg_safari_pool, _fg_embedded_pool, _fg_visionos_pool
     if _fg_anon_pool is None:
-        _fg_android_pool = YtdlpEnginePool('fg-android', 1, 'android', 'yt-dlp-android-v37.8')
-        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-pot-v37.8')
-        _fg_safari_pool = YtdlpEnginePool('fg-safari', 1, 'web_safari', 'yt-dlp-web-safari-v37.8')
-        _fg_embedded_pool = YtdlpEnginePool('fg-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v37.8')
-        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v37.8')
-        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v37.8')
+        _fg_visionos_pool = YtdlpEnginePool('fg-visionos', 1, 'visionos', 'yt-dlp-visionos-v37.9')
+        _fg_android_pool = YtdlpEnginePool('fg-android', 1, 'android', 'yt-dlp-android-v37.9')
+        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-pot-v37.9')
+        _fg_safari_pool = YtdlpEnginePool('fg-safari', 1, 'web_safari', 'yt-dlp-web-safari-v37.9')
+        _fg_embedded_pool = YtdlpEnginePool('fg-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v37.9')
+        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v37.9')
+        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v37.9')
 
 async def resolve_ytdlp_foreground_v35(video_id: str, purpose: str) -> ResolvedMedia:
     init_ytdlp_pools()
     errors = []
-    pools = [_fg_android_pool, _fg_pot_pool, _fg_embedded_pool, _fg_anon_pool]
+    pools = [_fg_visionos_pool, _fg_android_pool, _fg_pot_pool, _fg_embedded_pool, _fg_anon_pool]
     if get_writable_cookie_file():
         pools.append(_fg_auth_pool)
     for pool in pools:
@@ -346,7 +379,7 @@ async def resolve_ytdlp_foreground_v35(video_id: str, purpose: str) -> ResolvedM
         except Exception as exc:
             message = str(exc)
             errors.append(pool.name + ': ' + message)
-            print('v37.8 acquisition attempt failed', json.dumps({'videoId': video_id, 'path': pool.name, 'error': redact_source_error(message)}), flush=True)
+            print('v37.9 acquisition attempt failed', json.dumps({'videoId': video_id, 'path': pool.name, 'error': redact_source_error(message)}), flush=True)
     raise RuntimeError('acquisition failed: ' + ' | '.join(errors))
 
 async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
@@ -443,7 +476,7 @@ def build_transcode_source_headers(media: ResolvedMedia) -> dict[str, str]:
     return headers
 
 def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -> dict[str, str]:
-    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v37.8-mp3-stream', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'ffmpeg-direct-http-mp3-v3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
+    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v37.9-mp3-stream', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'ffmpeg-direct-http-mp3-v3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
 
 def ffmpeg_http_input_args(media: ResolvedMedia) -> list[str]:
     """Build FFmpeg HTTP input options for the resolved Googlevideo URL.
@@ -524,10 +557,24 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
                 stderr = await asyncio.wait_for(asyncio.shield(stderr_task), timeout=1.0)
             except Exception:
                 pass
+        local_path = getattr(media, '_local_path', None)
+        if local_path:
+            try:
+                source_file = Path(local_path)
+                source_file.unlink(missing_ok=True)
+                try:
+                    source_file.parent.rmdir()
+                except OSError:
+                    pass
+            except Exception:
+                pass
         await release_slots()
         return stderr
     try:
-        process = await spawn_owned_process('ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', *ffmpeg_http_input_args(media), '-i', media.url, '-map', '0:a:0', '-vn', '-map_metadata', '-1', '-threads', '1', '-c:a', 'libmp3lame', '-b:a', f'{MP3_BITRATE_KBPS}k', '-ac', '2', '-ar', '44100', '-id3v2_version', '0', '-write_xing', '0', '-f', 'mp3', '-flush_packets', '1', 'pipe:1', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        source_path = getattr(media, '_local_path', None)
+        input_args = [] if source_path else ffmpeg_http_input_args(media)
+        input_value = source_path or media.url
+        process = await spawn_owned_process('ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', *input_args, '-i', input_value, '-map', '0:a:0', '-vn', '-map_metadata', '-1', '-threads', '1', '-c:a', 'libmp3lame', '-b:a', f'{MP3_BITRATE_KBPS}k', '-ac', '2', '-ar', '44100', '-id3v2_version', '0', '-write_xing', '0', '-f', 'mp3', '-flush_packets', '1', 'pipe:1', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stderr_task = asyncio.create_task(_read_ffmpeg_stderr(process))
         assert process.stdout is not None
         startup_buffer = bytearray()
@@ -544,7 +591,7 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
         if len(first_chunk) < MP3_STARTUP_MIN_BYTES:
             stderr = await cleanup(kill=True)
             raise RuntimeError(f'FFmpeg produced only {len(first_chunk)} startup MP3 bytes' + (': ' + stderr.decode('utf-8', 'replace')[-1200:] if stderr else ''))
-        print('v37.8 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
+        print('v37.9 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
 
         async def body() -> AsyncIterator[bytes]:
             try:
@@ -563,7 +610,7 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
                     except Exception:
                         pass
                 if rc != 0:
-                    print('v37.8 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
+                    print('v37.9 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
                     raise RuntimeError('FFmpeg failed before MP3 completion')
             except asyncio.CancelledError:
                 raise
@@ -575,7 +622,12 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
         raise
 
 def redact_source_error(message: str) -> str:
-    return re.sub('https?://[^\\s]+', '[url]', str(message))[-1800:]
+    text = str(message)
+    text = re.sub(r'(?i)https?://[^\s]+googlevideo\.com/[^\s]+', '[googlevideo-url]', text)
+    text = re.sub(r'(?i)https?://[^\s]+', '[url]', text)
+    text = re.sub(r'(?i)(?:[?&]|\b)(pot|sig|lsig|spc|n)=([^\s&]+)', r'\1=<redacted>', text)
+    text = re.sub(r'(?i)[^\s]{0,120}videoplayback[^\s]*', '[googlevideo-url]', text)
+    return text[-1800:]
 
 def error_detail(error: BaseException) -> dict[str, str]:
     message = str(error).lower()
@@ -599,7 +651,7 @@ async def produce_mp3(video_id: str, request: Request, job):
     attempts = []
     job.metadata['attempts'] = attempts
     cached = get_cached_media(video_id)
-    pools = [_fg_android_pool, _fg_pot_pool, _fg_embedded_pool, _fg_anon_pool]
+    pools = [_fg_visionos_pool, _fg_android_pool, _fg_pot_pool, _fg_embedded_pool, _fg_anon_pool]
     if get_writable_cookie_file():
         pools.append(_fg_auth_pool)
     async with asyncio.timeout(65):
@@ -607,11 +659,23 @@ async def produce_mp3(video_id: str, request: Request, job):
             try:
                 media = cached if pool is None else await pool.resolve(video_id, 'live')
                 media._output_bitrate = MP3_BITRATE_KBPS
-                iterator = await prepare_live_mp3_stream(media, video_id, request)
-                _resolved_cache[video_id] = media
-                cleanup_resolved_cache()
-                job.metadata = {'media': media, 'cache': 'HIT' if pool is None else 'MISS'}
-                return iterator
+                try:
+                    iterator = await prepare_live_mp3_stream(media, video_id, request)
+                    if pool is not None:
+                        _resolved_cache[video_id] = media
+                        cleanup_resolved_cache()
+                    job.metadata = {'media': media, 'cache': 'HIT' if pool is None else 'MISS'}
+                    return iterator
+                except Exception as direct_exc:
+                    if pool is None:
+                        raise
+                    attempts.append({'path': pool.name + '-direct', 'error': redact_source_error(str(direct_exc))[-1200:]})
+                    print('v37.9 direct source fetch failed; trying yt-dlp owned download', json.dumps({'videoId': video_id, 'path': pool.name, 'error': redact_source_error(str(direct_exc))}), flush=True)
+                    downloaded = await pool.download_source(video_id, 'live-download-fallback')
+                    downloaded._output_bitrate = MP3_BITRATE_KBPS
+                    iterator = await prepare_live_mp3_stream(downloaded, video_id, request)
+                    job.metadata = {'media': downloaded, 'cache': 'MISS-DOWNLOADED'}
+                    return iterator
             except asyncio.CancelledError:
                 invalidate_media(video_id)
                 raise
@@ -619,7 +683,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                 invalidate_media(video_id)
                 errors.append(str(exc))
                 attempts.append({'path': pool.name if pool else 'cached', 'error': redact_source_error(str(exc))[-1200:]})
-                print('v37.8 source-to-mp3 attempt failed', json.dumps({'videoId': video_id, 'path': pool.name if pool else 'cached', 'error': redact_source_error(str(exc))}), flush=True)
+                print('v37.9 source-to-mp3 attempt failed', json.dumps({'videoId': video_id, 'path': pool.name if pool else 'cached', 'error': redact_source_error(str(exc))}), flush=True)
     if errors and all(('sign in to confirm' in item.lower()) or ('login_required' in item.lower()) or ('not a bot' in item.lower()) for item in errors):
         raise JobError('SOURCE_ACCESS_DENIED', 'Every configured YouTube client was challenged before a playable source was returned.')
     raise RuntimeError('No source produced MP3: ' + ' | '.join(errors))
@@ -628,7 +692,7 @@ _media_jobs = MediaJobs(produce_mp3)
 async def proxy_media(request: Request, video_id: str):
     cache_fill = request.headers.get('x-veeb-purpose') == 'cache-fill'
     if request.method == 'HEAD':
-        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v37.8-mp3-stream'})
+        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v37.9-mp3-stream'})
     try:
         job = _media_jobs.get(video_id, request, background=cache_fill)
         await _media_jobs.wait(job, complete=cache_fill)
@@ -649,7 +713,7 @@ async def startup_session() -> None:
     load_youtube_cookie_session(force=True)
     get_http_client()
     init_ytdlp_pools()
-    print('v37.8 ready: android format-18, mweb POT, web_embedded, anonymous, optional cookies; shared MP3 jobs', flush=True)
+    print('v37.9 ready: visionos/android webpage-skip, mweb POT, yt-dlp owned-download fallback, optional cookies; shared MP3 jobs', flush=True)
 
 @app.on_event('shutdown')
 async def shutdown_http_client() -> None:
@@ -669,7 +733,7 @@ async def root_head() -> Response:
 
 @app.get('/')
 async def root() -> dict[str, Any]:
-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v37.8-mp3-stream'}
+    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v37.9-mp3-stream'}
 
 @app.get('/health')
 async def health(authorization: str | None=Header(default=None)) -> dict[str, Any]:
@@ -679,7 +743,7 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
         ytdlp_version = importlib.metadata.version('yt-dlp')
     except importlib.metadata.PackageNotFoundError:
         ytdlp_version = 'unknown'
-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v37.8-mp3-stream', 'ytDlpVersion': ytdlp_version, 'sourceSelector': YTDLP_SOURCE_SELECTOR, 'androidSourceSelector': '18/best[acodec!=none]/bestaudio/best', 'ytDlpCheckFormats': False, 'cookieFilePresent': os.path.isfile(YOUTUBE_COOKIE_FILE), 'cookieSessionRecognized': _youtube_cookie_authenticated, 'cookieAuthenticationVerified': None, 'potHttpReady': pot_http_server_ready(), 'ffmpegInstalled': bool(shutil.which('ffmpeg')), 'jsRuntimeInstalled': bool(shutil.which(JSC_RUNTIME)), 'sourceAccessVerified': False, 'note': 'Liveness only. POST /diagnose/<videoId> proves source acquisition and MP3 production. null cookieAuthenticationVerified means not tested.', 'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1, 'maxConcurrentTranscodes': MP3_MAX_CONCURRENT_TRANSCODES, 'jobs': _media_jobs.stats()}
+    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v37.9-mp3-stream', 'ytDlpVersion': ytdlp_version, 'sourceSelector': YTDLP_SOURCE_SELECTOR, 'androidSourceSelector': '18/best[acodec!=none]/bestaudio/best', 'ytDlpCheckFormats': False, 'playerSkipWebpageClients': ['visionos', 'android'], 'ytDlpOwnedDownloadFallback': True, 'cookieFilePresent': os.path.isfile(YOUTUBE_COOKIE_FILE), 'cookieSessionRecognized': _youtube_cookie_authenticated, 'cookieAuthenticationVerified': None, 'potHttpReady': pot_http_server_ready(), 'ffmpegInstalled': bool(shutil.which('ffmpeg')), 'jsRuntimeInstalled': bool(shutil.which(JSC_RUNTIME)), 'sourceAccessVerified': False, 'note': 'Liveness only. POST /diagnose/<videoId> proves source acquisition and MP3 production. null cookieAuthenticationVerified means not tested.', 'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1, 'maxConcurrentTranscodes': MP3_MAX_CONCURRENT_TRANSCODES, 'jobs': _media_jobs.stats()}
 
 @app.post('/diagnose/{video_id}')
 async def diagnose(video_id: str, authorization: str | None=Header(default=None)):
@@ -691,9 +755,9 @@ async def diagnose(video_id: str, authorization: str | None=Header(default=None)
         job = _media_jobs.get(video_id, request)
         await _media_jobs.wait(job, complete=True)
         media = job.metadata['media']
-        return {'ok': True, 'version': 'v37.8-mp3-stream', 'videoId': video_id, 'mp3Complete': True, 'bytes': job.size, 'jobId': job.job_id, 'sourceClient': media.client, 'sourceFormat': media.format_id, 'elapsedSeconds': round(time.monotonic() - started, 2)}
+        return {'ok': True, 'version': 'v37.9-mp3-stream', 'videoId': video_id, 'mp3Complete': True, 'bytes': job.size, 'jobId': job.job_id, 'sourceClient': media.client, 'sourceFormat': media.format_id, 'elapsedSeconds': round(time.monotonic() - started, 2)}
     except Exception as exc:
-        payload = {'ok': False, 'version': 'v37.8-mp3-stream', 'videoId': video_id, **error_detail(exc), 'elapsedSeconds': round(time.monotonic() - started, 2)}
+        payload = {'ok': False, 'version': 'v37.9-mp3-stream', 'videoId': video_id, **error_detail(exc), 'elapsedSeconds': round(time.monotonic() - started, 2)}
         try:
             if job.metadata.get('attempts'):
                 payload['attempts'] = job.metadata['attempts'][-8:]
