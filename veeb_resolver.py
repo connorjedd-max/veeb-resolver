@@ -31,7 +31,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V37 MP3 Stream", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V37.1 MP3 Stream", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -2568,10 +2568,23 @@ async def open_media_upstream(media: ResolvedMedia, request: Request) -> httpx.R
     return await client.send(upstream_request, stream=True)
 
 
-async def open_transcode_source(media: ResolvedMedia) -> httpx.Response:
+async def probe_transcode_source(media: ResolvedMedia) -> int:
+    """Cheaply verify that the signed Googlevideo URL is still usable.
+
+    The actual MP3 transcode is performed by FFmpeg reading the URL directly so
+    libavformat can issue byte-range seeks when an MP4 has metadata near the end
+    of the file. Piping the MP4 through stdin made that impossible and caused
+    cold-play startup failures on valid format-18 sources.
+    """
     client = get_http_client()
-    upstream_request = client.build_request("GET", media.url, headers=build_transcode_source_headers(media))
-    return await client.send(upstream_request, stream=True)
+    headers = build_transcode_source_headers(media)
+    headers["Range"] = "bytes=0-0"
+    upstream_request = client.build_request("GET", media.url, headers=headers)
+    response = await client.send(upstream_request, stream=True)
+    try:
+        return int(response.status_code)
+    finally:
+        await response.aclose()
 
 
 def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -> dict[str, str]:
@@ -2580,36 +2593,47 @@ def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -
     return {
         "Content-Type": "audio/mpeg",
         "Cache-Control": "private, no-store",
-        "X-Veeb-Resolver": "v37-mp3-stream",
+        "X-Veeb-Resolver": "v37.1-mp3-stream",
         "X-Veeb-Resolved-Cache": cache_state,
         "X-Veeb-Playback-Client": media.client,
         "X-Veeb-Source-Format": media.format_id or SOURCE_FORMAT,
         "X-Veeb-Resolver-Path": media.resolver_path,
         "X-Veeb-Direct-Proxy": "0",
-        "X-Veeb-Transcode": "ffmpeg-mp3-live-v1",
+        "X-Veeb-Transcode": "ffmpeg-direct-http-mp3-v2",
         "X-Veeb-MP3-Bitrate": str(MP3_BITRATE_KBPS),
         "X-Veeb-Ignored-Range": "1" if request.headers.get("range") else "0",
     }
 
 
-async def _pump_source_to_ffmpeg(source: httpx.Response, process: asyncio.subprocess.Process) -> None:
-    try:
-        assert process.stdin is not None
-        async for chunk in source.aiter_raw(PROXY_CHUNK_BYTES):
-            if not chunk:
-                continue
-            process.stdin.write(chunk)
-            await process.stdin.drain()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-    finally:
-        try:
-            if process.stdin is not None:
-                process.stdin.close()
-                await process.stdin.wait_closed()
-        except Exception:
-            pass
-        await source.aclose()
+def ffmpeg_http_input_args(media: ResolvedMedia) -> list[str]:
+    """Build FFmpeg HTTP input options for the resolved Googlevideo URL.
+
+    FFmpeg owns the upstream HTTP connection. That is intentional: MP4 format 18
+    can require seeking/range requests to locate metadata before decoding audio.
+    """
+    headers = build_transcode_source_headers(media)
+    user_agent = ""
+    header_lines: list[str] = []
+    for raw_name, raw_value in headers.items():
+        name = str(raw_name or "").strip()
+        value = str(raw_value or "").strip()
+        if not name or not value or "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+            continue
+        if name.lower() == "user-agent":
+            user_agent = value
+            continue
+        header_lines.append(f"{name}: {value}\r\n")
+
+    args = [
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "2",
+    ]
+    if user_agent:
+        args += ["-user_agent", user_agent]
+    if header_lines:
+        args += ["-headers", "".join(header_lines)]
+    return args
 
 
 async def _read_ffmpeg_stderr(process: asyncio.subprocess.Process) -> bytes:
@@ -2622,23 +2646,19 @@ async def _read_ffmpeg_stderr(process: asyncio.subprocess.Process) -> bytes:
 
 
 async def prepare_live_mp3_stream(
-    source: httpx.Response,
     media: ResolvedMedia,
     video_id: str,
     request: Request,
 ) -> AsyncIterator[bytes]:
-    """Start FFmpeg and prove we have MP3 bytes before returning HTTP 200."""
+    """Start FFmpeg against the signed URL and prove MP3 bytes before HTTP 200."""
     purpose = (request.headers.get("x-veeb-purpose") or "playback").strip().lower()
     cache_fill = purpose == "cache-fill"
 
-    # Cache fills are separately capped at one. Both cache and playback then
-    # share the total transcode limit so background work cannot run unbounded.
     if cache_fill:
         await _mp3_cache_fill_sem.acquire()
     await _mp3_transcode_sem.acquire()
 
     process: asyncio.subprocess.Process | None = None
-    input_task: asyncio.Task[Any] | None = None
     stderr_task: asyncio.Task[bytes] | None = None
     released = False
 
@@ -2652,8 +2672,6 @@ async def prepare_live_mp3_stream(
             _mp3_cache_fill_sem.release()
 
     async def cleanup(kill: bool = False) -> bytes:
-        if input_task is not None and not input_task.done():
-            input_task.cancel()
         if process is not None and kill and process.returncode is None:
             try:
                 process.kill()
@@ -2668,8 +2686,6 @@ async def prepare_live_mp3_stream(
                         process.kill()
                     except ProcessLookupError:
                         pass
-        if not source.is_closed:
-            await source.aclose()
         stderr = b""
         if stderr_task is not None:
             try:
@@ -2685,7 +2701,8 @@ async def prepare_live_mp3_stream(
             "-hide_banner",
             "-loglevel", "error",
             "-nostdin",
-            "-i", "pipe:0",
+            *ffmpeg_http_input_args(media),
+            "-i", media.url,
             "-map", "0:a:0",
             "-vn",
             "-map_metadata", "-1",
@@ -2696,11 +2713,9 @@ async def prepare_live_mp3_stream(
             "-f", "mp3",
             "-flush_packets", "1",
             "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        input_task = asyncio.create_task(_pump_source_to_ffmpeg(source, process))
         stderr_task = asyncio.create_task(_read_ffmpeg_stderr(process))
         assert process.stdout is not None
 
@@ -2709,7 +2724,7 @@ async def prepare_live_mp3_stream(
         while len(startup_buffer) < MP3_STARTUP_MIN_BYTES:
             remaining = startup_deadline - time.monotonic()
             if remaining <= 0:
-                raise asyncio.TimeoutError()
+                raise asyncio.TimeoutError("FFmpeg MP3 first-byte timeout")
             chunk = await asyncio.wait_for(
                 process.stdout.read(min(MP3_CHUNK_BYTES, MP3_STARTUP_MIN_BYTES - len(startup_buffer))),
                 timeout=remaining,
@@ -2723,10 +2738,10 @@ async def prepare_live_mp3_stream(
             stderr = await cleanup(kill=True)
             raise RuntimeError(
                 f"FFmpeg produced only {len(first_chunk)} startup MP3 bytes"
-                + (": " + stderr.decode("utf-8", "replace")[-900:] if stderr else "")
+                + (": " + stderr.decode("utf-8", "replace")[-1200:] if stderr else "")
             )
 
-        print("v37 mp3 first byte ready", json.dumps({
+        print("v37.1 mp3 first byte ready", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "sourceFormat": media.format_id,
@@ -2753,10 +2768,10 @@ async def prepare_live_mp3_stream(
                     except Exception:
                         pass
                 if rc != 0:
-                    print("v37 ffmpeg ended non-zero", json.dumps({
+                    print("v37.1 ffmpeg ended non-zero", json.dumps({
                         "videoId": video_id,
                         "returnCode": rc,
-                        "error": stderr.decode("utf-8", "replace")[-1200:],
+                        "error": stderr.decode("utf-8", "replace")[-1600:],
                     }), flush=True)
             except asyncio.CancelledError:
                 raise
@@ -2769,19 +2784,16 @@ async def prepare_live_mp3_stream(
         raise
 
 
-async def _resolved_source_for_transcode(video_id: str, request: Request) -> tuple[ResolvedMedia, str, httpx.Response]:
+async def _resolved_media_for_transcode(video_id: str) -> tuple[ResolvedMedia, str]:
     media, cache_state = await get_or_resolve(video_id, "live")
-    response = await open_transcode_source(media)
+    status = await probe_transcode_source(media)
 
-    # A player URL can be syntactically valid but rejected by GVS. Refresh once
-    # before FFmpeg starts so the browser never receives a fake successful stream.
-    if response.status_code in {403, 410}:
+    if status in {403, 410}:
         rejected_path = media.resolver_path
-        await response.aclose()
         invalidate_media(video_id)
-        print("v37 source url rejected", json.dumps({
+        print("v37.1 source url rejected", json.dumps({
             "videoId": video_id,
-            "status": response.status_code,
+            "status": status,
             "client": media.client,
             "resolverPath": rejected_path,
         }), flush=True)
@@ -2797,53 +2809,47 @@ async def _resolved_source_for_transcode(video_id: str, request: Request) -> tup
         else:
             media = await resolve_media_uncached(video_id, "live-refresh")
         cache_state = "REFRESH"
-        response = await open_transcode_source(media)
+        status = await probe_transcode_source(media)
 
-    if response.status_code >= 400:
-        status = response.status_code
-        body = await response.aread()
-        await response.aclose()
-        detail = body[:800].decode("utf-8", "replace") if body else ""
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream media server returned HTTP {status}" + (f": {detail}" if detail else ""),
-        )
+    if status >= 400:
+        raise HTTPException(status_code=502, detail=f"Upstream media server returned HTTP {status}")
 
-    return media, cache_state, response
+    return media, cache_state
 
 
 async def proxy_media(request: Request, video_id: str):
-    # HEAD advertises the canonical delivery type without starting an expensive
-    # transcode. Completed R2 objects provide real Content-Length/Range metadata.
     if request.method == "HEAD":
         media, cache_state = await get_or_resolve(video_id, "live")
         headers = live_mp3_headers(media, cache_state, request)
         return Response(status_code=200, headers=headers)
 
-    media, cache_state, source = await _resolved_source_for_transcode(video_id, request)
+    media, cache_state = await _resolved_media_for_transcode(video_id)
 
     try:
-        body = await prepare_live_mp3_stream(source, media, video_id, request)
+        body = await prepare_live_mp3_stream(media, video_id, request)
     except Exception as first_exc:
-        # One hard recovery attempt. A failure before first MP3 bytes are emitted
-        # is treated as a bad source/resolution, not as successful playback.
-        print("v37 mp3 start failed; refreshing source once", json.dumps({
+        print("v37.1 mp3 start failed; refreshing source once", json.dumps({
             "videoId": video_id,
-            "error": str(first_exc)[-1400:],
+            "error": str(first_exc)[-1800:],
         }), flush=True)
         invalidate_media(video_id)
         media = await resolve_ytdlp_foreground_v35(video_id, "live-mp3-recovery")
         _resolved_cache[video_id] = media
         cache_state = "MP3-RECOVERY"
-        source = await open_transcode_source(media)
-        if source.status_code >= 400:
-            status = source.status_code
-            await source.aclose()
+        status = await probe_transcode_source(media)
+        if status >= 400:
             raise HTTPException(status_code=502, detail=f"MP3 recovery source returned HTTP {status}")
-        body = await prepare_live_mp3_stream(source, media, video_id, request)
+        try:
+            body = await prepare_live_mp3_stream(media, video_id, request)
+        except Exception as second_exc:
+            print("v37.1 mp3 recovery failed", json.dumps({
+                "videoId": video_id,
+                "error": str(second_exc)[-1800:],
+            }), flush=True)
+            raise HTTPException(status_code=502, detail="MP3 transcode startup failed") from second_exc
 
     headers = live_mp3_headers(media, cache_state, request)
-    print("v37 mp3 stream open", json.dumps({
+    print("v37.1 mp3 stream open", json.dumps({
         "videoId": video_id,
         "client": media.client,
         "formatId": media.format_id,

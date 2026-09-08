@@ -1,0 +1,41 @@
+VEEB RESOLVER V37.1 HOTFIX
+
+Why V37 failed
+--------------
+1. The app still installed the old MP4Box/MSE transport. Once /api/audio became MP3,
+   the browser first fetched the MP3 and tried to parse it as MP4. It then fell back
+   to native audio, causing a SECOND cold /api/audio request and a second FFmpeg job.
+   On a small Render instance this can saturate the transcode slots even for one user.
+
+2. V37 piped the format-18 MP4 into FFmpeg through stdin. Some MP4 sources require
+   HTTP byte-range seeking to find MP4 metadata. A non-seekable stdin pipe prevents
+   FFmpeg/libavformat from doing that and can lead to first-byte timeouts / HTTP 502.
+
+What V37.1 changes
+------------------
+- FFmpeg now reads the signed Googlevideo URL directly over HTTP.
+- FFmpeg can perform byte-range seeks itself when required by the MP4 container.
+- A cheap Range: bytes=0-0 probe validates the signed source URL before transcoding.
+- The Worker disables the old MP4Box/MSE transport and uses native <audio> for MP3.
+- Browser-side MP4 runway preloading is therefore disabled by design in this hotfix.
+- R2 remains MP3-only under veeb-audio-v2-mp3/<trackId>.mp3.
+- Live resolver responses remain audio/mpeg without fake byte-range metadata.
+- Completed R2 MP3 responses retain proper byte-range support.
+
+Deployment order
+----------------
+1. Deploy the resolver package first and wait for Render to report Live.
+2. Deploy veeb-worker-v37.1.txt to Cloudflare.
+3. Hard refresh / fully close and reopen the installed PWA before testing.
+
+Expected resolver headers on a cold play
+----------------------------------------
+Content-Type: audio/mpeg
+X-Veeb-Resolver: v37.1-mp3-stream
+X-Veeb-Transcode: ffmpeg-direct-http-mp3-v2
+
+Expected browser diagnostic after the Worker update
+---------------------------------------------------
+native-mp3-transport-installed
+
+You should NOT see mse-demux-failed for a normal V37.1 playback attempt.
