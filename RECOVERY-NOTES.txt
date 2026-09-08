@@ -1,3 +1,1 @@
-V37.9 supersedes V37.8 for resolver source acquisition.
-Do not set YOUTUBE_STREAM_FORMAT=140 or force the old V35/V36 format-18 architecture.
-The canonical Veeb/R2 output remains MP3.
+V38.1: keep the V37.6.1 diagnostic Worker. Upload every resolver file including source_support.py and tests. No proxy is required. TEST PLAYBACK distinguishes local encoder function, YouTube page-level cookie recognition, and actual media download. Do not interpret liveness or token generation as successful playback. Only a complete MP3 plus successful R2 readback confirms that end-to-end test. Live YouTube access remains unverified by local tests.

@@ -29,7 +29,7 @@ RUN git clone --depth 1 --branch 1.3.2 \
     && npm ci \
     && npx tsc
 
-COPY veeb_resolver.py media_jobs.py extract_source.py /app/
+COPY veeb_resolver.py media_jobs.py extract_source.py source_support.py /app/
 COPY tests /app/tests
 RUN python -m unittest discover -s /app/tests -v \
     && python -c "import veeb_resolver" \

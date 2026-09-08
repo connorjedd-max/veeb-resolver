@@ -1,0 +1,11 @@
+.git
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+.venv
+.env
+*cookie*.txt
+*.mp3
+*.mp4
+*.webm

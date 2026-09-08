@@ -1,0 +1,58 @@
+VEEB V38.1 - RESOLVER ONLY
+
+1. Extract veeb-resolver-v38.1.zip.
+2. In connorjedd-max/veeb-resolver, upload ALL extracted contents into the
+   repository root, where Dockerfile and veeb_resolver.py already sit.
+   Do not upload the ZIP itself or create a nested version folder in GitHub.
+   Include:
+     Dockerfile
+     requirements.txt
+     render.yaml
+     veeb_resolver.py
+     extract_source.py
+     media_jobs.py
+     source_support.py        NEW AND REQUIRED
+     tests/test_pipeline.py
+     tests/test_sessions.py   NEW
+     tests/test_http.py       NEW
+   README and RECOVERY-NOTES explain the changes.
+3. Commit and wait for the Render deployment to show Live.
+4. Do NOT replace the Cloudflare Worker. Keep V37.6.1-diagnostic.
+   Its admin development-warning toggle and MP3-only R2 cache are unchanged.
+5. Run Veeb /admin > Playback and cache test > TEST PLAYBACK once.
+   Expected resolver version: v38.1-mp3-stream.
+
+No proxy or new environment variable is required for these checks.
+Keep the existing RESOLVER_SECRET and youtube-cookies.txt secret file.
+
+RESULTS
+
+codecSelfTest.ok=true:
+  The actual Render encoder produced valid MP3 from a local synthetic source.
+  This is not proof that YouTube source access works.
+
+cookieSessionTest.youtubeReportsLoggedIn=true:
+  YouTube reported page-level login with the supplied cookie jar.
+  Media-download permission remains a separate check.
+
+cookieSessionTest.youtubeReportsLoggedIn=false:
+  YouTube reported logged out for this request. Refresh the cookie export.
+  The flag cannot distinguish expiry, revocation or another session issue.
+
+cookieSessionTest.youtubeReportsLoggedIn=null:
+  Login state could not be established. Read status/error. This is NOT a failed
+  authentication verdict and is not proof the cookies are valid either.
+
+attempts includes fg-mweb-auth, usesCookies=true:
+  Cookie-backed mweb was actually attempted. Its stage and code show whether
+  extraction was challenged or the selected media download was refused.
+
+mp3Complete=true:
+  The entire MP3 passed resolver validation. The unchanged Worker then performs
+  its R2 store/readback test. Confirm that separately in r2Stored/r2Read.
+
+The authenticated source-download fallback waits for source download before
+encoding. Direct streaming remains available for a source that permits it.
+
+Do not send cookie values in chat or commit them to GitHub. The README includes
+fresh-export instructions. A readable cookie file is not a verified session.

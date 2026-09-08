@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*cookie*.txt
+*.mp3
+*.mp4
+*.webm
