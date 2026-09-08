@@ -1,17 +1,4 @@
-V37 NOTE, 2026-09-08
-
-V37.4 uses audio-first internal acquisition and `/stream` delivers progressive MP3 via FFmpeg. Leave YOUTUBE_STREAM_FORMAT unset.
-
-The historical recovery notes below are retained because they explain why switching the source directly to 140 was backed out.
-
-V36.15 recovery package, 2026-08-15
-
-Application resolver source is unchanged.
-Recovered helper: exact veeb_innertube_helper.mjs supplied in files.zip.
-Docker-only recovery changes:
-- VEEB_MWEB_CLIENT_VERSION defaults to 2.20260708.05.00 to match MWEB_DIRECT_CONFIG.
-- POT provider is given the CPU first and up to 90 seconds to become ready.
-- YouTube.js helper starts after POT is ready and is given up to 60 seconds to warm.
-
-Leave YOUTUBE_STREAM_FORMAT unset. Use YOUTUBE_SOURCE_SELECTOR only for deliberate resolver experiments.
-Expected helper log includes: "evaluator":"node:vm".
+V37.6 supersedes the old format-18 recovery instructions.
+Follow README.md. Do not restore YOUTUBE_STREAM_FORMAT=18 to troubleshoot this
+release. MP3 conversion and acquisition are tested by /admin -> TEST PLAYBACK.
+For rollback, revert the resolver Git commit and Worker deployment together.
