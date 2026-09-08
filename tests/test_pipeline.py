@@ -201,25 +201,65 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_cookie_modes_and_manifest_options(self):
         core=self.core
         with patch.object(core,'get_writable_cookie_file',return_value='/private/cookies'):
-            for client in ('anonymous','mweb'):
+            for client in ('anonymous','mweb','android','visionos'):
                 opts=core.ytdlp_options(client,None)
                 self.assertNotIn('cookiefile',opts)
                 self.assertNotIn('skip',opts['extractor_args']['youtube'])
-                self.assertNotIn('player_skip',opts['extractor_args']['youtube'])
+                if client in ('android','visionos'):
+                    self.assertEqual(opts['extractor_args']['youtube']['player_skip'],['webpage'])
+                else:
+                    self.assertNotIn('player_skip',opts['extractor_args']['youtube'])
+                self.assertFalse(opts['check_formats'])
+            self.assertEqual(core.ytdlp_options('android',None)['format'].split('/')[0],'18')
+            self.assertEqual(core.ytdlp_options('android',None)['extractor_args']['youtube']['player_client'],['android'])
             self.assertEqual(core.ytdlp_options('default',None,True)['cookiefile'],'/private/cookies')
             self.assertNotIn('player_client',core.ytdlp_options('anonymous',None)['extractor_args']['youtube'])
 
-    async def test_source_decode_failure_tries_next_path(self):
+    async def test_direct_403_falls_back_to_ytdlp_owned_download(self):
         core=self.core; core.init_ytdlp_pools()
-        media=types.SimpleNamespace(client='mweb',video_id='siRAwwaNc1M',expires_at=9999999999,valid=lambda:True)
-        job=types.SimpleNamespace(metadata={})
-        iterator=object()
-        with patch.object(core._fg_anon_pool,'resolve',AsyncMock(return_value=media)), \
-             patch.object(core._fg_pot_pool,'resolve',AsyncMock(return_value=media)), \
+        media=types.SimpleNamespace(client='mweb',video_id='siRAwwaNc1M',format_id='251',expires_at=9999999999,valid=lambda:True)
+        downloaded=types.SimpleNamespace(client='mweb',video_id='siRAwwaNc1M',format_id='251',expires_at=9999999999,valid=lambda:True)
+        job=types.SimpleNamespace(metadata={}); iterator=object()
+        with patch.object(core._fg_pot_pool,'resolve',AsyncMock(return_value=media)), \
+             patch.object(core._fg_pot_pool,'download_source',AsyncMock(return_value=downloaded)) as download, \
+             patch.object(core._fg_anon_pool,'resolve',AsyncMock(side_effect=AssertionError('unexpected fallback'))), \
              patch.object(core,'get_writable_cookie_file',return_value=None), \
              patch.object(core,'prepare_live_mp3_stream',AsyncMock(side_effect=[RuntimeError('403'),iterator])) as prepare:
             result=await core.produce_mp3('siRAwwaNc1M',self.request(),job)
-            self.assertIs(result,iterator);self.assertEqual(prepare.await_count,2)
+        self.assertIs(result,iterator); self.assertEqual(prepare.await_count,2)
+        download.assert_awaited_once()
+        self.assertEqual(job.metadata['cache'],'MISS-DOWNLOADED')
+        self.assertEqual(job.metadata['attempts'][0]['code'],'MEDIA_HTTP_403')
+
+    async def test_foreground_order_includes_explicit_authenticated_mweb(self):
+        core=self.core; core.init_ytdlp_pools(); order=[]
+        async def anon_fail(*a,**k):
+            order.append('mweb-anon'); raise RuntimeError('no source')
+        async def auth_fail(*a,**k):
+            order.append('mweb-auth'); raise RuntimeError('no source')
+        media=types.SimpleNamespace(client='anon',video_id='siRAwwaNc1M',expires_at=9999999999,valid=lambda:True)
+        with patch.object(core._fg_pot_pool,'resolve',AsyncMock(side_effect=anon_fail)), \
+             patch.object(core._fg_mweb_auth_pool,'resolve',AsyncMock(side_effect=auth_fail)), \
+             patch.object(core._fg_anon_pool,'resolve',AsyncMock(return_value=media)), \
+             patch.object(core,'get_writable_cookie_file',return_value='/private/cookies'):
+            result=await core.resolve_ytdlp_foreground_v35('siRAwwaNc1M','live')
+        self.assertIs(result,media); self.assertEqual(order,['mweb-anon','mweb-auth'])
+        self.assertFalse(core._fg_pot_pool.use_cookies)
+        self.assertTrue(core._fg_mweb_auth_pool.use_cookies)
+
+    async def test_local_downloaded_source_transcodes_and_is_deleted(self):
+        core=self.core
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir=Path(tmp)/'owned'
+            source_dir.mkdir()
+            source=source_dir/'source.mp4'
+            source.write_bytes(self.fixture.read_bytes())
+            media=core.ResolvedMedia('siRAwwaNc1M','',{},'visionos','140','m4a','audio/mp4','aac','none',128,3,'tone',0,9999999999,'fixture-local')
+            media._local_path=str(source)
+            body=await core.prepare_live_mp3_stream(media,'siRAwwaNc1M',self.request())
+            data=b''.join([chunk async for chunk in body])
+            self.assertTrue(mp3_frames_valid(data))
+            self.assertFalse(source.exists())
 
     async def test_head_does_not_launch_job(self):
         response=await self.core.proxy_media(self.request('HEAD'),'siRAwwaNc1M')
@@ -254,3 +294,5 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
+
+# V37.7 static regression notes are also exercised by the existing cookie/options tests.
