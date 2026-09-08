@@ -1,0 +1,8 @@
+V37.3 playback hotfix
+
+- Keeps YouTube format 18 as the acquisition source.
+- FFmpeg still transcodes progressively to 128 kbps MP3.
+- MP3 output now starts directly with MPEG audio frames: ID3v2 and Xing headers are disabled for the live pipe.
+- Resolver proves at least 16 KB of MP3 before opening HTTP 200.
+- Live response explicitly advertises Accept-Ranges: none.
+- Pair with the V37.3 Worker, which feeds the live MP3 to Chrome through MediaSource audio/mpeg instead of the native range-seeking loader.

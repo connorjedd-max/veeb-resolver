@@ -31,7 +31,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V37.1 MP3 Stream", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V37.3 MP3 Stream", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -142,7 +142,7 @@ PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", 
 MP3_BITRATE_KBPS = max(96, min(192, int(os.environ.get("VEEB_MP3_BITRATE_KBPS", "128"))))
 MP3_CHUNK_BYTES = max(16 * 1024, int(os.environ.get("VEEB_MP3_CHUNK_BYTES", str(64 * 1024))))
 MP3_FIRST_BYTE_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_MP3_FIRST_BYTE_TIMEOUT", "8")))
-MP3_STARTUP_MIN_BYTES = max(1024, int(os.environ.get("VEEB_MP3_STARTUP_MIN_BYTES", "4096")))
+MP3_STARTUP_MIN_BYTES = max(4096, int(os.environ.get("VEEB_MP3_STARTUP_MIN_BYTES", "16384")))
 MP3_MAX_CONCURRENT_TRANSCODES = max(1, int(os.environ.get("VEEB_MP3_MAX_CONCURRENT", "2")))
 V37_DIRECT_BUDGET_SECONDS = max(0.5, float(os.environ.get("VEEB_V37_DIRECT_BUDGET", "3.0")))
 
@@ -2593,13 +2593,15 @@ def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -
     return {
         "Content-Type": "audio/mpeg",
         "Cache-Control": "private, no-store",
-        "X-Veeb-Resolver": "v37.1-mp3-stream",
+        "Accept-Ranges": "none",
+        "X-Content-Type-Options": "nosniff",
+        "X-Veeb-Resolver": "v37.3-mp3-stream",
         "X-Veeb-Resolved-Cache": cache_state,
         "X-Veeb-Playback-Client": media.client,
         "X-Veeb-Source-Format": media.format_id or SOURCE_FORMAT,
         "X-Veeb-Resolver-Path": media.resolver_path,
         "X-Veeb-Direct-Proxy": "0",
-        "X-Veeb-Transcode": "ffmpeg-direct-http-mp3-v2",
+        "X-Veeb-Transcode": "ffmpeg-direct-http-mp3-v3",
         "X-Veeb-MP3-Bitrate": str(MP3_BITRATE_KBPS),
         "X-Veeb-Ignored-Range": "1" if request.headers.get("range") else "0",
     }
@@ -2710,6 +2712,8 @@ async def prepare_live_mp3_stream(
             "-b:a", f"{MP3_BITRATE_KBPS}k",
             "-ac", "2",
             "-ar", "44100",
+            "-id3v2_version", "0",
+            "-write_xing", "0",
             "-f", "mp3",
             "-flush_packets", "1",
             "pipe:1",
@@ -2741,7 +2745,7 @@ async def prepare_live_mp3_stream(
                 + (": " + stderr.decode("utf-8", "replace")[-1200:] if stderr else "")
             )
 
-        print("v37.1 mp3 first byte ready", json.dumps({
+        print("v37.3 mp3 first bytes ready", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "sourceFormat": media.format_id,
@@ -2768,7 +2772,7 @@ async def prepare_live_mp3_stream(
                     except Exception:
                         pass
                 if rc != 0:
-                    print("v37.1 ffmpeg ended non-zero", json.dumps({
+                    print("v37.3 ffmpeg ended non-zero", json.dumps({
                         "videoId": video_id,
                         "returnCode": rc,
                         "error": stderr.decode("utf-8", "replace")[-1600:],
@@ -2791,7 +2795,7 @@ async def _resolved_media_for_transcode(video_id: str) -> tuple[ResolvedMedia, s
     if status in {403, 410}:
         rejected_path = media.resolver_path
         invalidate_media(video_id)
-        print("v37.1 source url rejected", json.dumps({
+        print("v37.3 source url rejected", json.dumps({
             "videoId": video_id,
             "status": status,
             "client": media.client,
@@ -2828,7 +2832,7 @@ async def proxy_media(request: Request, video_id: str):
     try:
         body = await prepare_live_mp3_stream(media, video_id, request)
     except Exception as first_exc:
-        print("v37.1 mp3 start failed; refreshing source once", json.dumps({
+        print("v37.3 mp3 start failed; refreshing source once", json.dumps({
             "videoId": video_id,
             "error": str(first_exc)[-1800:],
         }), flush=True)
@@ -2842,14 +2846,14 @@ async def proxy_media(request: Request, video_id: str):
         try:
             body = await prepare_live_mp3_stream(media, video_id, request)
         except Exception as second_exc:
-            print("v37.1 mp3 recovery failed", json.dumps({
+            print("v37.3 mp3 recovery failed", json.dumps({
                 "videoId": video_id,
                 "error": str(second_exc)[-1800:],
             }), flush=True)
             raise HTTPException(status_code=502, detail="MP3 transcode startup failed") from second_exc
 
     headers = live_mp3_headers(media, cache_state, request)
-    print("v37.1 mp3 stream open", json.dumps({
+    print("v37.3 mp3 stream open", json.dumps({
         "videoId": video_id,
         "client": media.client,
         "formatId": media.format_id,
