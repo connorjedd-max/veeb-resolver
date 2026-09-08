@@ -1,0 +1,21 @@
+V37.4 resolver reliability hotfix
+
+Why this exists
+- Render logs showed the resolver still forced format 18 even though FFmpeg now canonicalises everything to MP3.
+- mweb/POT could resolve format 18, but the resulting Googlevideo URL frequently probed HTTP 403.
+- intent prefetch cancellation did not stop yt-dlp work already running in asyncio.to_thread, so several skipped tracks could continue consuming the single foreground resolver slot.
+
+Changes
+- yt-dlp acquisition is now audio-first: bestaudio[ext=m4a]/bestaudio/best.
+- yt-dlp check_formats is enabled so unusable signed URLs are rejected before winning.
+- direct Innertube selection prefers itags 140, 251, then 18.
+- resolved URL probes try a useful range first, then a plain streaming GET before declaring the URL dead.
+- live-intent prefetch is direct-only and cancellable. It never enters the heavyweight yt-dlp path.
+- foreground Play immediately replaces an in-flight intent warm instead of waiting behind it.
+- Veeb/R2 output remains MP3 only.
+
+Deployment
+- Resolver only. Keep the V37.3 Cloudflare Worker deployed.
+- Upload the contents of this folder to the existing GitHub resolver repo.
+- Leave YOUTUBE_STREAM_FORMAT unset.
+- Wait for Render to report Live before testing.

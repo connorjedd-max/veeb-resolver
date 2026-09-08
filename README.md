@@ -12,7 +12,7 @@ This build keeps the proven YouTube acquisition source format at itag 18, but it
 
 ## Keep this setting
 
-Do **not** set `YOUTUBE_STREAM_FORMAT=140` in this build. Leave it unset so acquisition remains format 18. V37 changes the delivery/cache format, not the fragile YouTube source selection.
+Leave `YOUTUBE_STREAM_FORMAT` unset. V37.4 no longer forces format 18. Acquisition now prefers audio-only sources (`140`, then `251`, with yt-dlp `bestaudio[ext=m4a]/bestaudio/best`) and FFmpeg still emits canonical MP3.
 
 ## Optional environment variables
 

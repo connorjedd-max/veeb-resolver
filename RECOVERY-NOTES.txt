@@ -1,6 +1,6 @@
 V37 NOTE, 2026-09-08
 
-This package now keeps format 18 only as the internal acquisition source. `/stream` delivers progressive MP3 via FFmpeg. Leave YOUTUBE_STREAM_FORMAT unset.
+V37.4 uses audio-first internal acquisition and `/stream` delivers progressive MP3 via FFmpeg. Leave YOUTUBE_STREAM_FORMAT unset.
 
 The historical recovery notes below are retained because they explain why switching the source directly to 140 was backed out.
 
@@ -13,5 +13,5 @@ Docker-only recovery changes:
 - POT provider is given the CPU first and up to 90 seconds to become ready.
 - YouTube.js helper starts after POT is ready and is given up to 60 seconds to warm.
 
-Do not set YOUTUBE_STREAM_FORMAT=140. Leave it unset for the resolver's default 18.
+Leave YOUTUBE_STREAM_FORMAT unset. Use YOUTUBE_SOURCE_SELECTOR only for deliberate resolver experiments.
 Expected helper log includes: "evaluator":"node:vm".

@@ -31,7 +31,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V37.3 MP3 Stream", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V37.4 MP3 Stream", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -46,7 +46,19 @@ JSC_REMOTE_COMPONENTS = [
     for item in os.environ.get("VEEB_JSC_REMOTE_COMPONENTS", "ejs:npm").split(",")
     if item.strip()
 ]
-SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "18").strip() or "18"
+# V37.4 acquisition is audio-first. FFmpeg always converts the winning source
+# to MP3, so there is no reason to force YouTube progressive format 18 anymore.
+# Keep the legacy env var as an optional exact-itag override only.
+SOURCE_FORMAT = os.environ.get("YOUTUBE_STREAM_FORMAT", "").strip()
+YTDLP_SOURCE_SELECTOR = (
+    os.environ.get("YOUTUBE_SOURCE_SELECTOR", "").strip()
+    or "bestaudio[ext=m4a]/bestaudio/best"
+)
+DIRECT_SOURCE_ITAGS = [
+    item.strip()
+    for item in os.environ.get("VEEB_DIRECT_SOURCE_ITAGS", "140,251,18").split(",")
+    if item.strip()
+]
 YOUTUBE_PREMIUM_ACCOUNT = os.environ.get("YOUTUBE_PREMIUM_ACCOUNT", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -137,8 +149,8 @@ UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_UPSTREAM_
 UPSTREAM_READ_TIMEOUT_SECONDS = max(10.0, float(os.environ.get("VEEB_UPSTREAM_READ_TIMEOUT", "45")))
 PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", str(256 * 1024))))
 
-# V37 canonical delivery format. YouTube format 18 remains the acquisition source
-# because it is the proven resolver path, but Veeb only receives/stores MP3.
+# V37.4 canonical delivery format. YouTube acquisition is audio-first and
+# disposable; Veeb and R2 only receive/store MP3.
 MP3_BITRATE_KBPS = max(96, min(192, int(os.environ.get("VEEB_MP3_BITRATE_KBPS", "128"))))
 MP3_CHUNK_BYTES = max(16 * 1024, int(os.environ.get("VEEB_MP3_CHUNK_BYTES", str(64 * 1024))))
 MP3_FIRST_BYTE_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_MP3_FIRST_BYTE_TIMEOUT", "8")))
@@ -463,7 +475,7 @@ def format_has_drm(fmt: dict[str, Any]) -> bool:
 
 
 def select_direct_format(data: dict[str, Any]) -> dict[str, Any] | None:
-    """Select the target format even when YouTube returns signatureCipher instead of url."""
+    """Select an audio-first source for FFmpeg, with combined video only as fallback."""
     streaming = data.get("streamingData") or {}
     formats = list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or [])
     candidates = [
@@ -476,22 +488,32 @@ def select_direct_format(data: dict[str, Any]) -> dict[str, Any] | None:
             or isinstance(fmt.get("cipher"), str)
         )
     ]
-    for fmt in candidates:
-        if str(fmt.get("itag")) == SOURCE_FORMAT:
-            return fmt
-    combined_mp4 = [
+
+    # Veeb's low-cost audio-only preferences. The legacy YOUTUBE_STREAM_FORMAT
+    # value is intentionally ignored here so an old Render env var cannot force
+    # format 18 back into the new MP3 architecture.
+    for itag in DIRECT_SOURCE_ITAGS:
+        for fmt in candidates:
+            if str(fmt.get("itag")) == itag:
+                return fmt
+
+    audio_only = [
         fmt for fmt in candidates
-        if str(fmt.get("mimeType", "")).startswith("video/mp4")
-        and "audioQuality" in fmt
+        if str(fmt.get("mimeType", "")).startswith("audio/")
     ]
-    if combined_mp4:
-        return sorted(combined_mp4, key=lambda item: int(item.get("bitrate") or 0))[0]
-    audio_mp4 = [
+    if audio_only:
+        # Prefer AAC/M4A when present, otherwise highest-bitrate audio-only source.
+        audio_mp4 = [fmt for fmt in audio_only if str(fmt.get("mimeType", "")).startswith("audio/mp4")]
+        pool = audio_mp4 or audio_only
+        return sorted(pool, key=lambda item: int(item.get("bitrate") or 0), reverse=True)[0]
+
+    combined = [
         fmt for fmt in candidates
-        if str(fmt.get("mimeType", "")).startswith("audio/mp4")
+        if "audioQuality" in fmt and str(fmt.get("mimeType", "")).startswith("video/")
     ]
-    if audio_mp4:
-        return sorted(audio_mp4, key=lambda item: int(item.get("bitrate") or 0), reverse=True)[0]
+    if combined:
+        # Last resort only. Pick the lightest combined source since video is discarded.
+        return sorted(combined, key=lambda item: int(item.get("bitrate") or 0))[0]
     return None
 
 
@@ -589,32 +611,43 @@ async def probe_media_url(
     video_id: str,
     label: str,
 ) -> None:
-    """Verify that a signed Google Video URL returns media without downloading it."""
+    """Verify a signed Google Video URL using range and plain-stream fallbacks."""
     started = time.monotonic()
     allowed = {"user-agent", "accept", "accept-language", "sec-fetch-mode", "referer", "origin"}
-    headers = {
+    base_headers = {
         key: value for key, value in source_headers.items()
         if key.lower() in allowed
     }
-    if not headers:
-        headers.update(ytdlp_media_headers())
-    headers["Range"] = "bytes=0-0"
-    headers["Accept-Encoding"] = "identity"
+    if not base_headers:
+        base_headers.update(ytdlp_media_headers())
+    base_headers["Accept-Encoding"] = "identity"
 
     client = get_http_client()
-    request = client.build_request("GET", media_url, headers=headers)
-    response = await client.send(request, stream=True)
-    try:
-        if response.status_code not in {200, 206}:
-            raise RuntimeError(f"{label} Google Video probe returned HTTP {response.status_code}")
-        print("v36.15 media probe success", json.dumps({
-            "videoId": video_id,
-            "label": label,
-            "status": response.status_code,
-            "elapsedSeconds": round(time.monotonic() - started, 3),
-        }), flush=True)
-    finally:
-        await response.aclose()
+    attempts: list[str] = []
+    for range_value in ("bytes=0-65535", None):
+        headers = dict(base_headers)
+        if range_value:
+            headers["Range"] = range_value
+        request = client.build_request("GET", media_url, headers=headers)
+        response = await client.send(request, stream=True)
+        try:
+            if response.status_code in {200, 206}:
+                async for chunk in response.aiter_raw(16 * 1024):
+                    if chunk:
+                        print("v37.4 media probe success", json.dumps({
+                            "videoId": video_id,
+                            "label": label,
+                            "status": response.status_code,
+                            "mode": "range" if range_value else "plain",
+                            "elapsedSeconds": round(time.monotonic() - started, 3),
+                        }), flush=True)
+                        return
+                attempts.append(f"{range_value or 'plain'}:empty")
+            else:
+                attempts.append(f"{range_value or 'plain'}:{response.status_code}")
+        finally:
+            await response.aclose()
+    raise RuntimeError(f"{label} Google Video probe failed " + ", ".join(attempts))
 
 
 async def direct_resolve_one(video_id: str, client_name: str, purpose: str) -> ResolvedMedia:
@@ -1610,11 +1643,11 @@ async def resolve_direct_mweb_pot(video_id: str, purpose: str) -> ResolvedMedia:
                 "formats": len(streaming.get("formats") or []),
                 "adaptiveFormats": len(streaming.get("adaptiveFormats") or []),
                 "hasServerAbr": bool(streaming.get("serverAbrStreamingUrl")),
-                "itag18Present": any(
-                    str(item.get("itag")) == SOURCE_FORMAT
+                "preferredItagsPresent": [
+                    str(item.get("itag"))
                     for item in (list(streaming.get("formats") or []) + list(streaming.get("adaptiveFormats") or []))
-                    if isinstance(item, dict)
-                ),
+                    if isinstance(item, dict) and str(item.get("itag")) in set(DIRECT_SOURCE_ITAGS)
+                ],
             }
             raise RuntimeError(
                 "plain mweb /player returned no usable format: "
@@ -2138,7 +2171,7 @@ def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
 def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger) -> dict[str, Any]:
     cookie_file = get_writable_cookie_file()
     opts: dict[str, Any] = {
-        "format": SOURCE_FORMAT,
+        "format": YTDLP_SOURCE_SELECTOR,
         "skip_download": True,
         "noplaylist": True,
         "quiet": True,
@@ -2147,7 +2180,10 @@ def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger) -> dict[str, Any]:
         "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
         "retries": 0,
         "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
-        "check_formats": False,
+        # Reject signed URLs that are already unusable before they can win.
+        # yt-dlp will fall through the selector alternatives when a candidate
+        # cannot actually be opened from this Render instance.
+        "check_formats": True,
         "js_runtimes": {JSC_RUNTIME: {}},
         "extractor_args": {"youtube": youtube_extractor_args_dict(client_name)},
         "logger": logger,
@@ -2287,20 +2323,33 @@ def init_ytdlp_pools() -> None:
 
 
 async def probe_resolved_media(media: ResolvedMedia) -> None:
+    """Verify a resolved source without falsely rejecting range-sensitive GVS URLs."""
     client = get_http_client()
-    headers = {
+    base_headers = {
         k: v for k, v in media.http_headers.items()
-        if k.lower() not in {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding"}
+        if k.lower() not in {"authorization", "cookie", "host", "content-length", "connection", "transfer-encoding", "range"}
     }
-    headers["Range"] = "bytes=0-0"
-    headers["Accept-Encoding"] = "identity"
-    request = client.build_request("GET", media.url, headers=headers)
-    response = await client.send(request, stream=True)
-    try:
-        if response.status_code not in {200, 206}:
-            raise RuntimeError(f"resolved media probe returned HTTP {response.status_code}")
-    finally:
-        await response.aclose()
+    base_headers["Accept-Encoding"] = "identity"
+    attempts: list[str] = []
+    for range_value in ("bytes=0-65535", None):
+        headers = dict(base_headers)
+        if range_value:
+            headers["Range"] = range_value
+        request = client.build_request("GET", media.url, headers=headers)
+        response = await client.send(request, stream=True)
+        try:
+            if response.status_code in {200, 206}:
+                # Read one chunk so a connection that only succeeds at headers
+                # cannot poison the resolved-media cache.
+                async for chunk in response.aiter_raw(16 * 1024):
+                    if chunk:
+                        return
+                attempts.append(f"{range_value or 'plain'}:empty")
+            else:
+                attempts.append(f"{range_value or 'plain'}:{response.status_code}")
+        finally:
+            await response.aclose()
+    raise RuntimeError("resolved media probe failed " + ", ".join(attempts))
 
 
 def _consume_background_task(task: asyncio.Task[Any], label: str, video_id: str) -> None:
@@ -2462,7 +2511,13 @@ async def resolve_media_uncached(video_id: str, purpose: str) -> ResolvedMedia:
     cached = get_cached_media(video_id)
     if cached:
         return cached
-    if purpose.startswith("live"):
+    if purpose == "live-intent":
+        # Intent warming must stay cancellable. asyncio cancellation cannot stop an
+        # already-running asyncio.to_thread(yt-dlp) job, so speculative intent must
+        # never enter the heavyweight extractor. Foreground playback will promote
+        # to a real live resolve if this cheap direct warm does not succeed.
+        media = await resolve_prefetch_v35(video_id, purpose)
+    elif purpose.startswith("live"):
         media = await resolve_live_cold_v35(video_id, purpose)
     else:
         media = await resolve_prefetch_v35(video_id, purpose)
@@ -2511,13 +2566,19 @@ async def get_or_resolve(video_id: str, purpose: str) -> tuple[ResolvedMedia, st
         existing_purpose = _resolve_task_purpose.get(video_id, "")
         if purpose == "live" and existing_purpose == "live-intent":
             global _active_intent_video_id
-            _resolve_task_purpose[video_id] = "live"
+            # V37.4 intent jobs are direct-only and therefore genuinely cancellable.
+            # Do not make the user's Play wait behind speculative warming.
+            if _resolve_tasks.get(video_id) is task:
+                _resolve_tasks.pop(video_id, None)
+                _resolve_task_purpose.pop(video_id, None)
+            task.cancel()
             if _active_intent_video_id == video_id:
                 _active_intent_video_id = None
-            print("foreground joining intent resolver", json.dumps({
+            print("foreground replacing direct-only intent resolver", json.dumps({
                 "videoId": video_id,
             }), flush=True)
-            return await asyncio.shield(task), "WAIT-INTENT"
+            foreground = start_resolve_task(video_id, "live")
+            return await asyncio.shield(foreground), "MISS-AFTER-INTENT"
         if purpose == "live" and existing_purpose == "prefetch":
             print("foreground promoting speculative resolve to single-flight", json.dumps({
                 "videoId": video_id
@@ -2595,10 +2656,10 @@ def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -
         "Cache-Control": "private, no-store",
         "Accept-Ranges": "none",
         "X-Content-Type-Options": "nosniff",
-        "X-Veeb-Resolver": "v37.3-mp3-stream",
+        "X-Veeb-Resolver": "v37.4-mp3-stream",
         "X-Veeb-Resolved-Cache": cache_state,
         "X-Veeb-Playback-Client": media.client,
-        "X-Veeb-Source-Format": media.format_id or SOURCE_FORMAT,
+        "X-Veeb-Source-Format": media.format_id or YTDLP_SOURCE_SELECTOR,
         "X-Veeb-Resolver-Path": media.resolver_path,
         "X-Veeb-Direct-Proxy": "0",
         "X-Veeb-Transcode": "ffmpeg-direct-http-mp3-v3",
@@ -2610,8 +2671,8 @@ def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -
 def ffmpeg_http_input_args(media: ResolvedMedia) -> list[str]:
     """Build FFmpeg HTTP input options for the resolved Googlevideo URL.
 
-    FFmpeg owns the upstream HTTP connection. That is intentional: MP4 format 18
-    can require seeking/range requests to locate metadata before decoding audio.
+    FFmpeg owns the upstream HTTP connection. That is intentional: selected source
+    containers may require seeking/range requests before audio decoding can start.
     """
     headers = build_transcode_source_headers(media)
     user_agent = ""
@@ -2745,7 +2806,7 @@ async def prepare_live_mp3_stream(
                 + (": " + stderr.decode("utf-8", "replace")[-1200:] if stderr else "")
             )
 
-        print("v37.3 mp3 first bytes ready", json.dumps({
+        print("v37.4 mp3 first bytes ready", json.dumps({
             "videoId": video_id,
             "purpose": purpose,
             "sourceFormat": media.format_id,
@@ -2772,7 +2833,7 @@ async def prepare_live_mp3_stream(
                     except Exception:
                         pass
                 if rc != 0:
-                    print("v37.3 ffmpeg ended non-zero", json.dumps({
+                    print("v37.4 ffmpeg ended non-zero", json.dumps({
                         "videoId": video_id,
                         "returnCode": rc,
                         "error": stderr.decode("utf-8", "replace")[-1600:],
@@ -2795,7 +2856,7 @@ async def _resolved_media_for_transcode(video_id: str) -> tuple[ResolvedMedia, s
     if status in {403, 410}:
         rejected_path = media.resolver_path
         invalidate_media(video_id)
-        print("v37.3 source url rejected", json.dumps({
+        print("v37.4 source url rejected", json.dumps({
             "videoId": video_id,
             "status": status,
             "client": media.client,
@@ -2832,7 +2893,7 @@ async def proxy_media(request: Request, video_id: str):
     try:
         body = await prepare_live_mp3_stream(media, video_id, request)
     except Exception as first_exc:
-        print("v37.3 mp3 start failed; refreshing source once", json.dumps({
+        print("v37.4 mp3 start failed; refreshing source once", json.dumps({
             "videoId": video_id,
             "error": str(first_exc)[-1800:],
         }), flush=True)
@@ -2846,14 +2907,14 @@ async def proxy_media(request: Request, video_id: str):
         try:
             body = await prepare_live_mp3_stream(media, video_id, request)
         except Exception as second_exc:
-            print("v37.3 mp3 recovery failed", json.dumps({
+            print("v37.4 mp3 recovery failed", json.dumps({
                 "videoId": video_id,
                 "error": str(second_exc)[-1800:],
             }), flush=True)
             raise HTTPException(status_code=502, detail="MP3 transcode startup failed") from second_exc
 
     headers = live_mp3_headers(media, cache_state, request)
-    print("v37.3 mp3 stream open", json.dumps({
+    print("v37.4 mp3 stream open", json.dumps({
         "videoId": video_id,
         "client": media.client,
         "formatId": media.format_id,
@@ -2927,7 +2988,7 @@ async def root_head() -> Response:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v37-mp3-stream"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v37.4-mp3-stream"}
 
 
 @app.get("/health")
@@ -2941,9 +3002,10 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v37-mp3-stream",
+        "version": "v37.4-mp3-stream",
         "ytDlpVersion": ytdlp_version,
-        "sourceFormat": SOURCE_FORMAT,
+        "sourceSelector": YTDLP_SOURCE_SELECTOR,
+        "directSourceItags": DIRECT_SOURCE_ITAGS,
         "directClients": DIRECT_CLIENT_ORDER,
         "authFallbackClient": YTDLP_AUTH_CLIENT,
         "potFallbackClient": YTDLP_POT_CLIENT,
@@ -2978,7 +3040,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v37-mp3-resolver",
+        "provider": "veeb-v37.4-mp3-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,
