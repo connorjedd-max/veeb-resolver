@@ -31,7 +31,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="Veeb YouTube Resolver V36.16.6 Session Mirror", docs_url=None, redoc_url=None)
+app = FastAPI(title="Veeb YouTube Resolver V37 MP3 Stream", docs_url=None, redoc_url=None)
 
 RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -137,6 +137,15 @@ UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_UPSTREAM_
 UPSTREAM_READ_TIMEOUT_SECONDS = max(10.0, float(os.environ.get("VEEB_UPSTREAM_READ_TIMEOUT", "45")))
 PROXY_CHUNK_BYTES = max(64 * 1024, int(os.environ.get("VEEB_PROXY_CHUNK_BYTES", str(256 * 1024))))
 
+# V37 canonical delivery format. YouTube format 18 remains the acquisition source
+# because it is the proven resolver path, but Veeb only receives/stores MP3.
+MP3_BITRATE_KBPS = max(96, min(192, int(os.environ.get("VEEB_MP3_BITRATE_KBPS", "128"))))
+MP3_CHUNK_BYTES = max(16 * 1024, int(os.environ.get("VEEB_MP3_CHUNK_BYTES", str(64 * 1024))))
+MP3_FIRST_BYTE_TIMEOUT_SECONDS = max(2.0, float(os.environ.get("VEEB_MP3_FIRST_BYTE_TIMEOUT", "8")))
+MP3_STARTUP_MIN_BYTES = max(1024, int(os.environ.get("VEEB_MP3_STARTUP_MIN_BYTES", "4096")))
+MP3_MAX_CONCURRENT_TRANSCODES = max(1, int(os.environ.get("VEEB_MP3_MAX_CONCURRENT", "2")))
+V37_DIRECT_BUDGET_SECONDS = max(0.5, float(os.environ.get("VEEB_V37_DIRECT_BUDGET", "3.0")))
+
 os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
 
 
@@ -169,6 +178,10 @@ _fg_auth_pool = None
 _fg_pot_pool = None
 _prefetch_pool = None
 _direct_prefetch_sem = asyncio.Semaphore(DIRECT_PREFETCH_CONCURRENCY)
+_mp3_transcode_sem = asyncio.Semaphore(MP3_MAX_CONCURRENT_TRANSCODES)
+# At most one background R2 fill may consume a transcode slot. This leaves room
+# for foreground listeners when the Render instance is under pressure.
+_mp3_cache_fill_sem = asyncio.Semaphore(1)
 _resolve_task_purpose: dict[str, str] = {}
 _direct_client_cooldown_until: dict[str, float] = {}
 _visitor_data: str | None = None
@@ -2349,100 +2362,73 @@ async def resolve_ytdlp_foreground_v35(video_id: str, purpose: str) -> ResolvedM
 
 
 async def resolve_live_cold_v35(video_id: str, purpose: str) -> ResolvedMedia:
-    """V36.16 cold path: verified mweb direct first, yt-dlp only as fallback.
+    """V37 cold path: one expensive resolver at a time.
 
-    The generic direct client race was a permanent loser on Render and only added
-    requests/noise. Give the actual mweb + POT + YouTube.js path a short head
-    start. If it fails, start yt-dlp immediately. If it is merely slow, keep it
-    alive while yt-dlp starts and let the first verified media URL win.
+    The previous build gave the direct mweb/POT/YouTube.js path a head start and
+    then raced it against yt-dlp. On a small Render instance those two expensive
+    jobs competed for the same CPU and made simultaneous users materially worse.
+
+    V37 gives the direct path a strict budget. If it misses that budget it is
+    cancelled before the mature yt-dlp fallback starts.
     """
     init_ytdlp_pools()
     started = time.monotonic()
+    errors: list[str] = []
+
     direct_pot = asyncio.create_task(
         resolve_direct_mweb_pot(video_id, purpose + "-mweb-direct-pot")
     )
-    errors: list[str] = []
 
-    head_start = max(0.0, float(os.environ.get("VEEB_V36_DIRECT_HEAD_START", "1.5")))
-    if head_start > 0:
-        try:
-            winner = await asyncio.wait_for(asyncio.shield(direct_pot), timeout=head_start)
-            print("v36.16.2 cold direct won", json.dumps({
-                "videoId": video_id,
-                "client": winner.client,
-                "resolverPath": winner.resolver_path,
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-            return winner
-        except asyncio.TimeoutError:
-            print("v36.16.2 direct head-start expired", json.dumps({
-                "videoId": video_id,
-                "headStartSeconds": head_start,
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-        except asyncio.CancelledError:
+    try:
+        winner = await asyncio.wait_for(
+            asyncio.shield(direct_pot),
+            timeout=V37_DIRECT_BUDGET_SECONDS,
+        )
+        print("v37 cold direct won", json.dumps({
+            "videoId": video_id,
+            "client": winner.client,
+            "resolverPath": winner.resolver_path,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+        return winner
+    except asyncio.TimeoutError:
+        errors.append(f"direct budget exceeded {V37_DIRECT_BUDGET_SECONDS:.1f}s")
+        print("v37 direct budget expired; cancelling before yt-dlp", json.dumps({
+            "videoId": video_id,
+            "budgetSeconds": V37_DIRECT_BUDGET_SECONDS,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+    except asyncio.CancelledError:
+        direct_pot.cancel()
+        raise
+    except Exception as exc:
+        errors.append(str(exc))
+        print("v37 direct path failed; falling back sequentially", json.dumps({
+            "videoId": video_id,
+            "error": str(exc)[-1600:],
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+    finally:
+        if not direct_pot.done():
             direct_pot.cancel()
-            raise
-        except Exception as exc:
-            errors.append(str(exc))
-            print("v36.16.6 direct head-start failed", json.dumps({
-                "videoId": video_id,
-                "error": str(exc)[-1600:],
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
+            await asyncio.gather(direct_pot, return_exceptions=True)
 
-    # Close the tiny race where the direct task finishes just after the
-    # head-start timeout but before the fallback task is created.
-    if direct_pot.done():
-        try:
-            winner = direct_pot.result()
-            print("v36.16.2 cold direct won after head-start", json.dumps({
-                "videoId": video_id,
-                "client": winner.client,
-                "resolverPath": winner.resolver_path,
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-            return winner
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if str(exc) not in errors:
-                errors.append(str(exc))
-
-    # A real direct failure should never make the user wait out an arbitrary
-    # head-start window. Start the known-working fallback immediately.
-    fallback = asyncio.create_task(resolve_ytdlp_foreground_v35(video_id, purpose))
-    tasks = {fallback}
-    if not direct_pot.done():
-        tasks.add(direct_pot)
-
-    for done in asyncio.as_completed(tasks):
-        try:
-            winner = await done
-            print("v36.16.6 cold race won", json.dumps({
-                "videoId": video_id,
-                "client": winner.client,
-                "resolverPath": winner.resolver_path,
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-                    task.add_done_callback(
-                        lambda finished, label="v36.16-loser": _consume_background_task(finished, label, video_id)
-                    )
-            return winner
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            errors.append(str(exc))
-            print("v36.16.6 cold race path failed", json.dumps({
-                "videoId": video_id,
-                "error": str(exc)[-1600:],
-                "elapsedSeconds": round(time.monotonic() - started, 3),
-            }), flush=True)
-
-    raise RuntimeError("all V36.16.2 cold resolver paths failed: " + " || ".join(errors)[-2600:])
+    try:
+        winner = await resolve_ytdlp_foreground_v35(video_id, purpose + "-sequential-fallback")
+        print("v37 sequential yt-dlp won", json.dumps({
+            "videoId": video_id,
+            "client": winner.client,
+            "resolverPath": winner.resolver_path,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+        }), flush=True)
+        return winner
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        errors.append(str(exc))
+        raise RuntimeError(
+            "all V37 sequential resolver paths failed: " + " || ".join(errors)[-2600:]
+        ) from exc
 
 
 async def resolve_prefetch_v35(video_id: str, purpose: str) -> ResolvedMedia:
@@ -2561,32 +2547,19 @@ def build_upstream_headers(media: ResolvedMedia, request: Request) -> dict[str, 
     return headers
 
 
-PASSTHROUGH_RESPONSE_HEADERS = {
-    "accept-ranges", "content-length", "content-range", "content-type", "etag", "last-modified",
-}
+def build_transcode_source_headers(media: ResolvedMedia) -> dict[str, str]:
+    """Headers for the disposable source fetch feeding FFmpeg.
 
-
-def build_downstream_headers(upstream: httpx.Response, media: ResolvedMedia, cache_state: str) -> dict[str, str]:
-    headers = {k: v for k, v in upstream.headers.items() if k.lower() in PASSTHROUGH_RESPONSE_HEADERS}
-    headers.setdefault("Content-Type", media.content_type or "video/mp4")
-    headers.setdefault("Accept-Ranges", "bytes")
-    headers["Cache-Control"] = "private, no-store"
-    headers["X-Veeb-Resolver"] = "innertube-resilient-v36.3"
-    headers["X-Veeb-Resolved-Cache"] = cache_state
-    headers["X-Veeb-Playback-Client"] = media.client
-    headers["X-Veeb-Source-Format"] = media.format_id or SOURCE_FORMAT
-    headers["X-Veeb-Resolver-Path"] = media.resolver_path
-    headers["X-Veeb-Direct-Proxy"] = "1"
+    A live MP3 transcode always starts at the beginning of the source. Browser
+    byte ranges apply only to completed R2 MP3 objects, never to this source.
+    """
+    blocked = {
+        "authorization", "cookie", "host", "content-length", "connection",
+        "transfer-encoding", "range",
+    }
+    headers = {k: v for k, v in media.http_headers.items() if k.lower() not in blocked}
+    headers["Accept-Encoding"] = "identity"
     return headers
-
-
-async def upstream_body(response: httpx.Response) -> AsyncIterator[bytes]:
-    try:
-        async for chunk in response.aiter_raw(PROXY_CHUNK_BYTES):
-            if chunk:
-                yield chunk
-    finally:
-        await response.aclose()
 
 
 async def open_media_upstream(media: ResolvedMedia, request: Request) -> httpx.Response:
@@ -2595,18 +2568,218 @@ async def open_media_upstream(media: ResolvedMedia, request: Request) -> httpx.R
     return await client.send(upstream_request, stream=True)
 
 
-async def proxy_media(request: Request, video_id: str):
-    media, cache_state = await get_or_resolve(video_id, "live")
-    response = await open_media_upstream(media, request)
+async def open_transcode_source(media: ResolvedMedia) -> httpx.Response:
+    client = get_http_client()
+    upstream_request = client.build_request("GET", media.url, headers=build_transcode_source_headers(media))
+    return await client.send(upstream_request, stream=True)
 
-    # A direct Innertube URL can still be rejected at GVS even though the player
-    # endpoint returned it. If so, invalidate and go straight to the mature
-    # fallback instead of retrying the same experimental client ladder.
+
+def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -> dict[str, str]:
+    # Deliberately omit Content-Length, Content-Range and Accept-Ranges. The live
+    # stream is being created now and is not a random-access completed object.
+    return {
+        "Content-Type": "audio/mpeg",
+        "Cache-Control": "private, no-store",
+        "X-Veeb-Resolver": "v37-mp3-stream",
+        "X-Veeb-Resolved-Cache": cache_state,
+        "X-Veeb-Playback-Client": media.client,
+        "X-Veeb-Source-Format": media.format_id or SOURCE_FORMAT,
+        "X-Veeb-Resolver-Path": media.resolver_path,
+        "X-Veeb-Direct-Proxy": "0",
+        "X-Veeb-Transcode": "ffmpeg-mp3-live-v1",
+        "X-Veeb-MP3-Bitrate": str(MP3_BITRATE_KBPS),
+        "X-Veeb-Ignored-Range": "1" if request.headers.get("range") else "0",
+    }
+
+
+async def _pump_source_to_ffmpeg(source: httpx.Response, process: asyncio.subprocess.Process) -> None:
+    try:
+        assert process.stdin is not None
+        async for chunk in source.aiter_raw(PROXY_CHUNK_BYTES):
+            if not chunk:
+                continue
+            process.stdin.write(chunk)
+            await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+                await process.stdin.wait_closed()
+        except Exception:
+            pass
+        await source.aclose()
+
+
+async def _read_ffmpeg_stderr(process: asyncio.subprocess.Process) -> bytes:
+    try:
+        if process.stderr is None:
+            return b""
+        return await process.stderr.read()
+    except Exception:
+        return b""
+
+
+async def prepare_live_mp3_stream(
+    source: httpx.Response,
+    media: ResolvedMedia,
+    video_id: str,
+    request: Request,
+) -> AsyncIterator[bytes]:
+    """Start FFmpeg and prove we have MP3 bytes before returning HTTP 200."""
+    purpose = (request.headers.get("x-veeb-purpose") or "playback").strip().lower()
+    cache_fill = purpose == "cache-fill"
+
+    # Cache fills are separately capped at one. Both cache and playback then
+    # share the total transcode limit so background work cannot run unbounded.
+    if cache_fill:
+        await _mp3_cache_fill_sem.acquire()
+    await _mp3_transcode_sem.acquire()
+
+    process: asyncio.subprocess.Process | None = None
+    input_task: asyncio.Task[Any] | None = None
+    stderr_task: asyncio.Task[bytes] | None = None
+    released = False
+
+    async def release_slots() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        _mp3_transcode_sem.release()
+        if cache_fill:
+            _mp3_cache_fill_sem.release()
+
+    async def cleanup(kill: bool = False) -> bytes:
+        if input_task is not None and not input_task.done():
+            input_task.cancel()
+        if process is not None and kill and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        if process is not None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except Exception:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+        if not source.is_closed:
+            await source.aclose()
+        stderr = b""
+        if stderr_task is not None:
+            try:
+                stderr = await asyncio.wait_for(asyncio.shield(stderr_task), timeout=1.0)
+            except Exception:
+                pass
+        await release_slots()
+        return stderr
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-i", "pipe:0",
+            "-map", "0:a:0",
+            "-vn",
+            "-map_metadata", "-1",
+            "-c:a", "libmp3lame",
+            "-b:a", f"{MP3_BITRATE_KBPS}k",
+            "-ac", "2",
+            "-ar", "44100",
+            "-f", "mp3",
+            "-flush_packets", "1",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        input_task = asyncio.create_task(_pump_source_to_ffmpeg(source, process))
+        stderr_task = asyncio.create_task(_read_ffmpeg_stderr(process))
+        assert process.stdout is not None
+
+        startup_buffer = bytearray()
+        startup_deadline = time.monotonic() + MP3_FIRST_BYTE_TIMEOUT_SECONDS
+        while len(startup_buffer) < MP3_STARTUP_MIN_BYTES:
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            chunk = await asyncio.wait_for(
+                process.stdout.read(min(MP3_CHUNK_BYTES, MP3_STARTUP_MIN_BYTES - len(startup_buffer))),
+                timeout=remaining,
+            )
+            if not chunk:
+                break
+            startup_buffer.extend(chunk)
+
+        first_chunk = bytes(startup_buffer)
+        if len(first_chunk) < MP3_STARTUP_MIN_BYTES:
+            stderr = await cleanup(kill=True)
+            raise RuntimeError(
+                f"FFmpeg produced only {len(first_chunk)} startup MP3 bytes"
+                + (": " + stderr.decode("utf-8", "replace")[-900:] if stderr else "")
+            )
+
+        print("v37 mp3 first byte ready", json.dumps({
+            "videoId": video_id,
+            "purpose": purpose,
+            "sourceFormat": media.format_id,
+            "resolverPath": media.resolver_path,
+            "firstChunkBytes": len(first_chunk),
+            "bitrateKbps": MP3_BITRATE_KBPS,
+        }), flush=True)
+
+        async def body() -> AsyncIterator[bytes]:
+            try:
+                yield first_chunk
+                assert process is not None and process.stdout is not None
+                while True:
+                    chunk = await process.stdout.read(MP3_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    yield chunk
+
+                rc = await process.wait()
+                stderr = b""
+                if stderr_task is not None:
+                    try:
+                        stderr = await stderr_task
+                    except Exception:
+                        pass
+                if rc != 0:
+                    print("v37 ffmpeg ended non-zero", json.dumps({
+                        "videoId": video_id,
+                        "returnCode": rc,
+                        "error": stderr.decode("utf-8", "replace")[-1200:],
+                    }), flush=True)
+            except asyncio.CancelledError:
+                raise
+            finally:
+                await cleanup(kill=True)
+
+        return body()
+    except Exception:
+        await cleanup(kill=True)
+        raise
+
+
+async def _resolved_source_for_transcode(video_id: str, request: Request) -> tuple[ResolvedMedia, str, httpx.Response]:
+    media, cache_state = await get_or_resolve(video_id, "live")
+    response = await open_transcode_source(media)
+
+    # A player URL can be syntactically valid but rejected by GVS. Refresh once
+    # before FFmpeg starts so the browser never receives a fake successful stream.
     if response.status_code in {403, 410}:
         rejected_path = media.resolver_path
         await response.aclose()
         invalidate_media(video_id)
-        print("media url rejected", json.dumps({
+        print("v37 source url rejected", json.dumps({
             "videoId": video_id,
             "status": response.status_code,
             "client": media.client,
@@ -2624,29 +2797,62 @@ async def proxy_media(request: Request, video_id: str):
         else:
             media = await resolve_media_uncached(video_id, "live-refresh")
         cache_state = "REFRESH"
-        response = await open_media_upstream(media, request)
+        response = await open_transcode_source(media)
 
     if response.status_code >= 400:
         status = response.status_code
         body = await response.aread()
         await response.aclose()
         detail = body[:800].decode("utf-8", "replace") if body else ""
-        raise HTTPException(status_code=502, detail=f"Upstream media server returned HTTP {status}" + (f": {detail}" if detail else ""))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream media server returned HTTP {status}" + (f": {detail}" if detail else ""),
+        )
 
-    headers = build_downstream_headers(response, media, cache_state)
-    print("direct media proxy open", json.dumps({
+    return media, cache_state, response
+
+
+async def proxy_media(request: Request, video_id: str):
+    # HEAD advertises the canonical delivery type without starting an expensive
+    # transcode. Completed R2 objects provide real Content-Length/Range metadata.
+    if request.method == "HEAD":
+        media, cache_state = await get_or_resolve(video_id, "live")
+        headers = live_mp3_headers(media, cache_state, request)
+        return Response(status_code=200, headers=headers)
+
+    media, cache_state, source = await _resolved_source_for_transcode(video_id, request)
+
+    try:
+        body = await prepare_live_mp3_stream(source, media, video_id, request)
+    except Exception as first_exc:
+        # One hard recovery attempt. A failure before first MP3 bytes are emitted
+        # is treated as a bad source/resolution, not as successful playback.
+        print("v37 mp3 start failed; refreshing source once", json.dumps({
+            "videoId": video_id,
+            "error": str(first_exc)[-1400:],
+        }), flush=True)
+        invalidate_media(video_id)
+        media = await resolve_ytdlp_foreground_v35(video_id, "live-mp3-recovery")
+        _resolved_cache[video_id] = media
+        cache_state = "MP3-RECOVERY"
+        source = await open_transcode_source(media)
+        if source.status_code >= 400:
+            status = source.status_code
+            await source.aclose()
+            raise HTTPException(status_code=502, detail=f"MP3 recovery source returned HTTP {status}")
+        body = await prepare_live_mp3_stream(source, media, video_id, request)
+
+    headers = live_mp3_headers(media, cache_state, request)
+    print("v37 mp3 stream open", json.dumps({
         "videoId": video_id,
         "client": media.client,
         "formatId": media.format_id,
         "resolverPath": media.resolver_path,
         "resolvedCache": cache_state,
-        "range": request.headers.get("range"),
-        "upstreamStatus": response.status_code,
+        "ignoredRange": request.headers.get("range"),
+        "bitrateKbps": MP3_BITRATE_KBPS,
     }), flush=True)
-    if request.method == "HEAD":
-        await response.aclose()
-        return Response(status_code=response.status_code, headers=headers)
-    return StreamingResponse(upstream_body(response), status_code=response.status_code, headers=headers, media_type=headers.get("Content-Type"))
+    return StreamingResponse(body, status_code=200, headers=headers, media_type="audio/mpeg")
 
 
 @app.on_event("startup")
@@ -2711,7 +2917,7 @@ async def root_head() -> Response:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "veeb-resolver", "version": "v36.15-youtubejs"}
+    return {"ok": True, "service": "veeb-resolver", "version": "v37-mp3-stream"}
 
 
 @app.get("/health")
@@ -2725,7 +2931,7 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     return {
         "ok": True,
         "service": "veeb-resolver",
-        "version": "v36.15-youtubejs",
+        "version": "v37-mp3-stream",
         "ytDlpVersion": ytdlp_version,
         "sourceFormat": SOURCE_FORMAT,
         "directClients": DIRECT_CLIENT_ORDER,
@@ -2747,7 +2953,12 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
             if until > time.time()
         },
         "heavyPrefetch": HEAVY_PREFETCH,
-        "architecture": "v36.16.4-player-datasync-gvs-plus-warm-bgutil-with-ytdlp-fallback",
+        "architecture": "v37-sequential-resolve-plus-live-mp3-r2-canonical",
+        "deliveryFormat": "audio/mpeg",
+        "mp3BitrateKbps": MP3_BITRATE_KBPS,
+        "mp3StartupMinBytes": MP3_STARTUP_MIN_BYTES,
+        "maxConcurrentTranscodes": MP3_MAX_CONCURRENT_TRANSCODES,
+        "directBudgetSeconds": V37_DIRECT_BUDGET_SECONDS,
     }
 
 
@@ -2757,7 +2968,7 @@ async def resolve_endpoint(video_id: str, authorization: str | None = Header(def
     video_id = validate_video_id(video_id)
     media, cache_state = await get_or_resolve(video_id, "metadata")
     return JSONResponse({
-        "provider": "veeb-v36.15-youtubejs-resolver",
+        "provider": "veeb-v37-mp3-resolver",
         "videoId": video_id,
         "title": media.title,
         "duration": media.duration,

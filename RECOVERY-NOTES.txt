@@ -1,3 +1,9 @@
+V37 NOTE, 2026-09-08
+
+This package now keeps format 18 only as the internal acquisition source. `/stream` delivers progressive MP3 via FFmpeg. Leave YOUTUBE_STREAM_FORMAT unset.
+
+The historical recovery notes below are retained because they explain why switching the source directly to 140 was backed out.
+
 V36.15 recovery package, 2026-08-15
 
 Application resolver source is unchanged.
