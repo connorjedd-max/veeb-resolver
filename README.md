@@ -1,4 +1,4 @@
-VEEB V37.6: DEPLOYMENT AND LIVE CHECK
+VEEB V37.7: DEPLOYMENT AND LIVE CHECK
 
 This is a tested code repair, not a claim that YouTube has accepted requests from
 Render. The supplied logs fail during acquisition before FFmpeg starts. They do
@@ -6,7 +6,7 @@ not prove that every current yt-dlp acquisition path or every Render IP is block
 
 1. RESOLVER FIRST
 
-Extract veeb-resolver-v37.6.zip. Open the extracted veeb-resolver-v37.6 folder.
+Extract veeb-resolver-v37.7.zip. Open the extracted veeb-resolver-v37.7 folder.
 Upload its CONTENTS to the ROOT of your existing resolver GitHub repository.
 Dockerfile must sit beside veeb_resolver.py, not inside another nested folder.
 
@@ -24,7 +24,7 @@ Files to replace/add at repository root:
 Commit the upload. Wait for Render to finish building and show Live.
 The build runs the 12 offline regression tests, imports the actual FastAPI app,
 and checks package dependencies. A failing check stops the new deployment.
-The public resolver root / should show version v37.6-mp3-stream.
+The public resolver root / should show version v37.7-mp3-stream.
 
 Keep your current RESOLVER_SECRET and existing cookie secret file. No new account,
 proxy, secret, queue, paid plan, or R2 binding is required by this patch.
@@ -39,7 +39,7 @@ customized YOUTUBE_AUTH_FALLBACK_CLIENT, remove it to restore yt-dlp defaults.
 2. CLOUDFLARE WORKER SECOND
 
 Cloudflare -> Workers & Pages -> your Veeb Worker -> Edit code.
-Open veeb-worker-v37.6.txt. Copy ALL its contents and replace the ENTIRE Worker
+Open veeb-worker-v37.7.txt. Copy ALL its contents and replace the ENTIRE Worker
 source. Save and deploy. This is not a snippet to append.
 
 Keep these bindings/variables as currently configured:
@@ -49,7 +49,7 @@ Keep these bindings/variables as currently configured:
   YOUTUBE_RESOLVER_SECRET     must equal Render's RESOLVER_SECRET
   ADMIN_EMAIL                your admin email
 
-The updated R2 writer requires the completed-file response from resolver V37.6.
+The updated R2 writer requires the completed-file response from resolver V37.7.
 Do not deploy the new Worker against V37.4/V37.5.
 
 3. RUN THE ACTUAL ACQUISITION / MP3 / R2 TEST
@@ -61,8 +61,8 @@ Click TEST PLAYBACK. The result opens as formatted JSON. Allow up to a few minut
 if the service was asleep or jobs were already active.
 
 Successful result:
-  workerVersion includes v37.6
-  health.version is v37.6-mp3-stream
+  workerVersion includes v37.7
+  health.version is v37.7-mp3-stream
   playback.ok = true
   playback.mp3Complete = true
   playback.bytes > 0
@@ -77,7 +77,7 @@ successful local resolver job may be reused. The test then writes/reads the MP3
 through R2. A repeated diagnostic is not automatically a fresh YouTube test.
 
 If playback.ok = false, copy the entire JSON result plus the corresponding Render
-lines beginning 'v37.6 acquisition attempt failed' or 'v37.6 source-to-mp3 attempt
+lines beginning 'v37.7 acquisition attempt failed' or 'v37.7 source-to-mp3 attempt
 failed'. Those lines identify which source attempt failed, without signed URLs.
 
 SOURCE_ACCESS_DENIED means a source attempt received a bot/login denial and none

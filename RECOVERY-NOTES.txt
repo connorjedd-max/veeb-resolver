@@ -1,4 +1,4 @@
-V37.6 supersedes the old format-18 recovery instructions.
+V37.7 supersedes the old format-18 recovery instructions.
 Follow README.md. Do not restore YOUTUBE_STREAM_FORMAT=18 to troubleshoot this
 release. MP3 conversion and acquisition are tested by /admin -> TEST PLAYBACK.
 For rollback, revert the resolver Git commit and Worker deployment together.
