@@ -1,0 +1,15 @@
+services:
+  source-agent:
+    build: .
+    image: veeb-source-agent:v39.0
+    restart: unless-stopped
+    init: true
+    env_file: .agent.env
+    environment:
+      VEEB_ROLE: agent
+      VEEB_SOURCE_MODE: direct
+      VEEB_AGENT_CACHE_DIR: /data/audio
+      YOUTUBE_COOKIE_FILE: /data/youtube-cookies.txt
+    volumes:
+      - ./agent-data:/data
+    # No ports are published. This computer makes outbound HTTPS connections only.

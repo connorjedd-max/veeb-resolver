@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import shutil
 import sys
 import tempfile
 from source_support import DiagnosticLog, failure_code, redact, reported_login_state
+from progressive_source import publish_streamable_progress
 MAX_SOURCE_BYTES = 80 * 1024 * 1024
 
 
@@ -61,15 +63,21 @@ def run(payload):
                 download_dir = str(payload.get('downloadDirectory') or tempfile.mkdtemp(prefix='veeb-ytdlp-source-'))
                 Path(download_dir).mkdir(parents=True, exist_ok=True)
                 options.update(skip_download=False, outtmpl=os.path.join(download_dir, '%(id)s.%(ext)s'),
-                               nopart=False, concurrent_fragment_downloads=1, max_filesize=MAX_SOURCE_BYTES, fragment_retries=0)
+                               nopart=False, concurrent_fragment_downloads=1, max_filesize=MAX_SOURCE_BYTES,
+                               fragment_retries=2, skip_unavailable_fragments=False,
+                               hls_prefer_native=True)
                 def progress(data):
                     logger.progress(data)
+                    publish_streamable_progress(data, download_dir)
                     if int(data.get('downloaded_bytes') or 0) > MAX_SOURCE_BYTES:
                         raise RuntimeError('Source exceeds the 80 MiB size limit')
                 options['progress_hooks'] = [progress]
                 def finite_only(info, *, incomplete=False):
                     if info.get('is_live') or info.get('live_status') in {'is_live', 'is_upcoming'}:
                         return 'Live broadcasts are not supported by the finite MP3 cache'
+                    duration = info.get('duration')
+                    if duration is not None and (not math.isfinite(float(duration)) or not 1 <= float(duration) <= 1800):
+                        return 'Source duration must be between 1 and 1800 seconds'
                     return None
                 options['match_filter'] = finite_only
             try:
@@ -94,7 +102,7 @@ def run(payload):
             download_bytes = None
             if download:
                 candidates = [p for p in Path(download_dir).iterdir() if p.is_file() and p.name.startswith(video_id + '.') and not p.name.endswith(('.part', '.ytdl'))]
-                if not candidates: raise RuntimeError('yt-dlp returned without a completed source file')
+                if len(candidates) != 1: raise RuntimeError('yt-dlp did not return exactly one completed source file')
                 source = max(candidates, key=lambda p: p.stat().st_size)
                 download_bytes = source.stat().st_size
                 if not 0 < download_bytes <= MAX_SOURCE_BYTES: raise RuntimeError('Downloaded source is empty or exceeds 80 MiB')

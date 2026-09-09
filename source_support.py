@@ -13,7 +13,7 @@ AUTH_NAMES = {'SAPISID', '__Secure-1PAPISID', '__Secure-3PAPISID', 'SID', '__Sec
 
 def redact(message, limit=600):
     text = str(message or '').replace('\x00', '')
-    text = re.sub(r'https?://[^\s\"\'<>]+', '[url]', text, flags=re.I)
+    text = re.sub(r'(?:https?|socks[45]h?)://[^\s\"\'<>]+', '[url]', text, flags=re.I)
     text = re.sub(r'\S*[?&](?:expire|itag|source|mime|sparams|lsparams|bui|spc|sig|lsig|pot|n)=\S*', '[media-query]', text, flags=re.I)
     text = re.sub(r'(?i)(?:cookie|authorization)\s*[:=]\s*[^\r\n]+', '[credential-header]', text)
     text = re.sub(r'''(?ix)(\b(?:po[_ -]?token|integrity[_ -]?token|pot|sig|lsig|spc)\b)[\\'"\s]*[:=][\\'"\s]*[^\s,;\)\]}>]+''', r'\1=<redacted>', text)
@@ -35,6 +35,8 @@ def failure_code(message, stage='extract'):
         return 'SOURCE_FORMAT_UNAVAILABLE'
     if 'live broadcasts' in low:
         return 'LIVE_SOURCE_NOT_SUPPORTED'
+    if 'duration must be' in low:
+        return 'SOURCE_DURATION_UNSUPPORTED'
     return 'SOURCE_ACQUISITION_FAILED'
 
 

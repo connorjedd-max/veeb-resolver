@@ -1,0 +1,59 @@
+VEEB V39.1 VALIDATION. 9 SEPTEMBER 2026
+
+PASS: 73 Python resolver tests, 20 Node Worker/player tests. No skips or failures.
+Final Python run: 4.490 seconds, Python 3.12 on Linux.
+Final Node run: 162 ms, Node 24.19.0.
+All resolver Python modules compile. Full Worker module and its decoded inline
+client script pass Node syntax checking.
+
+Resolver command:
+  python -m unittest discover -s tests -v
+Worker commands are in worker-verification/README.txt.
+
+REAL SOURCE-TRANSPORT / MP3 TESTS
+The current yt-dlp HTTP downloader fetched a synthetic WebM from a controlled
+local HTTP server. Real FFmpeg produced the first valid MP3 bytes in 107 ms in
+the final run, while the server deliberately held the remainder of the source.
+An earlier isolated run measured 148 ms. The completed MP3 was 320,574 bytes with
+20 seconds of validated audio and decoded successfully with FFmpeg.
+
+This is time to first MP3 bytes in the local fixture. It excludes live YouTube
+metadata/token/access latency, Render cold starts, Cloudflare/R2 network latency
+and browser buffering. It is not a live tap-to-audible result or a guarantee.
+
+The same real downloader was interrupted after startup. The partial stream did
+not become a completed MP3, and the partial job file was deleted. Cancellation
+while waiting for an encoder slot and during active streaming both closed the
+owned downloader and removed its directory. MP4 and segmented sources were
+confirmed ineligible for the growing-file pipe path.
+
+Retained tests cover actual FastAPI/ASGI auth and route behaviour, shared jobs,
+full MP3 frame validation, source-duration mismatch, invalid imports, missing
+HLS fragments, read-only completed cache misses, cancellation of child processes,
+cookie snapshots and rotation, source cooldowns, and optional agent ownership.
+
+WORKER / PLAYER TESTS
+- Cached playback without resolver configuration or a cache-state DB lookup.
+  The actual audio routes still require authentication.
+- R2 byte ranges, HEAD, ETag, invalid ranges, unverified object rejection.
+- Live streams omit unfinished Content-Length and do not forward browser ranges.
+- Completed resolver responses retain their finite length.
+- A resolver that never returns headers reaches its timeout; source errors keep
+  their machine-readable code and Retry-After.
+- Restored-session playback, play-vs-playing startup state, hung startup,
+  fresh-source retry, rapid track changes, stale recovery after a song switch,
+  pause during recovery, stale cached hints, and ordinary pause/resume.
+- MSE fetch errors settle the pending play promise; late errors from an old
+  session do not poison a newer song. Repeated stalled events cannot postpone
+  the same watchdog forever. Search warming only requests cache metadata.
+
+LIMITS
+No live YouTube source-access or production timing pass was obtained. Render
+credentials were not supplied. Production D1/R2 collection was not executed.
+The browser security policy blocked local test pages, so there is no actual
+browser playback pass. Mobile, screen-off and media-session behaviour still
+need the deployment checks. No Docker image build or Windows PowerShell run
+was possible here. The Dockerfile runs the Python regression suite at build.
+
+These results establish the tested transport/recovery corrections. They do not
+establish flawless playback on every device or universal YouTube availability.

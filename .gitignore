@@ -1,8 +1,8 @@
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
-.env
-*cookie*.txt
-*.mp3
-*.mp4
-*.webm
+.agent.env
+agent-data/
+*cookies*.txt
+*.log
+verification/

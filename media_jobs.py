@@ -59,13 +59,15 @@ def mp3_frames_valid(data):
 
 
 class MediaJobs:
-    def __init__(self, producer, *, directory=None, max_jobs=8, max_bytes=80*1024*1024,
-                 disk_bytes=256*1024*1024, ttl=900, timeout=240, failure_ttl=15):
+    def __init__(self, producer, *, directory=None, max_jobs=32, max_bytes=80*1024*1024,
+                 disk_bytes=256*1024*1024, ttl=900, timeout=240, failure_ttl=15,
+                 max_active=2, collection_grace=90):
         self.producer = producer
         self.directory = Path(directory or tempfile.mkdtemp(prefix='veeb-mp3-'))
         self.directory.mkdir(parents=True, exist_ok=True)
         self.max_jobs, self.max_bytes, self.disk_bytes = max_jobs, max_bytes, disk_bytes
         self.ttl, self.timeout, self.failure_ttl = ttl, timeout, failure_ttl
+        self.max_active, self.collection_grace = max_active, collection_grace
         self.jobs = {}
 
     def _remove(self, video_id):
@@ -76,11 +78,12 @@ class MediaJobs:
         now = time.monotonic()
         for video_id, job in list(self.jobs.items()):
             age = now - job.touched
-            if job.done.is_set() and not job.readers and not job.waiters and age > (self.failure_ttl if job.error else self.ttl):
+            failure_age = max(self.failure_ttl, getattr(getattr(job, 'error', None), 'retry_after', 0))
+            if job.done.is_set() and not job.readers and not job.waiters and age > (failure_age if job.error else self.ttl):
                 self._remove(video_id)
         candidates = sorted((j for j in self.jobs.values() if j.done.is_set() and not j.readers and not j.waiters), key=lambda j: j.touched)
         # Keep recent failure entries until cooldown expires to prevent retry storms.
-        candidates = [j for j in candidates if not j.error]
+        candidates = [j for j in candidates if not j.error and now - j.touched > self.collection_grace]
         while candidates and (sum(j.size for j in self.jobs.values()) + needed > self.disk_bytes or
                               (extra_job and len(self.jobs) >= self.max_jobs)):
             self._remove(candidates.pop(0).video_id)
@@ -94,6 +97,8 @@ class MediaJobs:
         # Never let background cache misses create a queue behind active work.
         if background and any(not j.done.is_set() for j in self.jobs.values()):
             raise JobError('RESOLVER_BUSY', 'Cache fill deferred while playback jobs are active.')
+        if sum(not j.done.is_set() for j in self.jobs.values()) >= self.max_active:
+            raise JobError('RESOLVER_BUSY', 'Acquisition capacity is occupied. Retry shortly.')
         self._evict(extra_job=True)
         if len(self.jobs) >= self.max_jobs:
             raise JobError('RESOLVER_BUSY', 'Resolver job capacity is full. Retry shortly.')
@@ -105,7 +110,9 @@ class MediaJobs:
         return job
 
     async def _run(self, job, request):
+        from mp3_validation import MP3Validator
         iterator = None
+        validator = MP3Validator()
         try:
             async with asyncio.timeout(self.timeout):
                 iterator = await self.producer(job.video_id, request, job)
@@ -127,19 +134,22 @@ class MediaJobs:
                         self._evict(needed=len(chunk))
                         if sum(j.size for j in self.jobs.values()) + len(chunk) > self.disk_bytes:
                             raise JobError('RESOLVER_BUSY', 'Temporary MP3 storage is full.')
+                        validator.feed(chunk)
                         output.write(chunk)
                         job.size += len(chunk)
                         job.ready.set()
                         job.changed.set()
                 if not job.size:
                     raise JobError('INVALID_MP3', 'Encoder produced no usable MP3 audio.')
+                decoded_duration = validator.finish()
+                job.metadata['validatedDuration'] = decoded_duration
                 # CBR output should closely match source duration. A clean process
                 # exit on a prematurely ended manifest must not enter R2 either.
                 duration = getattr(job.metadata.get('media'), 'duration', None)
                 bitrate = getattr(job.metadata.get('media'), '_output_bitrate', None)
                 if duration and bitrate:
-                    expected = float(duration) * float(bitrate) * 125
-                    if job.size < expected * 0.90:
+                    tolerance = max(2.0, float(duration) * 0.01)
+                    if abs(decoded_duration - float(duration)) > tolerance:
                         raise JobError('TRUNCATED_MP3', 'MP3 is substantially shorter than the source duration.')
         except asyncio.CancelledError:
             job.error = JobError('JOB_CANCELLED', 'MP3 job was cancelled.')

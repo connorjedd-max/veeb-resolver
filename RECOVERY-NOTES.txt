@@ -1,1 +1,5 @@
-V38.1: keep the V37.6.1 diagnostic Worker. Upload every resolver file including source_support.py and tests. No proxy is required. TEST PLAYBACK distinguishes local encoder function, YouTube page-level cookie recognition, and actual media download. Do not interpret liveness or token generation as successful playback. Only a complete MP3 plus successful R2 readback confirms that end-to-end test. Live YouTube access remains unverified by local tests.
+V39.0 recovery is a source-agent path, not a hidden iframe player.
+The existing optional browser recovery remains a separate Worker feature.
+See DEPLOY.txt for a complete source test and deployment of the source agent.
+Neither a recognised cookie session nor a green health response proves that an
+uncached song can be downloaded. A completed MP3 is the test used here.

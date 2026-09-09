@@ -1,79 +1,75 @@
-# Veeb V38.1: cookie-backed mweb and session verification
+# Veeb resolver V39.1
 
-Targeted repair built from the deployed V37.9 source. Live YouTube access is not
-verified by the local tests. No proxy is required to run this version. Keep the
-existing V37.6.1 diagnostic Cloudflare Worker.
+This release targets first-play latency and recovery. Deploy it together with
+`VEEB-WORKER-v39.1.txt`. Start with `DEPLOY.txt` for exact placement.
 
-## What changed
+## Playback changes
 
-- An explicit authenticated mweb mode is now paired with the cookie-free mweb
-  mode. The prior default implementation supplied cookies only to fg-auth,
-  which used default clients unless YOUTUBE_AUTH_FALLBACK_CLIENT was overridden.
-- Cookie-backed acquisition and source download use one yt-dlp process/jar.
-  FFmpeg then reads the owned local source file. This fallback waits for the
-  source download; it is not progressive during that download. The anonymous
-  direct-HTTP FFmpeg path remains progressive.
-- Both mweb modes use identical provider policy (fetch_pot=auto). Optional player
-  tokens/ad context are no longer forced, and token-cache tracing is disabled.
-- Source secret changes atomically refresh runtime cookies. Each authenticated
-  child receives a private copy. Server-rotated cookies are committed back to
-  runtime only if its input snapshot is still current. The Render secret file
-  is never edited. Cookie-free attempts never receive account cookies.
-- Local inspection checks Netscape structure and expiry, treating zero expiry
-  as a session cookie. Local fields never establish remote authentication.
-- Main errors are preserved separately from bounded diagnostic excerpts. Source
-  API challenges and media-download HTTP 403 are reported as different phases.
-  Resolver/API errors redact URLs/tokens before truncating. The upstream bgutil
-  process can still print its own tokens to Render logs; do not publish raw logs.
-- Parent-owned source directories are removed after failed/cancelled downloads.
-  Existing shared MP3 jobs, full-file checks and MP3-only output remain.
+- One yt-dlp process retains ownership of source acquisition. Direct audio-only
+  WebM can feed FFmpeg while the file is still downloading. MP4 and fragmented
+  sources retain the completed, seekable-file path.
+- The default format selector prefers audio WebM, with the existing audio/source
+  alternatives retained. MP3 startup now needs 4 KiB instead of 16 KiB.
+- Source startup has a 20-second deadline. Completion still requires successful
+  download, an intact MP3 frame stream and a matching duration. Temporary file EOF
+  and missing fragments cannot become completed MP3 objects.
+- Simultaneous playback and cache collection share the same job. `/completed`
+  never launches acquisition. Jobs on Render are temporary; the Worker writes
+  completed MP3s into the existing R2 namespace.
+- The companion Worker fixes failed-source retry, stale recovery callbacks,
+  premature startup completion on the `play` event, and forced service-worker
+  reloads. Search checks cache metadata without downloading uncached results.
 
-## Existing /admin TEST PLAYBACK now checks
+## What this cannot promise
 
-1. codecSelfTest: local synthetic WAV through this instance's production FFmpeg
-   encoder, with real MP3 frame validation. No YouTube call or R2 write.
-2. cookieSessionTest: one YouTube subscriptions-page request using the cookie jar.
-   An explicit server LOGGED_IN flag gives true/false. No flag, conflicting flags,
-   consent/challenge pages, or failed requests yield unknown/null. This proves at
-   most page-level recognition, not permission to download a track.
-3. Production acquisition and completed MP3 validation. Look for fg-mweb-auth,
-   usesCookies=true, and the exact stage/code/error. On complete success the
-   unchanged Worker performs its existing R2 store and range-readback checks.
+A new uncached track still needs the upstream source to respond. This package
+cannot guarantee YouTube source access, or 1-2 second starts during a source
+refusal. Free Render instances spin down after 15 idle minutes and take about a
+minute to wake. Use an always-on compute instance for the playback target.
+The included `render.yaml` retains the uploaded Free baseline; it is not a claim
+that Free meets the target. Review the instance plan before using that blueprint.
 
-Health is liveness. Its cookie authentication field refers to the last page-level
-check and has a timestamp/scope. Token generation alone does not establish that
-YouTube will accept a media download. Existing logs cannot prove IP mismatch.
+The optional desktop agent changes acquisition location. It currently uploads a
+complete MP3 and is not the latency solution. Normal deployment uses
+`VEEB_SOURCE_MODE=direct`. Optional investigation is documented separately in
+`SOURCE-AGENT-OPTIONAL.txt`.
 
-## Deployment
+## Deployment contract
 
-Upload ALL archive contents into the repository ROOT, including source_support.py
-and tests/. Dockerfile copies the new module. No pycache is required. Wait for
-Render Live, then run the existing admin test once. Expected version:
-v38.1-mp3-stream. Do not change the Worker or add a proxy for this test.
+Keep one ASGI worker and one Render instance. Acquisition concurrency is one;
+there are two active MP3 job slots. A busy source service returns a bounded
+failure. Cached R2 playback does not consume those slots.
 
-Keep RESOLVER_SECRET and the existing youtube-cookies.txt secret file. Never
-commit cookies to GitHub or send them in chat.
+Existing Worker bindings remain `DB`, `AUDIO_CACHE`, `YOUTUBE_RESOLVER_URL` and
+`YOUTUBE_RESOLVER_SECRET`. The resolver's `RESOLVER_SECRET` must still match the
+Worker secret. Existing cookie-file settings are preserved.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /` | Version and liveness |
+| `GET /health` | Authenticated configuration and source evidence |
+| `GET /stream/{id}` | Start or join progressive/shared playback |
+| `GET /resolve/{id}` | Start or join the same MP3 job |
+| `GET/HEAD /completed/{id}` | Read completed bytes only |
+| `POST /prepare/{id}` | Start or join a requested job |
+| `GET /jobs/{id}` | Read job state without acquisition |
+| `POST /diagnose/{id}` | Encoder, session and complete-MP3 diagnostic |
+| `POST /import-cached-source/{id}` | Convert an existing finite source into MP3 |
+
+The optional agent endpoints and separate agent key are retained for existing
+users. No endpoint accepts arbitrary commands or arbitrary source URLs.
 
 ## Validation
 
-35 offline tests passed locally: real FFmpeg, loopback HTTP input, real FastAPI
-ASGI routes, cookie isolation/rotation, cancellation cleanup, shared readers and
-partial-file rejection. Source/session responses in the tests are mocks.
-Live YouTube, bgutil interoperability and actual R2 writes were NOT tested here.
-The exact pinned yt-dlp was unavailable in the local execution environment;
-Render's Docker build installs the existing pinned dependencies and runs tests.
+See `TEST-RESULTS.txt` for commands, results and unverified production conditions.
+The Docker build runs all Python tests. `worker-verification` contains the Node
+regression suite for the supplied Worker. Its media/browser APIs are test doubles;
+real yt-dlp HTTP downloading and FFmpeg encoding are tested separately in Python.
 
-Run: python -m unittest discover -s tests -v
+## References checked 9 September 2026
 
-## Fresh cookie export
-
-Use the official yt-dlp instructions: open a new private/incognito window, sign
-into YouTube, navigate the same tab to https://www.youtube.com/robots.txt, export
-youtube.com cookies as Netscape text, then close that private session. Put the
-file only in Render's secret-file configuration, named youtube-cookies.txt (or
-your configured path). Fresh cookies do not guarantee media access, and account
-use with automated downloaders carries restriction risk.
-
-References:
-https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
-https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+- [Render Free instance limitations](https://render.com/docs/free#spinning-down-on-idle).
+- [yt-dlp YouTube guidance](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#youtube).
+- [yt-dlp PO-token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
+- [The browser play event](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/play_event)
+  and [playing event](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/playing_event).

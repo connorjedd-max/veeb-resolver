@@ -1,0 +1,118 @@
+OPTIONAL SOURCE-ACCESS DIAGNOSTIC, NOT A FAST-START REQUIREMENT
+
+The desktop agent is not required for V39.1 playback changes. Its current
+protocol uploads a complete MP3, so uncached playback waits for that upload.
+Use it only to investigate source access or deliberately choose that tradeoff.
+
+3. TEST ACQUISITION ON A SOURCE COMPUTER
+Use an always-on regular Windows 10/11 computer with Docker Desktop running Linux
+containers, or a Linux machine with Docker Engine and Compose. Docker Desktop is
+not supported on Windows Server; do not install this setup on EXC-APP01.
+Official Windows installer and requirements:
+https://docs.docker.com/desktop/setup/install/windows-install/
+
+In C:\VeebSourceAgent run:
+  .\Setup-SourceAgent.ps1 -ProbeVideoId 'C2elY5Tctqg'
+
+This creates a local .agent.env file with the Render URL and a NEW random agent
+secret, builds the container, and runs a complete download-to-MP3 probe from this
+computer. The probe does not contact Render. It starts cookie-free. If needed,
+you can place your YouTube cookie export at:
+  C:\VeebSourceAgent\agent-data\youtube-cookies.txt
+The agent reads that file locally. It does not send those cookies to Render.
+Use the same supplied cookie snapshot when comparing the two networks if you
+want a controlled comparison of authenticated behaviour. A difference in results
+with different sessions is not evidence of an IP-only cause.
+
+The same downloader, PO-token provider and encoder run on both computers. A
+successful fresh probe has ok:true, mp3Complete:true and localCacheHit:false.
+A localCacheHit:true probe proves cached delivery, not a new YouTube request.
+Test several uncached tracks you actually use before depending on this route.
+
+If the probe ALSO fails, agent mode is not a fix for that network/session. Keep
+Render in direct mode and use the reported error to investigate the source.
+Do not buy random proxies on the assumption that they must solve it.
+
+4. CONNECT THE SOURCE COMPUTER AFTER THE PROBE PASSES
+Render dashboard > existing resolver service > Environment. Add:
+  VEEB_SOURCE_MODE = agent
+  VEEB_SOURCE_AGENT_SECRET = the matching value from C:\VeebSourceAgent\.agent.env
+
+Open .agent.env locally in Notepad to copy the secret. This is a separate secret
+from RESOLVER_SECRET. Keep both private. Save the variables and redeploy Render.
+
+Back in C:\VeebSourceAgent run:
+  .\Setup-SourceAgent.ps1 -Connect
+
+The script checks the settings before starting the source agent in the
+background. Keep the computer awake and Docker Desktop running. Enable Docker
+Desktop start at sign-in if you want it to return after a user sign-in. The
+container's restart policy handles container restarts, not Windows sleep, power
+loss or a Docker Desktop process that has not started.
+
+View logs:
+  docker compose -f compose.agent.yaml logs --tail 60 -f
+Stop the agent:
+  docker compose -f compose.agent.yaml stop
+
+No inbound router port, tunnel, inbound Windows firewall rule, or Render access
+to your computer is needed. The agent polls Render over HTTPS and uploads MP3
+bytes. It never sends Render a Googlevideo URL for Render to fetch. Both download
+and conversion happen on the source computer; Render does not encode it again.
+
+The local completed-file cache is capped at 1 GiB by default, adjustable with
+VEEB_AGENT_CACHE_MB in .agent.env. Old local copies are evicted at the cap; R2
+objects are never deleted by this package. A transfer retry reuses completed
+local audio. If Render restarts before R2 collection, a new request can reuse the
+agent's local MP3 rather than contact YouTube again.
+
+Linux equivalent, from the extracted folder:
+  cp .agent.env.example .agent.env
+  # Edit the URL and a new random agent secret locally.
+  mkdir -p agent-data
+  docker compose -f compose.agent.yaml build
+  docker compose -f compose.agent.yaml run --rm source-agent --probe C2elY5Tctqg
+  # Set the two matching Render variables after the probe passes, then:
+  docker compose -f compose.agent.yaml up -d
+
+5. VERIFY THE WHOLE VEEB PATH
+Repeat Test-Resolver.ps1 after the source agent starts. Then, in Veeb:
+- Play the same track or run the existing admin playback/cache test.
+- Confirm the completed MP3 is stored under veeb-audio-v2-mp3/<id>.mp3.
+- Play again and confirm R2 HIT without source acquisition.
+- Disconnect/stop the source agent and replay that CACHED track.
+- Test screen-off/background playback and the next cached track on your phone.
+- Restart Render and replay the cached track again.
+
+These final checks depend on the Worker and device. The resolver archive cannot
+verify or fix a Worker startup gate or a mobile background-player bug by itself.
+The prior one-minute Worker cron and R2 settings remain necessary for collection.
+Existing legacy R2 imports through /import-cached-source/ remain supported.
+
+6. RENDER SLEEP AND CAPACITY
+The supplied render.yaml retains the original free plan; this package makes no
+billing change. If the service actually uses Free, Render documents a spin-down
+after 15 minutes idle and a wake time of about a minute. Files on that instance
+are lost at spin-down/restart. Reliable cold-track startup requires an always-on
+Render instance. Choose the instance type in the service settings before treating
+it as a production playback dependency. R2 hits should continue to bypass Render.
+Reference: https://render.com/docs/free
+
+Do not scale this version to multiple ASGI workers or multiple Render instances:
+a source lease must return to the same process that owns the MP3 job. A durable,
+shared scheduler would be required before doing that. Up to two active MP3 jobs
+are admitted; completed jobs receive a 90-second collection grace period under
+capacity pressure. R2 remains the durable system of record.
+
+OPTIONAL EXISTING PROXY
+For a proxy you already own/use, YOUTUBE_PROXY_URL on the acquiring machine is
+passed to yt-dlp and its PO-token provider. Supported URL schemes are http,
+https, socks5 and socks5h. Keep a consistent route for extraction, tokens and
+media transfer. The downloader owns all three. An invalid proxy setting fails
+explicitly; it never silently falls back to direct network requests.
+A proxy is optional and is not a guaranteed solution to a source refusal.
+
+ROLLBACK
+Restore the previous repository commit if needed. To change only acquisition
+location, set VEEB_SOURCE_MODE=direct on Render and redeploy, then stop the agent.
+No R2 object or original source file is deleted by rollback.
