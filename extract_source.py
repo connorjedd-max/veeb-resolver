@@ -12,6 +12,7 @@ import sys
 import tempfile
 from source_support import DiagnosticLog, failure_code, redact, reported_login_state
 from progressive_source import publish_streamable_progress
+from source_slots import publish_download_started
 MAX_SOURCE_BYTES = 80 * 1024 * 1024
 
 
@@ -68,6 +69,7 @@ def run(payload):
                                hls_prefer_native=True)
                 def progress(data):
                     logger.progress(data)
+                    publish_download_started(data, download_dir)
                     publish_streamable_progress(data, download_dir)
                     if int(data.get('downloaded_bytes') or 0) > MAX_SOURCE_BYTES:
                         raise RuntimeError('Source exceeds the 80 MiB size limit')

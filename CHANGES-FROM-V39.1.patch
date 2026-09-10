@@ -1,0 +1,549 @@
+--- a/extract_source.py
++++ b/extract_source.py
+@@ -12,6 +12,7 @@
+ import tempfile
+ from source_support import DiagnosticLog, failure_code, redact, reported_login_state
+ from progressive_source import publish_streamable_progress
++from source_slots import publish_download_started
+ MAX_SOURCE_BYTES = 80 * 1024 * 1024
+ 
+ 
+@@ -68,6 +69,7 @@
+                                hls_prefer_native=True)
+                 def progress(data):
+                     logger.progress(data)
++                    publish_download_started(data, download_dir)
+                     publish_streamable_progress(data, download_dir)
+                     if int(data.get('downloaded_bytes') or 0) > MAX_SOURCE_BYTES:
+                         raise RuntimeError('Source exceeds the 80 MiB size limit')
+--- a/source_slots.py
++++ b/source_slots.py
+@@ -0,0 +1,71 @@
++"""Serialize extraction without serializing already-started source downloads."""
++import asyncio
++from contextlib import asynccontextmanager
++from pathlib import Path
++
++DOWNLOAD_STARTED_FILE = '.veeb-download-started'
++
++
++class ExtractionLease:
++    def __init__(self, semaphore):
++        self.semaphore = semaphore
++        self.held = True
++        self.watcher = None
++
++    def release(self):
++        if self.held:
++            self.held = False
++            self.semaphore.release()
++
++    def watch(self, directory):
++        async def monitor():
++            marker = Path(directory) / DOWNLOAD_STARTED_FILE
++            while not marker.is_file():
++                await asyncio.sleep(.02)
++            self.release()
++        self.watcher = asyncio.create_task(monitor())
++
++    async def close(self):
++        if self.watcher is not None:
++            self.watcher.cancel()
++            await asyncio.gather(self.watcher, return_exceptions=True)
++        self.release()
++
++
++@asynccontextmanager
++async def source_slot(extraction, downloads, *, download):
++    """Download capacity remains owned until child cleanup, including cancellation."""
++    download_held = False
++    lease = None
++    try:
++        if download:
++            await downloads.acquire()
++            download_held = True
++        await extraction.acquire()
++        lease = ExtractionLease(extraction)
++        yield lease
++    finally:
++        if lease is not None:
++            await lease.close()
++        if download_held:
++            downloads.release()
++
++
++def publish_download_started(data, directory):
++    """Only actual bytes in this child's owned file release the extraction slot."""
++    if data.get('status') not in {'downloading', 'finished'}:
++        return
++    if int(data.get('downloaded_bytes') or 0) < 8192:
++        return
++    directory = Path(directory).resolve()
++    marker = directory / DOWNLOAD_STARTED_FILE
++    if marker.is_file():
++        return
++    source = Path(str(data.get('tmpfilename') or data.get('filename') or ''))
++    try:
++        ready = (source.is_file() and source.resolve().parent == directory
++                 and source.stat().st_size >= 8192)
++    except FileNotFoundError:
++        return  # A finished download can be renamed between progress callbacks.
++    if ready:
++        marker.touch(mode=0o600, exist_ok=True)
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -240,7 +240,7 @@
+              patch.object(core._fg_anon_pool,'resolve',AsyncMock(return_value=media)), \
+              patch.object(core,'get_writable_cookie_file',return_value='/private/cookies'):
+             result=await core.resolve_ytdlp_foreground_v35('siRAwwaNc1M','live')
+-        self.assertIs(result,media); self.assertEqual(order,['mweb-anon','mweb-auth'])
++        self.assertIs(result,media); self.assertEqual(order,['mweb-auth','mweb-anon'])
+         self.assertFalse(core._fg_pot_pool.use_cookies)
+         self.assertTrue(core._fg_mweb_auth_pool.use_cookies)
+ 
+--- a/tests/test_sessions.py
++++ b/tests/test_sessions.py
+@@ -119,13 +119,13 @@
+         c=self.core;media=types.SimpleNamespace(client='mweb',format_id='251',video_id='siRAwwaNc1M')
+         job=types.SimpleNamespace(metadata={});iterator=object()
+         with patch.object(c,'get_writable_cookie_file',return_value='/private/cookies'), \
+-             patch.object(c._fg_pot_pool,'download_source',AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
++             patch.object(c._fg_pot_pool,'download_source',AsyncMock(side_effect=AssertionError('auth must not wait for anonymous'))) as anonymous, \
+              patch.object(c._fg_mweb_auth_pool,'resolve',AsyncMock(side_effect=AssertionError('must retain session'))) as resolve, \
+              patch.object(c._fg_mweb_auth_pool,'download_source',AsyncMock(return_value=media)) as download, \
+              patch.object(c,'prepare_live_mp3_stream',AsyncMock(return_value=iterator)):
+             result=await c.produce_mp3('siRAwwaNc1M',None,job)
+         self.assertIs(result,iterator);download.assert_awaited_once();resolve.assert_not_awaited()
+-        self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);self.assertIn('not a bot',job.metadata['attempts'][0]['error'])
++        self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);anonymous.assert_not_awaited()
+     async def test_mweb_args_equal_except_cookiefile(self):
+         with patch.object(self.core,'get_writable_cookie_file',return_value='/private/cookies'):
+             a=self.core.ytdlp_options('mweb',None,False);b=self.core.ytdlp_options('mweb',None,True)
+--- a/tests/test_source_slots.py
++++ b/tests/test_source_slots.py
+@@ -0,0 +1,176 @@
++"""Queue ownership and session policy; all source traffic is local or mocked."""
++import asyncio
++import json
++from pathlib import Path
++import tempfile
++import types
++import unittest
++from unittest.mock import AsyncMock, patch
++
++from source_slots import source_slot, publish_download_started, DOWNLOAD_STARTED_FILE
++from source_support import SourceAttemptError
++from test_pipeline import load_core
++
++
++class SourceSlotTests(unittest.IsolatedAsyncioTestCase):
++    async def test_next_extraction_starts_before_previous_download_finishes(self):
++        extraction, downloads = asyncio.Semaphore(1), asyncio.Semaphore(2)
++        with tempfile.TemporaryDirectory() as directory:
++            async with source_slot(extraction, downloads, download=True) as first:
++                first.watch(directory)
++                acquired = asyncio.Event()
++                async def second():
++                    async with source_slot(extraction, downloads, download=True):
++                        acquired.set()
++                task = asyncio.create_task(second())
++                await asyncio.sleep(.04)
++                self.assertFalse(acquired.is_set())
++                source = Path(directory) / 'audio.webm.part'
++                source.write_bytes(b'x' * 16384)
++                publish_download_started({'status': 'downloading', 'downloaded_bytes': 16384,
++                                          'tmpfilename': str(source)}, directory)
++                await asyncio.wait_for(acquired.wait(), 1)
++                await task
++                # The first download is still active here, with its download
++                # permit retained even though another extraction has run.
++                self.assertEqual(downloads._value, 1)
++            self.assertEqual(extraction._value, 1)
++            self.assertEqual(downloads._value, 2)
++
++    async def test_download_capacity_remains_bounded_after_extraction_release(self):
++        extraction, downloads = asyncio.Semaphore(1), asyncio.Semaphore(2)
++        async with source_slot(extraction, downloads, download=True) as first:
++            first.release()
++            async with source_slot(extraction, downloads, download=True) as second:
++                second.release()
++                entered = asyncio.Event()
++                async def third():
++                    async with source_slot(extraction, downloads, download=True):
++                        entered.set()
++                task = asyncio.create_task(third())
++                await asyncio.sleep(.04)
++                self.assertFalse(entered.is_set())
++                task.cancel()
++                await asyncio.gather(task, return_exceptions=True)
++                self.assertEqual(downloads._value, 0)
++        self.assertEqual(downloads._value, 2)
++        self.assertEqual(extraction._value, 1)
++
++    async def test_cancel_while_waiting_for_extraction_returns_only_owned_capacity(self):
++        extraction, downloads = asyncio.Semaphore(0), asyncio.Semaphore(2)
++        async def queued():
++            async with source_slot(extraction, downloads, download=True):
++                self.fail('No extraction permit exists')
++        task = asyncio.create_task(queued())
++        await asyncio.sleep(.02)
++        self.assertEqual(downloads._value, 1)
++        task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
++        self.assertEqual(downloads._value, 2)
++        self.assertEqual(extraction._value, 0)
++
++    async def test_marker_requires_owned_source_bytes(self):
++        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
++            marker = Path(directory) / DOWNLOAD_STARTED_FILE
++            source = Path(directory) / 'source.part'
++            source.write_bytes(b'x')
++            data = {'status': 'downloading', 'downloaded_bytes': 16384, 'tmpfilename': str(source)}
++            publish_download_started(data, directory)
++            self.assertFalse(marker.exists())
++            foreign = Path(outside) / 'source.part'
++            foreign.write_bytes(b'x' * 16384)
++            publish_download_started(dict(data, tmpfilename=str(foreign)), directory)
++            self.assertFalse(marker.exists())
++            source.write_bytes(b'x' * 16384)
++            publish_download_started(data, directory)
++            self.assertTrue(marker.is_file())
++
++    async def test_real_child_download_does_not_block_second_child_extraction(self):
++        core = load_core()
++        core.init_ytdlp_pools()
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            script = root / 'extract_source.py'
++            script.write_text('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).resolve().parents[1])) + ')\n' + '''import json,sys,time
++from pathlib import Path
++from source_slots import publish_download_started
++p=json.load(sys.stdin)
++root=Path(__file__).parent
++out=Path(p['downloadDirectory']);out.mkdir(exist_ok=True)
++f=out/'source.webm';f.write_bytes(b'x'*16384)
++publish_download_started({'status':'downloading','downloaded_bytes':16384,'tmpfilename':str(f)},out)
++(root/p['videoId']).touch()
++if p['videoId']=='first_track':
++ while not (root/'release').exists():time.sleep(.01)
++print(json.dumps({'ok':True,'media':{'local_path':str(f)}}))
++''')
++            tasks = []
++            with patch.object(core, '__file__', str(root/'veeb_resolver.py')):
++                try:
++                    first = asyncio.create_task(core._fg_pot_pool._child(
++                        'first_track', download=True, timeout=5, directory=str(root/'one')))
++                    tasks.append(first)
++                    for _ in range(300):
++                        if (root/'first_track').exists(): break
++                        await asyncio.sleep(.01)
++                    self.assertTrue((root/'first_track').exists())
++                    second = asyncio.create_task(core._fg_pot_pool._child(
++                        'second_song', download=True, timeout=5, directory=str(root/'two')))
++                    tasks.append(second)
++                    result = await asyncio.wait_for(asyncio.shield(second), 2)
++                    self.assertTrue(result['ok'])
++                    self.assertFalse(first.done(), 'First source must remain in progress')
++                    (root/'release').touch()
++                    await first
++                finally:
++                    for task in tasks:
++                        if not task.done(): task.cancel()
++                    await asyncio.gather(*tasks, return_exceptions=True)
++                    await core._media_jobs.close()
++            self.assertFalse(core._extraction_sem.locked())
++            self.assertEqual(core._source_download_sem._value, core.MP3_MAX_CONCURRENT_TRANSCODES)
++
++
++class SessionPriorityTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.core = load_core()
++        self.core.init_ytdlp_pools()
++
++    async def asyncTearDown(self):
++        await self.core._media_jobs.close()
++
++    async def test_recognised_session_uses_authenticated_mweb_first(self):
++        c = self.core
++        with patch.object(c, 'get_writable_cookie_file', return_value='/private/cookies'), \
++             patch.object(c, '_last_cookie_session_test', {'youtubeReportsLoggedIn': True}):
++            self.assertIs(c.foreground_pools()[0], c._fg_mweb_auth_pool)
++
++    async def test_negative_session_skips_cookie_attempts_and_explains_failure(self):
++        c = self.core
++        with patch.object(c, 'get_writable_cookie_file', return_value='/private/cookies'), \
++             patch.object(c, '_last_cookie_session_test', {'youtubeReportsLoggedIn': False}), \
++             patch.object(c._fg_pot_pool, 'stream_source', AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
++             patch.object(c._fg_anon_pool, 'stream_source', AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
++             patch.object(c._fg_mweb_auth_pool, 'stream_source', AsyncMock(side_effect=AssertionError('known rejected session'))) as auth:
++            self.assertEqual(c.foreground_pools(), [c._fg_pot_pool, c._fg_anon_pool])
++            with self.assertRaises(c.JobError) as failure:
++                await c.produce_mp3('siRAwwaNc1M', None, types.SimpleNamespace(metadata={}))
++            self.assertEqual(failure.exception.code, 'SOURCE_ACCESS_DENIED')
++            self.assertIn('not logged in', str(failure.exception))
++            auth.assert_not_awaited()
++
++    async def test_cookie_secret_change_reenables_auth_without_restart(self):
++        c = self.core
++        def cookies(value):
++            return '# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\t'+value+'\n'
++        with tempfile.TemporaryDirectory() as directory:
++            source, runtime = Path(directory)/'secret', Path(directory)/'runtime'
++            source.write_text(cookies('old'))
++            with patch.object(c, 'YOUTUBE_COOKIE_FILE', str(source)), \
++                 patch.object(c, 'WRITABLE_COOKIE_FILE', str(runtime)):
++                c.get_writable_cookie_file()
++                c._last_cookie_session_test = {'youtubeReportsLoggedIn': False}
++                self.assertFalse(any(p.use_cookies for p in c.foreground_pools()))
++                source.write_text(cookies('new'))
++                self.assertIs(c.foreground_pools()[0], c._fg_mweb_auth_pool)
++                self.assertIsNone(c._last_cookie_session_test['youtubeReportsLoggedIn'])
+--- a/veeb_resolver.py
++++ b/veeb_resolver.py
+@@ -19,6 +19,7 @@
+ from source_broker import SourceBroker
+ from mp3_validation import MP3Validator
+ from source_support import CookieStore, inspect_cookies, redact, failure_code, SourceAttemptError
++from source_slots import source_slot
+ from progressive_source import ProgressiveSource
+ from media_jobs import MediaJobs, JobError, mp3_frames_valid
+ import threading
+@@ -31,7 +32,7 @@
+ from fastapi import FastAPI, Header, HTTPException, Query, Request
+ from fastapi.responses import JSONResponse, Response, StreamingResponse
+ from starlette.background import BackgroundTask
+-app = FastAPI(title='Veeb YouTube Resolver V39.1 MP3 Stream', docs_url=None, redoc_url=None)
++app = FastAPI(title='Veeb YouTube Resolver V39.2 MP3 Stream', docs_url=None, redoc_url=None)
+ RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
+ VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
+ YOUTUBE_COOKIE_FILE = os.environ.get('YOUTUBE_COOKIE_FILE', '/etc/secrets/youtube-cookies.txt')
+@@ -131,7 +132,7 @@
+     audit = inspect_cookies(YOUTUBE_COOKIE_FILE)
+     _youtube_cookie_authenticated = audit['activeAuthCookieFieldsPresent']
+     if force:
+-        print('v39.1 cookie file audit', json.dumps(audit), flush=True)
++        print('v39.2 cookie file audit', json.dumps(audit), flush=True)
+     return _youtube_cookie_authenticated
+ 
+ def pot_http_server_ready() -> bool:
+@@ -268,6 +269,7 @@
+         opts['proxy'] = YOUTUBE_PROXY_URL
+     return opts
+ _extraction_sem = asyncio.Semaphore(1)
++_source_download_sem = asyncio.Semaphore(MP3_MAX_CONCURRENT_TRANSCODES)
+ _fg_anon_pool = None
+ 
+ async def spawn_owned_process(*args, **kwargs):
+@@ -295,12 +297,14 @@
+         self.use_cookies = name == 'fg-auth' if use_cookies is None else bool(use_cookies)
+ 
+     async def _child(self, video_id: str, *, download: bool, timeout: float, operation: str='source', directory=None) -> dict[str, Any]:
+-        async with _extraction_sem:
++        async with source_slot(_extraction_sem, _source_download_sem, download=download) as lease:
+             if operation == 'source':
+                 _source_guard.check()
+             options = ytdlp_options(self.client_name, None, use_cookies=self.use_cookies)
+             options.pop('logger', None)
+             directory = (directory or tempfile.mkdtemp(prefix='veeb-ytdlp-source-')) if download else None
++            if directory:
++                lease.watch(directory)
+             process = communication = None
+             cookie_update_dir = cookie_update_path = cookie_digest = None
+             keep_source = False
+@@ -371,7 +375,7 @@
+         result = await self._child(video_id, download=False, timeout=18.0)
+         media = self._media(video_id, result['media'], resolver_path=self.resolver_path)
+         media._source_evidence = result.get('evidence') or {}
+-        print('v39.1 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
++        print('v39.2 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
+               'usesCookies': self.use_cookies, 'formatId': media.format_id}), flush=True)
+         return media
+ 
+@@ -391,7 +395,7 @@
+         except BaseException:
+             cleanup_owned_source(media)
+             raise
+-        print('v39.1 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
++        print('v39.2 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
+               'usesCookies': self.use_cookies, 'formatId': media.format_id, 'bytes': result.get('downloadBytes')}), flush=True)
+         return media
+ 
+@@ -411,20 +415,23 @@
+ def init_ytdlp_pools() -> None:
+     global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_mweb_auth_pool
+     if _fg_anon_pool is None:
+-        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v39.1', False)
+-        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v39.1', True)
+-        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v39.1', False)
+-        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v39.1', True)
++        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v39.2', False)
++        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v39.2', True)
++        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v39.2', False)
++        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v39.2', True)
+ 
+ 
+ def foreground_pools():
+     init_ytdlp_pools()
+-    pools = [_fg_pot_pool]
+     cookies = bool(get_writable_cookie_file())
+-    if cookies:
+-        pools.append(_fg_mweb_auth_pool)
+-    pools.append(_fg_anon_pool)
+-    if cookies and YTDLP_AUTH_CLIENT != 'mweb':
++    # The earlier fast resolver used cookies on its first mweb attempt. Do not
++    # make a usable session wait behind an anonymous bot rejection. A negative
++    # session diagnostic disables cookie attempts until the secret changes.
++    rejected = _last_cookie_session_test.get('youtubeReportsLoggedIn') is False
++    use_auth = cookies and not rejected
++    pools = [_fg_mweb_auth_pool] if use_auth else []
++    pools.extend([_fg_pot_pool, _fg_anon_pool])
++    if use_auth and YTDLP_AUTH_CLIENT != 'mweb':
+         pools.append(_fg_auth_pool)
+     return pools
+ 
+@@ -543,7 +550,7 @@
+     return headers
+ 
+ def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -> dict[str, str]:
+-    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v39.1-mp3-stream', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'verified-agent-mp3' if media.client == 'source-agent' else 'ffmpeg-owned-source-mp3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
++    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v39.2-mp3-stream', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'verified-agent-mp3' if media.client == 'source-agent' else 'ffmpeg-owned-source-mp3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
+ 
+ def ffmpeg_http_input_args(media: ResolvedMedia) -> list[str]:
+     """Build FFmpeg HTTP input options for the resolved Googlevideo URL.
+@@ -667,7 +674,7 @@
+         if len(first_chunk) < MP3_STARTUP_MIN_BYTES:
+             stderr = await cleanup(kill=True)
+             raise RuntimeError(f'FFmpeg produced only {len(first_chunk)} startup MP3 bytes' + (': ' + redact_source_error(stderr.decode('utf-8', 'replace')) if stderr else ''))
+-        print('v39.1 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
++        print('v39.2 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
+ 
+         async def body() -> AsyncIterator[bytes]:
+             try:
+@@ -688,7 +695,7 @@
+                     except Exception:
+                         pass
+                 if rc != 0:
+-                    print('v39.1 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
++                    print('v39.2 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
+                     raise RuntimeError('FFmpeg failed before MP3 completion')
+             except asyncio.CancelledError:
+                 raise
+@@ -758,7 +765,7 @@
+                         cleanup_owned_source(media)
+                     detail = attempt_detail(pool, exc, 'download')
+                     attempts.append(detail)
+-                    print('v39.1 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
++                    print('v39.2 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
+                     if getattr(exc, 'code', '') in {'SOURCE_ROUTE_COOLDOWN', 'SOURCE_PROXY_CONFIG_INVALID', 'SOURCE_DURATION_UNSUPPORTED'}:
+                         raise
+     except TimeoutError as exc:
+@@ -767,9 +774,14 @@
+     codes = {a.get('code') for a in attempts if a.get('code')}
+     _source_guard.failed(video_id, codes)
+     if codes and codes <= AcquisitionGuard.BLOCK_CODES:
+-        error = JobError('SOURCE_ACCESS_DENIED',
++        message = (
++            'YouTube refused source access. Its session check reports the saved cookies are not logged in. '
++            'Replace the YouTube cookie secret file and run the playback test again. Cached tracks can still play.'
++            if _last_cookie_session_test.get('youtubeReportsLoggedIn') is False else
+             'YouTube refused source access on this route. This does not prove bad cookies or an IP ban. '
+             'Cached tracks can still play. Inspect the source-access diagnostic before retrying.')
++        error = JobError('SOURCE_ACCESS_DENIED',
++                         message)
+         error.retry_after = 120
+         raise error
+     raise JobError('SOURCE_ACQUISITION_FAILED', 'Source attempts failed. Per-attempt stages identify extraction, download or conversion failure.')
+@@ -794,7 +806,7 @@
+ async def proxy_media(request: Request, video_id: str):
+     cache_fill = request.headers.get('x-veeb-purpose') == 'cache-fill'
+     if request.method == 'HEAD':
+-        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v39.1-mp3-stream'})
++        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v39.2-mp3-stream'})
+     try:
+         job = _media_jobs.get(video_id, request, background=cache_fill)
+         await _media_jobs.wait(job, complete=cache_fill)
+@@ -815,7 +827,7 @@
+     load_youtube_cookie_session(force=True)
+     get_http_client()
+     init_ytdlp_pools()
+-    print('v39.1 ready: mweb cookie-free, mweb authenticated, defaults; shared MP3 jobs', flush=True)
++    print('v39.2 ready: session-aware mweb priority; independent extraction/download slots; shared MP3 jobs', flush=True)
+ 
+ @app.on_event('shutdown')
+ async def shutdown_http_client() -> None:
+@@ -835,7 +847,7 @@
+ 
+ @app.get('/')
+ async def root() -> dict[str, Any]:
+-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.1-mp3-stream'}
++    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.2-mp3-stream'}
+ 
+ @app.get('/health')
+ async def health(authorization: str | None=Header(default=None)) -> dict[str, Any]:
+@@ -847,9 +859,10 @@
+     except importlib.metadata.PackageNotFoundError:
+         version = 'unknown'
+     audit, stats = inspect_cookies(YOUTUBE_COOKIE_FILE), _media_jobs.stats()
+-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.1-mp3-stream',
++    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.2-mp3-stream',
+             'ytDlpVersion': version, 'sourceSelector': YTDLP_SOURCE_SELECTOR,
+-            'cookieFilePresent': audit['present'], 'cookieSessionRecognized': audit['activeAuthCookieFieldsPresent'],
++            'cookieFilePresent': audit['present'], 'cookieAuthFieldsPresent': audit['activeAuthCookieFieldsPresent'],
++            'cookieSessionRecognized': _last_cookie_session_test.get('youtubeReportsLoggedIn'),
+             'cookieAuthenticationVerified': _last_cookie_session_test.get('youtubeReportsLoggedIn'),
+             'cookieAuthenticationVerificationScope': 'YouTube page-level login, not media permission',
+             'cookieAudit': audit, 'cookieSessionTest': _last_cookie_session_test,
+@@ -864,6 +877,8 @@
+             'sourceStartupDeadlineSeconds': 20,
+             'note': 'Liveness only. Current completed jobs prove MP3 production; cookie fields alone prove no login.',
+             'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1,
++            'sourceDownloadConcurrency': MP3_MAX_CONCURRENT_TRANSCODES,
++            'extractionSlotReleasedAfterSourceBytes': True,
+             'completedMp3Endpoint': '/completed/{videoId}', 'completedEndpointStartsAcquisition': False, 'maxConcurrentTranscodes': MP3_MAX_CONCURRENT_TRANSCODES, 'jobs': stats}
+ 
+ async def codec_self_test():
+@@ -902,7 +917,7 @@
+     except Exception as exc:
+         codec_test = {'ok': False, 'error': redact(exc, 180)}
+     if not codec_test['ok']:
+-        return JSONResponse({'ok': False, 'version': 'v39.1-mp3-stream', 'videoId': video_id,
++        return JSONResponse({'ok': False, 'version': 'v39.2-mp3-stream', 'videoId': video_id,
+                              'code': 'MP3_SELF_TEST_FAILED', 'codecSelfTest': codec_test, 'cookieAudit': audit}, status_code=424)
+     init_ytdlp_pools()
+     if SOURCE_MODE == 'agent':
+@@ -915,7 +930,7 @@
+     else:
+         _last_cookie_session_test = {'tested': False, 'youtubeReportsLoggedIn': None, 'status': 'no_usable_cookie_file'}
+     _last_cookie_session_test['checkedAtUnix'] = int(time.time())
+-    report = {'version': 'v39.1-mp3-stream', 'videoId': video_id, 'cookieAudit': audit,
++    report = {'version': 'v39.2-mp3-stream', 'videoId': video_id, 'cookieAudit': audit,
+               'sourceMode': SOURCE_MODE, 'sourceAgent': _source_broker.status(),
+               'cookieSessionTest': dict(_last_cookie_session_test), 'codecSelfTest': codec_test}
+     request = Request({'type': 'http', 'method': 'GET', 'headers': []})
+@@ -985,7 +1000,7 @@
+ os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
+ 
+ 
+-# V39.1: a read-only handoff for R2. This route MUST NEVER call get(), resolve,
++# V39.2: a read-only handoff for R2. This route MUST NEVER call get(), resolve,
+ # a downloader, or FFmpeg. A miss is cheap and cannot steal a playback slot.
+ @app.api_route('/completed/{video_id}', methods=['GET', 'HEAD'])
+ async def completed_mp3(video_id: str, request: Request,
+@@ -994,7 +1009,7 @@
+     video_id = validate_video_id(video_id)
+     _media_jobs._evict()
+     job = _media_jobs.jobs.get(video_id)
+-    common = {'Cache-Control': 'no-store', 'X-Veeb-Resolver': 'v39.1-mp3-stream'}
++    common = {'Cache-Control': 'no-store', 'X-Veeb-Resolver': 'v39.2-mp3-stream'}
+     if job is None:
+         return JSONResponse({'ok': False, 'code': 'COMPLETED_MP3_MISS',
+                              'startsAcquisition': False}, status_code=404, headers=common)
+@@ -1108,7 +1123,7 @@
+         owned_by_job = True
+         job.task.add_done_callback(lambda _done, folder=directory: shutil.rmtree(folder, ignore_errors=True))
+         await _media_jobs.wait(job, complete=True)
+-        return {'ok': True, 'version': 'v39.1-mp3-stream', 'mp3Complete': True,
++        return {'ok': True, 'version': 'v39.2-mp3-stream', 'mp3Complete': True,
+                 'bytes': job.size, 'jobId': job.job_id, 'source': 'legacy-r2',
+                 'youtubeContacted': False, 'originalDeleted': False}
+     except Exception as exc:

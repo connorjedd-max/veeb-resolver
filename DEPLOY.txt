@@ -1,91 +1,93 @@
-VEEB V39.1. WORKER + RESOLVER PLAYBACK FIX
+VEEB V39.2. EXACT INSTALLATION AND SESSION REPAIR
 
-The desktop agent is not required for this update. Use the Render resolver in
-DIRECT mode. The desktop option changes where source acquisition happens and
-currently waits for a completed MP3 upload; it is not the instant-play fix.
+This resolver works with the existing VEEB-WORKER-v39.1.txt release.
+The resolver version is v39.2-mp3-stream. The Worker version is
+10.10.4-v39.1-playback. Those are the intended versions of these two components.
 
-1. REPLACE THE RENDER RESOLVER
-Extract veeb-resolver-v39.1.zip. Copy its contents into the ROOT of the existing
-veeb-resolver repository linked to Render, beside the existing Dockerfile and
-veeb_resolver.py. Replace existing files and include progressive_source.py and
-all other .py files, requirements.txt and tests. Do not upload the ZIP itself or
-put the files in a nested version folder. Commit and let Render redeploy.
+Your attached diagnostic currently shows the V38.3 Worker and V39.1 resolver.
+It also shows youtubeReportsLoggedIn=false, codecSelfTest.ok=true, and refusal
+before source selection. Updating code does not renew a rejected login session.
 
-Render settings:
+1. REPLACE THE RESOLVER IN GITHUB
+Extract veeb-resolver-v39.2.zip. In the EXISTING GitHub repository linked to
+Render's veeb-resolver service, upload the extracted contents into the ROOT,
+beside Dockerfile and veeb_resolver.py. Replace matching files.
+
+Include ALL root .py files, especially the NEW source_slots.py, plus Dockerfile
+and requirements.txt. Open the existing tests folder and upload ALL NINE test
+files there, replacing matching files. The paths must include:
+  veeb_resolver.py
+  extract_source.py
+  source_slots.py
+  tests/test_pipeline.py
+  tests/test_source_slots.py
+Avoid an outer version directory or a tests/tests directory. Uploading the ZIP
+itself does not install the resolver. Commit to the branch connected to Render.
+The Docker build must discover 81 tests and finish with OK.
+
+2. REPLACE THE REJECTED COOKIE SESSION
+Use a fresh private/incognito browser window. Log into YouTube there. In the
+same tab, navigate to https://www.youtube.com/robots.txt. Export youtube.com
+cookies using your cookie-export tool in Netscape cookies.txt format, then
+close that private window. Do not reopen that exported private session.
+This is yt-dlp's documented export procedure to reduce browser cookie rotation.
+A normal browser session remaining logged in does not verify the exported file.
+
+In Render: open veeb-resolver > Environment > Secret Files.
+Edit the EXISTING youtube-cookies.txt entry and replace its Contents with the
+entire fresh Netscape export. If the entry is absent, add that exact filename.
+The first line should be # Netscape HTTP Cookie File, followed by tab-separated
+cookie rows. Do not paste JSON. This secret belongs in Render, not GitHub or chat.
+
+In the same service's Environment Variables, set or confirm:
+  YOUTUBE_COOKIE_FILE = /etc/secrets/youtube-cookies.txt
   VEEB_SOURCE_MODE = direct
   VEEB_MP3_STARTUP_MIN_BYTES = 4096
+  VEEB_MP3_MAX_CONCURRENT = 2
 
-Both values are defaults in the code. Set them explicitly if an older override
-is present. If YOUTUBE_SOURCE_SELECTOR is already configured, remove that
-optional override to use the new default, or set it to:
+If an older YOUTUBE_SOURCE_SELECTOR override exists, remove it to use the audio
+WebM default, or set it to:
   bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best
+Keep your existing RESOLVER_SECRET. Keep one Uvicorn worker and one instance.
+Save the secret/settings and deploy the committed V39.2 build. Render's secret
+file save triggers a deployment; wait for the final deployment to settle.
 
-Keep the existing RESOLVER_SECRET and existing cookie secret-file settings.
-Keep one Uvicorn worker and one Render instance. Wait for a successful build.
-The resolver root response must say version: v39.1-mp3-stream.
+3. UPDATE THE CLOUDFLARE WORKER
+Open the supplied VEEB-WORKER-v39.1.txt. Copy its ENTIRE contents.
+Cloudflare > Workers & Pages > your EXISTING Veeb Worker > Edit code:
+replace the ENTIRE existing script, then Deploy.
+The Worker is intentionally V39.1; this release changes only the resolver.
+The existing saved V39.1 Worker contains the browser startup/recovery fixes that
+are absent from the V38.3 Worker reported by your diagnostic.
 
-2. REPLACE THE COMPLETE CLOUDFLARE WORKER
-Open VEEB-WORKER-v39.1.txt. Copy the ENTIRE contents.
-In the code editor for your existing Veeb Cloudflare Worker, replace the ENTIRE
-existing script with those contents and deploy it. This includes the complete
-app, not just a patch or a snippet. Do not paste it into the resolver repository.
+Keep DB, AUDIO_CACHE, YOUTUBE_RESOLVER_URL and YOUTUBE_RESOLVER_SECRET.
+In Veeb /admin, Browser recovery playback should show RECOVERY OFF to test the
+MP3 route. Reload the Veeb page once after deploying the Worker.
 
-Keep the existing DB and AUDIO_CACHE bindings, YOUTUBE_RESOLVER_URL and
-YOUTUBE_RESOLVER_SECRET. No new Worker binding is required. Existing R2 MP3 keys
-are retained; do not wipe or rename the bucket.
+4. VERIFY ACCESS, THEN SPEED
+At your Veeb site's /admin page, use Playback and cache test. Enter
+siRAwwaNc1M and click TEST PLAYBACK once.
+Expected versions: Worker 10.10.4-v39.1-playback; resolver v39.2-mp3-stream.
+Read playback.cookieSessionTest.youtubeReportsLoggedIn. It should become true
+for the new cookie session. The decisive playback result is playback.ok=true,
+mp3Complete=true, and a successful R2 store/read.
 
-In Veeb admin, 'Browser recovery playback' must show RECOVERY OFF to use this
-MP3 player path. If it is ON, use its existing TURN OFF button.
-After deployment, reload Veeb once to load the new code. The new Worker no longer
-forces an automatic page reload when the service worker changes. The app version
-is 10.10.4-v39.1-playback.
+If the login field remains false, the new export is still not recognised from
+Render. If it is true but audio is refused, account recognition is insufficient
+for this request. Neither outcome is fixed by adding page reload retries.
+Paste the resulting JSON, without cookie values, for the next diagnosis.
 
-3. REMOVE A HOSTING DELAY IF IT APPLIES
-The supplied render.yaml says plan: free. That does not establish the plan of
-your already-deployed service. Check the service's actual compute instance.
-If it is Free, choose an always-on instance for the 1-2 second target. Render
-states that Free sleeps after 15 idle minutes and takes about one minute to wake:
-  https://render.com/docs/free#spinning-down-on-idle
-Changing code cannot remove that wake-up delay. A completed R2 hit bypasses it.
-The blueprint keeps the uploaded Free baseline to avoid silently changing cost;
-review its plan before using it to create or resync a service.
+The admin check includes session testing and COMPLETE MP3 production. Its elapsed
+seconds are not tap-to-audible startup time. Once source access succeeds, measure
+both an uncached track and an R2-cached track in the normal player. Also switch
+tracks while the earlier source is still downloading. The scheduler now allows
+that next extraction without waiting for the first download to finish.
 
-4. CHECK THE ACTUAL OUTCOME
-A. Search and play a track already stored as a verified R2 MP3. The response
-   should say X-Veeb-Audio-Cache: HIT. The first playback should work without a
-   resolver acquisition or repeated refreshes.
-B. Search and play a fresh track while Render is awake. A direct WebM source can
-   now start before the source download completes. First-time source access is
-   still an external dependency. Do not count a resolver-local completed job or
-   an R2 hit as a fresh-source test.
-C. Switch tracks quickly. An older recovery must not replace the selected song.
-D. After an error, use Play. It now creates a fresh playback attachment instead
-   of reusing a failed media source. Explicit source cooldowns are respected.
-E. Confirm the normal completed-MP3 collection reaches R2, then replay the track.
-   The browser's startup-audible diagnostic records actual tap-to-playing time.
+The supplied render.yaml retains the earlier Free blueprint setting. Check the
+actual service's compute plan. An idle Free instance cannot meet a 1-2 second
+first-request target. Changing plans does not fix YouTube session rejection.
 
-For a separate complete-MP3 resolver check, open PowerShell in the extracted
-resolver folder and run:
-  .\Test-Resolver.ps1 -VideoId 'C2elY5Tctqg'
-It asks for the Render URL and existing secret privately. This script runs once;
-it does not install a desktop service. It verifies full acquisition/completion,
-not browser tap-to-audible latency. Results appear in the verification subfolder.
-
-WHAT WAS FIXED
-- Main, expanded and media-session Play controls now share a recovery path.
-- Source switching cancels the previous attempt; stale callbacks check ownership.
-- The browser's play event no longer marks a still-buffering track as started.
-- Startup is bounded: resolver source 20s, Worker upstream headers 22s, browser
-  startup 25s. These are failure ceilings, not promised startup times. A stale R2
-  hint can take one fallback attempt; a mid-song stall gets one guarded recovery.
-- WebM converts while downloading. MP4/segmented sources retain safe buffering.
-- Search checks cache metadata; queue rendering and local storage no longer
-  precede the first audio request/play call.
-- Failed or partial source downloads never become completed MP3s.
-
-VALIDATION LIMIT
-Local tests validate the code paths, source ownership and MP3 bytes. Live
-YouTube access, Render wake/load, Cloudflare latency and mobile browser playback
-still require the deployment checks above. A SOURCE_ACCESS_DENIED result is not
-fixed by repeatedly refreshing the page. Instant first play for arbitrary
-uncached tracks cannot be guaranteed while that upstream source can refuse.
+SOURCES
+https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+https://render.com/docs/configure-environment-variables#secret-files
+https://render.com/docs/free#spinning-down-on-idle

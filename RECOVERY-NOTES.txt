@@ -1,5 +1,1 @@
-V39.0 recovery is a source-agent path, not a hidden iframe player.
-The existing optional browser recovery remains a separate Worker feature.
-See DEPLOY.txt for a complete source test and deployment of the source agent.
-Neither a recognised cookie session nor a green health response proves that an
-uncached song can be downloaded. A completed MP3 is the test used here.
+V39.2 supersedes the older recovery packages. Read DEPLOY.txt and COMPARISON.md.

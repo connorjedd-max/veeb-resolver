@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $Report = [ordered]@{videoId=$VideoId; checkedAtUtc=[DateTime]::UtcNow.ToString('o'); ok=$false}
 try {
     $Report.health = Invoke-RestMethod -Uri "$ResolverUrl/health" -Headers $Headers -TimeoutSec 90
-    if ($Report.health.version -ne 'v39.1-mp3-stream') { throw 'The resolver is not running V39.1 yet.' }
+    if ($Report.health.version -ne 'v39.2-mp3-stream') { throw 'The resolver is not running V39.2 yet.' }
     Invoke-RestMethod -Method Post -Uri "$ResolverUrl/prepare/$VideoId" -Headers $Headers -TimeoutSec 30 | Out-Null
     $Deadline = [DateTime]::UtcNow.AddSeconds(250)
     do {
