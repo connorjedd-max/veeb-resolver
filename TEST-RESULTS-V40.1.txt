@@ -1,0 +1,17 @@
+VEEB V40.1 LOCAL VERIFICATION
+
+Priority/concurrency pipeline suite:
+  python -m unittest tests.test_pipeline -v
+  18 tests passed.
+
+Whole suite in this sandbox:
+  85 tests discovered.
+  82 ran successfully.
+  3 could not run because this sandbox does not have yt_dlp installed and outbound pip access is disabled.
+  The same three tests also failed for that environment reason before the V40.1 changes.
+
+Static checks:
+  python -m py_compile veeb_resolver.py media_jobs.py source_slots.py
+  PASS
+
+The Dockerfile installs requirements.txt before running the full suite on Render, so the three yt_dlp-dependent tests are expected to be available in the actual Docker build.

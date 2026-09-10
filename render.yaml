@@ -9,3 +9,7 @@ services:
     envVars:
       - key: RESOLVER_SECRET
         sync: false
+      - key: VEEB_MP3_MAX_CONCURRENT
+        value: "3"
+      - key: VEEB_MP3_MAX_BACKGROUND
+        value: "2"

@@ -1,8 +1,9 @@
-"""Bounded shared progressive MP3 jobs. Standard-library only, one ASGI worker.
+"""Shared finite MP3 jobs with foreground-first, preemptible background capacity.
 
-Readers have independent file offsets. One producer resolves/transcodes a song,
-so playback, retries, and cache-fill never share a consumable iterator. Completed
-files are held briefly on ephemeral disk; R2 remains the persistent cache.
+One producer exists per track so playback, retries and R2 harvesting share the
+same bytes. Background jobs may use only their configured share of capacity.
+If foreground demand arrives while total capacity is full, the oldest active
+background job is cancelled so playback can take its place.
 """
 import asyncio
 from dataclasses import dataclass, field
@@ -34,14 +35,14 @@ class Job:
     touched: float = field(default_factory=time.monotonic)
     readers: int = 0
     waiters: int = 0
+    background: bool = False
+    purpose: str = 'playback'
+    preempt_requested: bool = False
+    priority: int = 100
 
 
 def mp3_frames_valid(data):
-    """Check two consecutive MPEG-1 Layer III frames, matching 44.1kHz encoder.
-
-    Reject a mislabeled HTML/JSON body and a single accidental sync word.
-    Bitrate need not be constant across input frames.
-    """
+    """Check two consecutive MPEG-1 Layer III frames, matching 44.1kHz encoder."""
     rates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
     def length(pos):
         if len(data) < pos + 4:
@@ -58,17 +59,37 @@ def mp3_frames_valid(data):
     return bool(first and second and len(data) >= first + second)
 
 
+def purpose_priority(purpose, background):
+    if not background:
+        return 100
+    value = str(purpose or '').strip().lower()
+    if value == 'r2-next-prefetch':
+        return 70
+    if value == 'r2-background-prefetch':
+        return 40
+    if value in {'cache-fill', 'cache-import'}:
+        return 30
+    if value == 'r2-library-warm' or value.startswith('background-'):
+        return 20
+    return 25
+
+
 class MediaJobs:
     def __init__(self, producer, *, directory=None, max_jobs=32, max_bytes=80*1024*1024,
                  disk_bytes=256*1024*1024, ttl=900, timeout=240, failure_ttl=15,
-                 max_active=2, collection_grace=90):
+                 max_active=2, max_background=None, collection_grace=90):
         self.producer = producer
         self.directory = Path(directory or tempfile.mkdtemp(prefix='veeb-mp3-'))
         self.directory.mkdir(parents=True, exist_ok=True)
         self.max_jobs, self.max_bytes, self.disk_bytes = max_jobs, max_bytes, disk_bytes
         self.ttl, self.timeout, self.failure_ttl = ttl, timeout, failure_ttl
-        self.max_active, self.collection_grace = max_active, collection_grace
+        self.max_active = max(1, int(max_active))
+        if max_background is None:
+            max_background = max(0, self.max_active - 1)
+        self.max_background = max(0, min(int(max_background), self.max_active - 1 if self.max_active > 1 else 0))
+        self.collection_grace = collection_grace
         self.jobs = {}
+        self.preemptions = 0
 
     def _remove(self, video_id):
         job = self.jobs.pop(video_id)
@@ -82,31 +103,85 @@ class MediaJobs:
             if job.done.is_set() and not job.readers and not job.waiters and age > (failure_age if job.error else self.ttl):
                 self._remove(video_id)
         candidates = sorted((j for j in self.jobs.values() if j.done.is_set() and not j.readers and not j.waiters), key=lambda j: j.touched)
-        # Keep recent failure entries until cooldown expires to prevent retry storms.
         candidates = [j for j in candidates if not j.error and now - j.touched > self.collection_grace]
         while candidates and (sum(j.size for j in self.jobs.values()) + needed > self.disk_bytes or
                               (extra_job and len(self.jobs) >= self.max_jobs)):
             self._remove(candidates.pop(0).video_id)
 
-    def get(self, video_id, request, background=False):
+    def _active(self):
+        return [j for j in self.jobs.values() if not j.done.is_set()]
+
+    def _preempt_one_background(self, incoming_priority=100):
+        candidates = [j for j in self._active() if j.background and j.task and not j.task.done()
+                      and int(j.priority) < int(incoming_priority)]
+        if not candidates:
+            return None
+        # Preserve the more valuable/older work when possible. Preempt the lowest
+        # priority class first, then the newest job within that class.
+        lowest = min(int(j.priority) for j in candidates)
+        same_class = [j for j in candidates if int(j.priority) == lowest]
+        job = max(same_class, key=lambda item: item.touched)
+        job.preempt_requested = True
+        job.task.cancel()
+        self.preemptions += 1
+        return job
+
+    def _task_finished(self, job, task):
+        # A task can be cancelled before _run receives its first timeslice. Make
+        # that edge deterministic so readers/waiters are never left hanging.
+        if not task.cancelled() or job.done.is_set():
+            return
+        if job.preempt_requested:
+            error = JobError('BACKGROUND_PREEMPTED', 'Background cache fill yielded to higher-priority playback/cache demand. Retry shortly.')
+            error.retry_after = 5
+            job.error = error
+        else:
+            job.error = JobError('JOB_CANCELLED', 'MP3 job was cancelled.')
+        job.touched = time.monotonic()
+        job.path.unlink(missing_ok=True)
+        job.size = 0
+        job.done.set()
+        job.ready.set()
+        job.changed.set()
+
+    def get(self, video_id, request, background=False, purpose=''):
         self._evict()
+        purpose = str(purpose or '').strip().lower() or 'playback'
+        priority = purpose_priority(purpose, background)
         existing = self.jobs.get(video_id)
         if existing:
             existing.touched = time.monotonic() if not existing.error else existing.touched
+            # If a user asks for a track already being warmed, that exact job becomes
+            # foreground-owned and must no longer be eligible for preemption.
+            if not background and existing.background and not existing.done.is_set():
+                existing.background = False
+                existing.purpose = purpose
+                existing.priority = 100
             return existing
-        # Never let background cache misses create a queue behind active work.
-        if background and any(not j.done.is_set() for j in self.jobs.values()):
-            raise JobError('RESOLVER_BUSY', 'Cache fill deferred while playback jobs are active.')
-        if sum(not j.done.is_set() for j in self.jobs.values()) >= self.max_active:
-            raise JobError('RESOLVER_BUSY', 'Acquisition capacity is occupied. Retry shortly.')
+
+        active = self._active()
+        active_background = sum(1 for job in active if job.background)
+        if background:
+            if self.max_background <= 0:
+                raise JobError('RESOLVER_BUSY', 'Background acquisition is disabled at the current capacity.')
+            if active_background >= self.max_background or len(active) >= self.max_active:
+                preempted = self._preempt_one_background(priority)
+                if preempted is None:
+                    raise JobError('RESOLVER_BUSY', 'Background acquisition capacity is occupied. Retry shortly.')
+        elif len(active) >= self.max_active:
+            preempted = self._preempt_one_background(priority)
+            if preempted is None:
+                raise JobError('RESOLVER_BUSY', 'Foreground acquisition capacity is occupied. Retry shortly.')
+
         self._evict(extra_job=True)
         if len(self.jobs) >= self.max_jobs:
             raise JobError('RESOLVER_BUSY', 'Resolver job capacity is full. Retry shortly.')
         fd, filename = tempfile.mkstemp(prefix=video_id+'-', suffix='.mp3.part', dir=self.directory)
         os.close(fd)
-        job = Job(video_id, Path(filename))
+        job = Job(video_id, Path(filename), background=bool(background), purpose=purpose, priority=priority)
         self.jobs[video_id] = job
         job.task = asyncio.create_task(self._run(job, request))
+        job.task.add_done_callback(lambda task, current=job: self._task_finished(current, task))
         return job
 
     async def _run(self, job, request):
@@ -143,8 +218,6 @@ class MediaJobs:
                     raise JobError('INVALID_MP3', 'Encoder produced no usable MP3 audio.')
                 decoded_duration = validator.finish()
                 job.metadata['validatedDuration'] = decoded_duration
-                # CBR output should closely match source duration. A clean process
-                # exit on a prematurely ended manifest must not enter R2 either.
                 duration = getattr(job.metadata.get('media'), 'duration', None)
                 bitrate = getattr(job.metadata.get('media'), '_output_bitrate', None)
                 if duration and bitrate:
@@ -152,7 +225,12 @@ class MediaJobs:
                     if abs(decoded_duration - float(duration)) > tolerance:
                         raise JobError('TRUNCATED_MP3', 'MP3 is substantially shorter than the source duration.')
         except asyncio.CancelledError:
-            job.error = JobError('JOB_CANCELLED', 'MP3 job was cancelled.')
+            if job.preempt_requested:
+                error = JobError('BACKGROUND_PREEMPTED', 'Background cache fill yielded to higher-priority playback/cache demand. Retry shortly.')
+                error.retry_after = 5
+                job.error = error
+            else:
+                job.error = JobError('JOB_CANCELLED', 'MP3 job was cancelled.')
         except BaseException as exc:
             job.error = exc
         finally:
@@ -166,8 +244,6 @@ class MediaJobs:
             job.ready.set()
             job.changed.set()
             if job.error:
-                # Open readers retain their descriptor on Linux, but must receive
-                # an error rather than treating a partial file as a normal EOF.
                 job.path.unlink(missing_ok=True)
                 job.size = 0
 
@@ -222,10 +298,19 @@ class MediaJobs:
 
     def stats(self):
         self._evict()
-        return {'active': sum(not j.done.is_set() for j in self.jobs.values()),
-                'complete': sum(j.done.is_set() and not j.error for j in self.jobs.values()),
-                'failed': sum(bool(j.error) for j in self.jobs.values()),
-                'diskBytes': sum(j.size for j in self.jobs.values())}
+        active = self._active()
+        return {
+            'active': len(active),
+            'activeForeground': sum(1 for j in active if not j.background),
+            'activeBackground': sum(1 for j in active if j.background),
+            'complete': sum(j.done.is_set() and not j.error for j in self.jobs.values()),
+            'failed': sum(bool(j.error) for j in self.jobs.values()),
+            'diskBytes': sum(j.size for j in self.jobs.values()),
+            'maxActive': self.max_active,
+            'maxBackground': self.max_background,
+            'foregroundReserved': max(0, self.max_active - self.max_background),
+            'backgroundPreemptions': self.preemptions,
+        }
 
     async def close(self):
         tasks = [job.task for job in self.jobs.values() if job.task and not job.task.done()]

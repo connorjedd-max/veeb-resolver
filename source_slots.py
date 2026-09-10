@@ -1,4 +1,4 @@
-"""Serialize extraction without serializing already-started source downloads."""
+"""Serialize extraction while reserving download capacity for foreground playback."""
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,12 +33,24 @@ class ExtractionLease:
 
 
 @asynccontextmanager
-async def source_slot(extraction, downloads, *, download):
-    """Download capacity remains owned until child cleanup, including cancellation."""
+async def source_slot(extraction, downloads, *, download, background=False, background_downloads=None):
+    """Own source capacity until cleanup, with a reserved foreground lane.
+
+    Background jobs must acquire the smaller background semaphore before the
+    shared total-download semaphore. This means background work can never fill
+    every source-download slot, while foreground jobs acquire only the shared
+    semaphore and can use the reserved capacity immediately.
+    """
     download_held = False
+    background_download_held = False
     lease = None
     try:
         if download:
+            if background:
+                if background_downloads is None:
+                    raise RuntimeError('Background download limiter is not configured')
+                await background_downloads.acquire()
+                background_download_held = True
             await downloads.acquire()
             download_held = True
         await extraction.acquire()
@@ -49,6 +61,8 @@ async def source_slot(extraction, downloads, *, download):
             await lease.close()
         if download_held:
             downloads.release()
+        if background_download_held:
+            background_downloads.release()
 
 
 def publish_download_started(data, directory):
@@ -66,6 +80,6 @@ def publish_download_started(data, directory):
         ready = (source.is_file() and source.resolve().parent == directory
                  and source.stat().st_size >= 8192)
     except FileNotFoundError:
-        return  # A finished download can be renamed between progress callbacks.
+        return
     if ready:
         marker.touch(mode=0o600, exist_ok=True)

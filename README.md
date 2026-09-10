@@ -1,11 +1,12 @@
-# Veeb resolver V39.2
+# Veeb resolver V40.1
 
-Start with **DEPLOY.txt**. This is a full resolver release. Use the existing
-**VEEB-WORKER-v39.1.txt** companion Worker; its version remains unchanged.
+Start with **DEPLOY.txt**. This is a full priority-aware resolver release. Pair it with
+**veeb-worker-r2-priority-parallel-v40.1.txt** in Cloudflare.
 
-V39.2 separates extraction admission from already-started downloads. One
-extractor runs at a time; up to two source downloads remain owned and bounded.
-The next track can extract while the first is still filling its MP3 cache.
+V40.1 keeps serialized extraction startup but makes active MP3 jobs priority-aware.
+Background R2 work has bounded parallel capacity, foreground playback has reserved
+capacity, and foreground can preempt a lower-priority background job if total capacity
+is full. Next-track prefetch also outranks bulk library warming.
 
 Cookie-based mweb gets first priority when a usable cookie file is available and
 has not been explicitly rejected by the session diagnostic. Known rejected
@@ -20,7 +21,7 @@ YouTube session must still be repaired in Render.
 the supplied live diagnostic and the changes made here.
 **TEST-RESULTS.txt** describes local verification and its production limits.
 The Docker build discovers all tests under `tests/` and requires them to pass.
-The complete release has nine test modules and 81 tests.
+The complete release has nine test modules and 85 tests.
 
 The optional desktop agent remains available for existing users. Normal
 installation uses `VEEB_SOURCE_MODE=direct`. The agent uploads completed MP3s

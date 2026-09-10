@@ -32,7 +32,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-app = FastAPI(title='Veeb YouTube Resolver V39.2 MP3 Stream', docs_url=None, redoc_url=None)
+app = FastAPI(title='Veeb YouTube Resolver V40.1 Priority Cache', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
 YOUTUBE_COOKIE_FILE = os.environ.get('YOUTUBE_COOKIE_FILE', '/etc/secrets/youtube-cookies.txt')
@@ -55,7 +55,10 @@ MP3_BITRATE_KBPS = max(96, min(192, int(os.environ.get('VEEB_MP3_BITRATE_KBPS', 
 MP3_CHUNK_BYTES = max(16 * 1024, int(os.environ.get('VEEB_MP3_CHUNK_BYTES', str(64 * 1024))))
 MP3_FIRST_BYTE_TIMEOUT_SECONDS = max(2.0, float(os.environ.get('VEEB_MP3_FIRST_BYTE_TIMEOUT', '8')))
 MP3_STARTUP_MIN_BYTES = max(4096, int(os.environ.get('VEEB_MP3_STARTUP_MIN_BYTES', '4096')))
-MP3_MAX_CONCURRENT_TRANSCODES = max(1, int(os.environ.get('VEEB_MP3_MAX_CONCURRENT', '2')))
+MP3_MAX_CONCURRENT_TRANSCODES = max(1, int(os.environ.get('VEEB_MP3_MAX_CONCURRENT', '3')))
+MP3_MAX_BACKGROUND_JOBS = max(0, min(
+    int(os.environ.get('VEEB_MP3_MAX_BACKGROUND', str(max(0, MP3_MAX_CONCURRENT_TRANSCODES - 1)))),
+    max(0, MP3_MAX_CONCURRENT_TRANSCODES - 1)))
 SOURCE_MODE = os.environ.get('VEEB_SOURCE_MODE', 'direct').strip().lower()
 SOURCE_AGENT_SECRET = os.environ.get('VEEB_SOURCE_AGENT_SECRET', '')
 SOURCE_DOWNLOAD_TIMEOUT = max(15, min(90, float(os.environ.get('VEEB_SOURCE_DOWNLOAD_TIMEOUT', '45'))))
@@ -96,11 +99,29 @@ _fg_embedded_pool = None
 _fg_visionos_pool = None
 _direct_prefetch_sem = asyncio.Semaphore(DIRECT_PREFETCH_CONCURRENCY)
 _mp3_transcode_sem = asyncio.Semaphore(MP3_MAX_CONCURRENT_TRANSCODES)
+_mp3_background_transcode_sem = asyncio.Semaphore(MP3_MAX_BACKGROUND_JOBS)
 _mp3_cache_fill_sem = asyncio.Semaphore(1)
 _resolve_task_purpose: dict[str, str] = {}
 _youtube_cookie_header: str = ''
 _youtube_cookie_authenticated = False
 _active_intent_video_id: str | None = None
+
+
+def request_purpose(request: Request | None) -> str:
+    try:
+        value = request.headers.get('x-veeb-purpose') if request is not None else None
+    except Exception:
+        value = None
+    return (value or 'playback').strip().lower()
+
+
+def is_background_purpose(purpose: str) -> bool:
+    value = str(purpose or '').strip().lower()
+    return (value in {'cache-fill', 'prefetch', 'r2-background-prefetch', 'r2-next-prefetch',
+                      'r2-library-warm', 'cache-import'}
+            or value.startswith('r2-background-')
+            or value.startswith('background-'))
+
 
 def require_auth(authorization: str | None) -> None:
     if not RESOLVER_SECRET:
@@ -132,7 +153,7 @@ def load_youtube_cookie_session(force: bool=False) -> bool:
     audit = inspect_cookies(YOUTUBE_COOKIE_FILE)
     _youtube_cookie_authenticated = audit['activeAuthCookieFieldsPresent']
     if force:
-        print('v39.2 cookie file audit', json.dumps(audit), flush=True)
+        print('v40.1 cookie file audit', json.dumps(audit), flush=True)
     return _youtube_cookie_authenticated
 
 def pot_http_server_ready() -> bool:
@@ -270,6 +291,7 @@ def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=
     return opts
 _extraction_sem = asyncio.Semaphore(1)
 _source_download_sem = asyncio.Semaphore(MP3_MAX_CONCURRENT_TRANSCODES)
+_source_background_download_sem = asyncio.Semaphore(MP3_MAX_BACKGROUND_JOBS)
 _fg_anon_pool = None
 
 async def spawn_owned_process(*args, **kwargs):
@@ -296,8 +318,14 @@ class YtdlpEnginePool:
         self.name, self.client_name, self.resolver_path = name, client_name, resolver_path
         self.use_cookies = name == 'fg-auth' if use_cookies is None else bool(use_cookies)
 
-    async def _child(self, video_id: str, *, download: bool, timeout: float, operation: str='source', directory=None) -> dict[str, Any]:
-        async with source_slot(_extraction_sem, _source_download_sem, download=download) as lease:
+    async def _child(self, video_id: str, *, download: bool, timeout: float, operation: str='source', directory=None, purpose: str='playback') -> dict[str, Any]:
+        background = is_background_purpose(purpose)
+        if background and download and MP3_MAX_BACKGROUND_JOBS <= 0:
+            raise JobError('RESOLVER_BUSY', 'Background source acquisition is disabled at the current capacity.')
+        async with source_slot(
+            _extraction_sem, _source_download_sem, download=download,
+            background=background, background_downloads=_source_background_download_sem
+        ) as lease:
             if operation == 'source':
                 _source_guard.check()
             options = ytdlp_options(self.client_name, None, use_cookies=self.use_cookies)
@@ -372,15 +400,15 @@ class YtdlpEnginePool:
         return media
 
     async def resolve(self, video_id: str, purpose: str) -> ResolvedMedia:
-        result = await self._child(video_id, download=False, timeout=18.0)
+        result = await self._child(video_id, download=False, timeout=18.0, purpose=purpose)
         media = self._media(video_id, result['media'], resolver_path=self.resolver_path)
         media._source_evidence = result.get('evidence') or {}
-        print('v39.2 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
+        print('v40.1 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
               'usesCookies': self.use_cookies, 'formatId': media.format_id}), flush=True)
         return media
 
     async def download_source(self, video_id: str, purpose: str, *, directory=None) -> ResolvedMedia:
-        result = await self._child(video_id, download=True, timeout=SOURCE_DOWNLOAD_TIMEOUT, directory=directory)
+        result = await self._child(video_id, download=True, timeout=SOURCE_DOWNLOAD_TIMEOUT, directory=directory, purpose=purpose)
         media = self._media(video_id, result['media'], resolver_path=self.resolver_path + '-yt-dlp-download')
         media._source_evidence = result.get('evidence') or {}
         if not getattr(media, '_local_path', None):
@@ -395,7 +423,7 @@ class YtdlpEnginePool:
         except BaseException:
             cleanup_owned_source(media)
             raise
-        print('v39.2 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
+        print('v40.1 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
               'usesCookies': self.use_cookies, 'formatId': media.format_id, 'bytes': result.get('downloadBytes')}), flush=True)
         return media
 
@@ -406,7 +434,7 @@ class YtdlpEnginePool:
         return await owned.start()
 
     async def inspect_session(self, video_id: str) -> dict[str, Any]:
-        result = await self._child(video_id, download=False, timeout=12.0, operation='session')
+        result = await self._child(video_id, download=False, timeout=12.0, operation='session', purpose='session-diagnostic')
         return result.get('cookieSessionTest') or {'tested': False, 'youtubeReportsLoggedIn': None, 'status': 'unknown'}
 
     def close(self) -> None:
@@ -550,7 +578,7 @@ def build_transcode_source_headers(media: ResolvedMedia) -> dict[str, str]:
     return headers
 
 def live_mp3_headers(media: ResolvedMedia, cache_state: str, request: Request) -> dict[str, str]:
-    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v39.2-mp3-stream', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'verified-agent-mp3' if media.client == 'source-agent' else 'ffmpeg-owned-source-mp3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
+    return {'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Accept-Ranges': 'none', 'X-Content-Type-Options': 'nosniff', 'X-Veeb-Resolver': 'v40.1-priority-cache', 'X-Veeb-Resolved-Cache': cache_state, 'X-Veeb-Playback-Client': media.client, 'X-Veeb-Source-Format': media.format_id or YTDLP_SOURCE_SELECTOR, 'X-Veeb-Resolver-Path': media.resolver_path, 'X-Veeb-Direct-Proxy': '0', 'X-Veeb-Transcode': 'verified-agent-mp3' if media.client == 'source-agent' else 'ffmpeg-owned-source-mp3', 'X-Veeb-MP3-Bitrate': str(MP3_BITRATE_KBPS), 'X-Veeb-Ignored-Range': '1' if request.headers.get('range') else '0'}
 
 def ffmpeg_http_input_args(media: ResolvedMedia) -> list[str]:
     """Build FFmpeg HTTP input options for the resolved Googlevideo URL.
@@ -587,11 +615,18 @@ async def _read_ffmpeg_stderr(process: asyncio.subprocess.Process) -> bytes:
 
 async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: Request) -> AsyncIterator[bytes]:
     """Prove MP3 startup from an owned source; download success still gates completion."""
-    purpose = (request.headers.get('x-veeb-purpose') or 'playback').strip().lower()
+    purpose = request_purpose(request)
     cache_fill = purpose == 'cache-fill'
+    background = is_background_purpose(purpose)
     owned = getattr(media, '_owned_download', None)
     cache_slot = False
+    background_transcode_slot = False
     try:
+        if background:
+            if MP3_MAX_BACKGROUND_JOBS <= 0:
+                raise JobError('RESOLVER_BUSY', 'Background transcoding is disabled at the current capacity.')
+            await _mp3_background_transcode_sem.acquire()
+            background_transcode_slot = True
         if cache_fill:
             await _mp3_cache_fill_sem.acquire()
             cache_slot = True
@@ -599,6 +634,8 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
     except BaseException:
         if cache_slot:
             _mp3_cache_fill_sem.release()
+        if background_transcode_slot:
+            _mp3_background_transcode_sem.release()
         if owned is not None:
             await owned.close()
         cleanup_owned_source(media)
@@ -616,6 +653,8 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
         _mp3_transcode_sem.release()
         if cache_fill:
             _mp3_cache_fill_sem.release()
+        if background_transcode_slot:
+            _mp3_background_transcode_sem.release()
 
     async def cleanup(kill: bool=False) -> bytes:
         if process is not None and kill and (process.returncode is None):
@@ -674,7 +713,7 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
         if len(first_chunk) < MP3_STARTUP_MIN_BYTES:
             stderr = await cleanup(kill=True)
             raise RuntimeError(f'FFmpeg produced only {len(first_chunk)} startup MP3 bytes' + (': ' + redact_source_error(stderr.decode('utf-8', 'replace')) if stderr else ''))
-        print('v39.2 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
+        print('v40.1 mp3 first bytes ready', json.dumps({'videoId': video_id, 'purpose': purpose, 'sourceFormat': media.format_id, 'resolverPath': media.resolver_path, 'firstChunkBytes': len(first_chunk), 'bitrateKbps': MP3_BITRATE_KBPS}), flush=True)
 
         async def body() -> AsyncIterator[bytes]:
             try:
@@ -695,7 +734,7 @@ async def prepare_live_mp3_stream(media: ResolvedMedia, video_id: str, request: 
                     except Exception:
                         pass
                 if rc != 0:
-                    print('v39.2 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
+                    print('v40.1 ffmpeg ended non-zero', json.dumps({'videoId': video_id, 'returnCode': rc, 'error': redact_source_error(stderr.decode('utf-8', 'replace'))}), flush=True)
                     raise RuntimeError('FFmpeg failed before MP3 completion')
             except asyncio.CancelledError:
                 raise
@@ -718,6 +757,7 @@ def error_detail(error: BaseException) -> dict[str, str]:
 
 async def produce_mp3(video_id: str, request: Request, job):
     global _last_source_success
+    purpose = request_purpose(request)
     imported = getattr(request, 'scope', {}).get('_veeb_import_media')
     if imported is not None:
         job.metadata.update(media=imported, cache='R2-IMPORT', attempts=[])
@@ -744,7 +784,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                 try:
                     # One yt-dlp process owns the source. Direct WebM can feed
                     # FFmpeg while downloading; other containers remain seekable.
-                    media = await pool.stream_source(video_id, 'live-download')
+                    media = await pool.stream_source(video_id, purpose)
                     media._output_bitrate = MP3_BITRATE_KBPS
                     iterator = await prepare_live_mp3_stream(media, video_id, request)
                     job.metadata.update(media=media, cache='MISS-PROGRESSIVE' if getattr(media, '_owned_download', None) else 'MISS-DOWNLOADED')
@@ -765,7 +805,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                         cleanup_owned_source(media)
                     detail = attempt_detail(pool, exc, 'download')
                     attempts.append(detail)
-                    print('v39.2 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
+                    print('v40.1 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
                     if getattr(exc, 'code', '') in {'SOURCE_ROUTE_COOLDOWN', 'SOURCE_PROXY_CONFIG_INVALID', 'SOURCE_DURATION_UNSUPPORTED'}:
                         raise
     except TimeoutError as exc:
@@ -801,17 +841,21 @@ async def owned_mp3_reader(media):
     finally:
         cleanup_owned_source(media)
 
-_media_jobs = MediaJobs(produce_mp3)
+_media_jobs = MediaJobs(produce_mp3, max_active=MP3_MAX_CONCURRENT_TRANSCODES, max_background=MP3_MAX_BACKGROUND_JOBS)
 
 async def proxy_media(request: Request, video_id: str):
-    cache_fill = request.headers.get('x-veeb-purpose') == 'cache-fill'
+    purpose = request_purpose(request)
+    cache_fill = purpose == 'cache-fill'
+    background = is_background_purpose(purpose)
     if request.method == 'HEAD':
-        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v39.2-mp3-stream'})
+        return Response(status_code=200, headers={'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'none', 'X-Veeb-Resolver': 'v40.1-priority-cache'})
     try:
-        job = _media_jobs.get(video_id, request, background=cache_fill)
+        job = _media_jobs.get(video_id, request, background=background, purpose=purpose)
         await _media_jobs.wait(job, complete=cache_fill)
         headers = live_mp3_headers(job.metadata['media'], job.metadata['cache'], request)
         headers['X-Veeb-MP3-Job'] = job.job_id
+        headers['X-Veeb-Request-Purpose'] = purpose
+        headers['X-Veeb-Job-Class'] = 'background' if background else 'foreground'
         if cache_fill or job.done.is_set():
             headers['Content-Length'] = str(job.size)
             headers['X-Veeb-MP3-Complete'] = '1'
@@ -819,7 +863,7 @@ async def proxy_media(request: Request, video_id: str):
         return StreamingResponse(body, headers=headers, media_type='audio/mpeg', background=BackgroundTask(close))
     except Exception as exc:
         detail = error_detail(exc)
-        status = 503 if detail['code'] in {'RESOLVER_BUSY', 'SOURCE_ROUTE_COOLDOWN', 'SOURCE_AGENT_OFFLINE'} else 502
+        status = 503 if detail['code'] in {'RESOLVER_BUSY', 'BACKGROUND_PREEMPTED', 'SOURCE_ROUTE_COOLDOWN', 'SOURCE_AGENT_OFFLINE'} else 502
         return JSONResponse({'ok': False, 'stage': 'source-or-transcode', **detail}, status_code=status, headers={'Cache-Control': 'no-store', 'Retry-After': str(getattr(exc, 'retry_after', 15)), 'X-Veeb-Error-Code': detail['code']})
 
 @app.on_event('startup')
@@ -827,7 +871,7 @@ async def startup_session() -> None:
     load_youtube_cookie_session(force=True)
     get_http_client()
     init_ytdlp_pools()
-    print('v39.2 ready: session-aware mweb priority; independent extraction/download slots; shared MP3 jobs', flush=True)
+    print('v40.1 ready: foreground-first MP3 jobs; preemptible background cache capacity; reserved playback lane ' + json.dumps({'maxConcurrent': MP3_MAX_CONCURRENT_TRANSCODES, 'maxBackground': MP3_MAX_BACKGROUND_JOBS, 'foregroundReserved': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS)}), flush=True)
 
 @app.on_event('shutdown')
 async def shutdown_http_client() -> None:
@@ -847,7 +891,7 @@ async def root_head() -> Response:
 
 @app.get('/')
 async def root() -> dict[str, Any]:
-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.2-mp3-stream'}
+    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v40.1-priority-cache'}
 
 @app.get('/health')
 async def health(authorization: str | None=Header(default=None)) -> dict[str, Any]:
@@ -859,7 +903,7 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
     except importlib.metadata.PackageNotFoundError:
         version = 'unknown'
     audit, stats = inspect_cookies(YOUTUBE_COOKIE_FILE), _media_jobs.stats()
-    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v39.2-mp3-stream',
+    return {'ok': True, 'service': 'veeb-resolver', 'version': 'v40.1-priority-cache',
             'ytDlpVersion': version, 'sourceSelector': YTDLP_SOURCE_SELECTOR,
             'cookieFilePresent': audit['present'], 'cookieAuthFieldsPresent': audit['activeAuthCookieFieldsPresent'],
             'cookieSessionRecognized': _last_cookie_session_test.get('youtubeReportsLoggedIn'),
@@ -878,8 +922,13 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
             'note': 'Liveness only. Current completed jobs prove MP3 production; cookie fields alone prove no login.',
             'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1,
             'sourceDownloadConcurrency': MP3_MAX_CONCURRENT_TRANSCODES,
+            'maxConcurrentTranscodes': MP3_MAX_CONCURRENT_TRANSCODES,
+            'maxBackgroundJobs': MP3_MAX_BACKGROUND_JOBS,
+            'foregroundReservedSlots': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS),
+            'backgroundPurposeHeaders': ['cache-fill', 'r2-background-prefetch', 'r2-next-prefetch', 'r2-library-warm'],
+            'foregroundPreemptsBackground': True,
             'extractionSlotReleasedAfterSourceBytes': True,
-            'completedMp3Endpoint': '/completed/{videoId}', 'completedEndpointStartsAcquisition': False, 'maxConcurrentTranscodes': MP3_MAX_CONCURRENT_TRANSCODES, 'jobs': stats}
+            'completedMp3Endpoint': '/completed/{videoId}', 'completedEndpointStartsAcquisition': False, 'jobs': stats}
 
 async def codec_self_test():
     """Exercise this instance's encoder without contacting YouTube or R2."""
@@ -917,7 +966,7 @@ async def diagnose(video_id: str, authorization: str | None=Header(default=None)
     except Exception as exc:
         codec_test = {'ok': False, 'error': redact(exc, 180)}
     if not codec_test['ok']:
-        return JSONResponse({'ok': False, 'version': 'v39.2-mp3-stream', 'videoId': video_id,
+        return JSONResponse({'ok': False, 'version': 'v40.1-priority-cache', 'videoId': video_id,
                              'code': 'MP3_SELF_TEST_FAILED', 'codecSelfTest': codec_test, 'cookieAudit': audit}, status_code=424)
     init_ytdlp_pools()
     if SOURCE_MODE == 'agent':
@@ -930,7 +979,7 @@ async def diagnose(video_id: str, authorization: str | None=Header(default=None)
     else:
         _last_cookie_session_test = {'tested': False, 'youtubeReportsLoggedIn': None, 'status': 'no_usable_cookie_file'}
     _last_cookie_session_test['checkedAtUnix'] = int(time.time())
-    report = {'version': 'v39.2-mp3-stream', 'videoId': video_id, 'cookieAudit': audit,
+    report = {'version': 'v40.1-priority-cache', 'videoId': video_id, 'cookieAudit': audit,
               'sourceMode': SOURCE_MODE, 'sourceAgent': _source_broker.status(),
               'cookieSessionTest': dict(_last_cookie_session_test), 'codecSelfTest': codec_test}
     request = Request({'type': 'http', 'method': 'GET', 'headers': []})
@@ -1009,7 +1058,7 @@ async def completed_mp3(video_id: str, request: Request,
     video_id = validate_video_id(video_id)
     _media_jobs._evict()
     job = _media_jobs.jobs.get(video_id)
-    common = {'Cache-Control': 'no-store', 'X-Veeb-Resolver': 'v39.2-mp3-stream'}
+    common = {'Cache-Control': 'no-store', 'X-Veeb-Resolver': 'v40.1-priority-cache'}
     if job is None:
         return JSONResponse({'ok': False, 'code': 'COMPLETED_MP3_MISS',
                              'startsAcquisition': False}, status_code=404, headers=common)
@@ -1113,7 +1162,7 @@ async def import_cached_source(video_id: str, request: Request,
                               None, duration, 'R2 import', time.time(), time.time()+900, 'r2-legacy-import')
         media._local_path = str(path)
         media._output_bitrate = MP3_BITRATE_KBPS
-        local_request = Request({'type': 'http', 'method': 'GET', 'headers': [], '_veeb_import_media': media})
+        local_request = Request({'type': 'http', 'method': 'GET', 'headers': [(b'x-veeb-purpose', b'cache-import')], '_veeb_import_media': media})
         # Upload/probe awaited. Re-check so a foreground job created during
         # that time is never relabelled as a source-free import.
         if _media_jobs.jobs.get(video_id) is not None:
@@ -1123,7 +1172,7 @@ async def import_cached_source(video_id: str, request: Request,
         owned_by_job = True
         job.task.add_done_callback(lambda _done, folder=directory: shutil.rmtree(folder, ignore_errors=True))
         await _media_jobs.wait(job, complete=True)
-        return {'ok': True, 'version': 'v39.2-mp3-stream', 'mp3Complete': True,
+        return {'ok': True, 'version': 'v40.1-priority-cache', 'mp3Complete': True,
                 'bytes': job.size, 'jobId': job.job_id, 'source': 'legacy-r2',
                 'youtubeContacted': False, 'originalDeleted': False}
     except Exception as exc:

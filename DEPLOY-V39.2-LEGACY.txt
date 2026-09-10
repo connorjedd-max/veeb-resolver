@@ -1,0 +1,93 @@
+VEEB V39.2. EXACT INSTALLATION AND SESSION REPAIR
+
+This resolver works with the existing VEEB-WORKER-v39.1.txt release.
+The resolver version is v39.2-mp3-stream. The Worker version is
+10.10.4-v39.1-playback. Those are the intended versions of these two components.
+
+Your attached diagnostic currently shows the V38.3 Worker and V39.1 resolver.
+It also shows youtubeReportsLoggedIn=false, codecSelfTest.ok=true, and refusal
+before source selection. Updating code does not renew a rejected login session.
+
+1. REPLACE THE RESOLVER IN GITHUB
+Extract veeb-resolver-v39.2.zip. In the EXISTING GitHub repository linked to
+Render's veeb-resolver service, upload the extracted contents into the ROOT,
+beside Dockerfile and veeb_resolver.py. Replace matching files.
+
+Include ALL root .py files, especially the NEW source_slots.py, plus Dockerfile
+and requirements.txt. Open the existing tests folder and upload ALL NINE test
+files there, replacing matching files. The paths must include:
+  veeb_resolver.py
+  extract_source.py
+  source_slots.py
+  tests/test_pipeline.py
+  tests/test_source_slots.py
+Avoid an outer version directory or a tests/tests directory. Uploading the ZIP
+itself does not install the resolver. Commit to the branch connected to Render.
+The Docker build must discover 81 tests and finish with OK.
+
+2. REPLACE THE REJECTED COOKIE SESSION
+Use a fresh private/incognito browser window. Log into YouTube there. In the
+same tab, navigate to https://www.youtube.com/robots.txt. Export youtube.com
+cookies using your cookie-export tool in Netscape cookies.txt format, then
+close that private window. Do not reopen that exported private session.
+This is yt-dlp's documented export procedure to reduce browser cookie rotation.
+A normal browser session remaining logged in does not verify the exported file.
+
+In Render: open veeb-resolver > Environment > Secret Files.
+Edit the EXISTING youtube-cookies.txt entry and replace its Contents with the
+entire fresh Netscape export. If the entry is absent, add that exact filename.
+The first line should be # Netscape HTTP Cookie File, followed by tab-separated
+cookie rows. Do not paste JSON. This secret belongs in Render, not GitHub or chat.
+
+In the same service's Environment Variables, set or confirm:
+  YOUTUBE_COOKIE_FILE = /etc/secrets/youtube-cookies.txt
+  VEEB_SOURCE_MODE = direct
+  VEEB_MP3_STARTUP_MIN_BYTES = 4096
+  VEEB_MP3_MAX_CONCURRENT = 2
+
+If an older YOUTUBE_SOURCE_SELECTOR override exists, remove it to use the audio
+WebM default, or set it to:
+  bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best
+Keep your existing RESOLVER_SECRET. Keep one Uvicorn worker and one instance.
+Save the secret/settings and deploy the committed V39.2 build. Render's secret
+file save triggers a deployment; wait for the final deployment to settle.
+
+3. UPDATE THE CLOUDFLARE WORKER
+Open the supplied VEEB-WORKER-v39.1.txt. Copy its ENTIRE contents.
+Cloudflare > Workers & Pages > your EXISTING Veeb Worker > Edit code:
+replace the ENTIRE existing script, then Deploy.
+The Worker is intentionally V39.1; this release changes only the resolver.
+The existing saved V39.1 Worker contains the browser startup/recovery fixes that
+are absent from the V38.3 Worker reported by your diagnostic.
+
+Keep DB, AUDIO_CACHE, YOUTUBE_RESOLVER_URL and YOUTUBE_RESOLVER_SECRET.
+In Veeb /admin, Browser recovery playback should show RECOVERY OFF to test the
+MP3 route. Reload the Veeb page once after deploying the Worker.
+
+4. VERIFY ACCESS, THEN SPEED
+At your Veeb site's /admin page, use Playback and cache test. Enter
+siRAwwaNc1M and click TEST PLAYBACK once.
+Expected versions: Worker 10.10.4-v39.1-playback; resolver v39.2-mp3-stream.
+Read playback.cookieSessionTest.youtubeReportsLoggedIn. It should become true
+for the new cookie session. The decisive playback result is playback.ok=true,
+mp3Complete=true, and a successful R2 store/read.
+
+If the login field remains false, the new export is still not recognised from
+Render. If it is true but audio is refused, account recognition is insufficient
+for this request. Neither outcome is fixed by adding page reload retries.
+Paste the resulting JSON, without cookie values, for the next diagnosis.
+
+The admin check includes session testing and COMPLETE MP3 production. Its elapsed
+seconds are not tap-to-audible startup time. Once source access succeeds, measure
+both an uncached track and an R2-cached track in the normal player. Also switch
+tracks while the earlier source is still downloading. The scheduler now allows
+that next extraction without waiting for the first download to finish.
+
+The supplied render.yaml retains the earlier Free blueprint setting. Check the
+actual service's compute plan. An idle Free instance cannot meet a 1-2 second
+first-request target. Changing plans does not fix YouTube session rejection.
+
+SOURCES
+https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+https://render.com/docs/configure-environment-variables#secret-files
+https://render.com/docs/free#spinning-down-on-idle
