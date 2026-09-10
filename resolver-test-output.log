@@ -1,93 +1,0 @@
-test_complete_mp3_get_and_head_reuse_producer (test_completed_cache.CompletedTests.test_complete_mp3_get_and_head_reuse_producer) ... ok
-test_deleted_file_returns_miss (test_completed_cache.CompletedTests.test_deleted_file_returns_miss) ... ok
-test_expired_job_does_not_reextract (test_completed_cache.CompletedTests.test_expired_job_does_not_reextract) ... ok
-test_failed_job_is_not_served (test_completed_cache.CompletedTests.test_failed_job_is_not_served) ... ok
-test_miss_never_creates_job (test_completed_cache.CompletedTests.test_miss_never_creates_job) ... ok
-test_rejects_invalid_id (test_completed_cache.CompletedTests.test_rejects_invalid_id) ... ok
-test_requires_auth (test_completed_cache.CompletedTests.test_requires_auth) ... ok
-test_running_is_202_without_new_work (test_completed_cache.CompletedTests.test_running_is_202_without_new_work) ... ok
-test_protected_health_lists_authenticated_mweb (test_http.HttpTests.test_protected_health_lists_authenticated_mweb) ... ok
-test_real_codec_self_test (test_http.HttpTests.test_real_codec_self_test) ... v39.1 mp3 first bytes ready {"videoId": "codec-test", "purpose": "playback", "sourceFormat": "wav", "resolverPath": "local-self-test", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_real_diagnose_json_preserves_phases_and_cookie_result (test_http.HttpTests.test_real_diagnose_json_preserves_phases_and_cookie_result) ... v39.1 mp3 first bytes ready {"videoId": "codec-test", "purpose": "playback", "sourceFormat": "wav", "resolverPath": "local-self-test", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_auth_required_before_upload (test_import_cache.ImportTests.test_auth_required_before_upload) ... ok
-test_body_limit (test_import_cache.ImportTests.test_body_limit) ... ok
-test_duplicate_import_does_not_reconvert (test_import_cache.ImportTests.test_duplicate_import_does_not_reconvert) ... v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "r2-import", "resolverPath": "r2-legacy-import", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_real_source_import_and_completed_read (test_import_cache.ImportTests.test_real_source_import_and_completed_read) ... v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "r2-import", "resolverPath": "r2-legacy-import", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_text_playlist_cannot_be_used_as_source (test_import_cache.ImportTests.test_text_playlist_cannot_be_used_as_source) ... ok
-test_wrong_content_length (test_import_cache.ImportTests.test_wrong_content_length) ... ok
-test_anonymous_source_is_owned_by_ytdlp_from_start (test_pipeline.PipelineTests.test_anonymous_source_is_owned_by_ytdlp_from_start) ... ok
-test_background_capacity_and_reader_cancellation (test_pipeline.PipelineTests.test_background_capacity_and_reader_cancellation) ... ok
-test_cache_response_is_finite_and_complete (test_pipeline.PipelineTests.test_cache_response_is_finite_and_complete) ... ok
-test_clean_but_short_source_rejected (test_pipeline.PipelineTests.test_clean_but_short_source_rejected) ... ok
-test_cookie_modes_and_manifest_options (test_pipeline.PipelineTests.test_cookie_modes_and_manifest_options) ... ok
-test_extraction_cancel_kills_child_and_releases_slot (test_pipeline.PipelineTests.test_extraction_cancel_kills_child_and_releases_slot) ... ok
-test_failed_stream_never_completes_cache (test_pipeline.PipelineTests.test_failed_stream_never_completes_cache) ... ok
-test_foreground_order_includes_explicit_authenticated_mweb (test_pipeline.PipelineTests.test_foreground_order_includes_explicit_authenticated_mweb) ... ok
-test_head_does_not_launch_job (test_pipeline.PipelineTests.test_head_does_not_launch_job) ... ok
-test_invalid_bytes_fail_before_ready (test_pipeline.PipelineTests.test_invalid_bytes_fail_before_ready) ... ok
-test_local_downloaded_source_transcodes_and_is_deleted (test_pipeline.PipelineTests.test_local_downloaded_source_transcodes_and_is_deleted) ... v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "140", "resolverPath": "fixture-local", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_real_http_source_to_mp3_and_shared_cache_fill (test_pipeline.PipelineTests.test_real_http_source_to_mp3_and_shared_cache_fill) ... v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "140", "resolverPath": "fixture", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_size_limit_cannot_publish_complete (test_pipeline.PipelineTests.test_size_limit_cannot_publish_complete) ... ok
-test_timeout_cleans_producer (test_pipeline.PipelineTests.test_timeout_cleans_producer) ... ok
-test_cancel_during_progressive_playback_closes_the_downloader (test_progressive.ProgressiveTests.test_cancel_during_progressive_playback_closes_the_downloader) ... v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": null, "resolverPath": "f", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ok
-test_cancel_reaps_owned_download_while_waiting_for_encoder_slot (test_progressive.ProgressiveTests.test_cancel_reaps_owned_download_while_waiting_for_encoder_slot) ... ok
-test_late_download_failure_never_publishes_complete_mp3 (test_progressive.ProgressiveTests.test_late_download_failure_never_publishes_complete_mp3) ... Executing <Task pending name='Task-252' coro=<ProgressiveTests.test_late_download_failure_never_publishes_complete_mp3() running at /workspace/scratch/b75c8cc94753/work/veeb-playback-v39.1/resolver/tests/test_progressive.py:119> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()] created at /opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:712> cb=[_run_until_complete_cb() at /opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/base_events.py:181] created at /opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py:100> took 0.137 seconds
-[download]   0.3% of  369.80KiB at  Unknown B/s ETA Unknown[download]   0.8% of  369.80KiB at  Unknown B/s ETA Unknown[download]   1.9% of  369.80KiB at  Unknown B/s ETA Unknown[download]   4.1% of  369.80KiB at   14.60MiB/s ETA 00:00  [download]   8.4% of  369.80KiB at   22.40MiB/s ETA 00:00v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "fixture", "resolverPath": "fixture-progressive", "firstChunkBytes": 4096, "bitrateKbps": 128}
-ERROR: [download] Got error: 48000 bytes read, 330676 more expected
-ok
-test_mp4_and_fragmented_sources_do_not_take_pipe_path (test_progressive.ProgressiveTests.test_mp4_and_fragmented_sources_do_not_take_pipe_path) ... ok
-test_real_downloader_starts_mp3_before_source_eof (test_progressive.ProgressiveTests.test_real_downloader_starts_mp3_before_source_eof) ... [download]   0.3% of  369.80KiB at  Unknown B/s ETA Unknown[download]   0.8% of  369.80KiB at  Unknown B/s ETA Unknown[download]   1.9% of  369.80KiB at  Unknown B/s ETA Unknown[download]   4.1% of  369.80KiB at   12.96MiB/s ETA 00:00  [download]   8.4% of  369.80KiB at   19.95MiB/s ETA 00:00v39.1 mp3 first bytes ready {"videoId": "siRAwwaNc1M", "purpose": "playback", "sourceFormat": "fixture", "resolverPath": "fixture-progressive", "firstChunkBytes": 4096, "bitrateKbps": 128}
-[download]  17.0% of  369.80KiB at 1001.08KiB/s ETA 00:00[download]  34.3% of  369.80KiB at    1.95MiB/s ETA 00:00[download]  69.0% of  369.80KiB at    3.89MiB/s ETA 00:00[download] 100.0% of  369.80KiB at    5.58MiB/s ETA 00:00[download] 100% of  369.80KiB in 00:00:00 at 4.97MiB/s                                                         Executing <Task finished name='Task-272' coro=<ProgressiveTests.test_real_downloader_starts_mp3_before_source_eof() done, defined at /workspace/scratch/b75c8cc94753/work/veeb-playback-v39.1/resolver/tests/test_progressive.py:115> result=None created at /opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py:100> took 0.117 seconds
-ok
-test_cooldown_expires (test_reliability.GuardTests.test_cooldown_expires) ... ok
-test_one_private_or_challenged_track_does_not_disable_every_track (test_reliability.GuardTests.test_one_private_or_challenged_track_does_not_disable_every_track) ... ok
-test_proxy_credentials_never_appear_in_diagnostics (test_reliability.GuardTests.test_proxy_credentials_never_appear_in_diagnostics) ... ok
-test_proxy_is_explicit_and_invalid_configuration_is_not_silently_ignored (test_reliability.GuardTests.test_proxy_is_explicit_and_invalid_configuration_is_not_silently_ignored) ... ok
-test_real_ytdlp_aborts_missing_hls_fragment_instead_of_publishing_partial_source (test_reliability.GuardTests.test_real_ytdlp_aborts_missing_hls_fragment_instead_of_publishing_partial_source) ... ok
-test_agent_local_copy_reused_without_another_source_download (test_reliability.ReliabilityTests.test_agent_local_copy_reused_without_another_source_download) ... ok
-test_completed_files_are_protected_during_worker_collection_window (test_reliability.ReliabilityTests.test_completed_files_are_protected_during_worker_collection_window) ... ok
-test_entire_mp3_not_just_startup_is_validated (test_reliability.ReliabilityTests.test_entire_mp3_not_just_startup_is_validated) ... ok
-test_imported_cache_does_not_claim_youtube_source_access (test_reliability.ReliabilityTests.test_imported_cache_does_not_claim_youtube_source_access) ... ok
-test_resolve_and_stream_share_one_source_download (test_reliability.ReliabilityTests.test_resolve_and_stream_share_one_source_download) ... ok
-test_truncated_frame_never_becomes_completed_audio (test_reliability.ReliabilityTests.test_truncated_frame_never_becomes_completed_audio) ... ok
-test_anonymous_child_has_no_cookiefile (test_sessions.CookieTests.test_anonymous_child_has_no_cookiefile) ... ok
-test_auth_child_private_cookie_copy_is_deleted (test_sessions.CookieTests.test_auth_child_private_cookie_copy_is_deleted) ... ok
-test_bad_runtime_update_rejected (test_sessions.CookieTests.test_bad_runtime_update_rejected) ... ok
-test_download_failure_keeps_stage_reason_and_cleans_files (test_sessions.CookieTests.test_download_failure_keeps_stage_reason_and_cleans_files) ... ok
-test_fields_do_not_verify_login (test_sessions.CookieTests.test_fields_do_not_verify_login) ... ok
-test_invalid_replacement_cannot_reuse_old_runtime (test_sessions.CookieTests.test_invalid_replacement_cannot_reuse_old_runtime) ... ok
-test_login_flag_true_false_unknown_conflict (test_sessions.CookieTests.test_login_flag_true_false_unknown_conflict) ... ok
-test_malformed_file_does_not_leak_values (test_sessions.CookieTests.test_malformed_file_does_not_leak_values) ... ok
-test_old_child_cannot_overwrite_new_secret (test_sessions.CookieTests.test_old_child_cannot_overwrite_new_secret) ... ok
-test_rotation_preserved_without_modifying_secret (test_sessions.CookieTests.test_rotation_preserved_without_modifying_secret) ... ok
-test_secret_change_refreshes_runtime (test_sessions.CookieTests.test_secret_change_refreshes_runtime) ... ok
-test_token_cache_spam_cannot_hide_main_error (test_sessions.CookieTests.test_token_cache_spam_cannot_hide_main_error) ... ok
-test_tokens_and_url_tails_are_redacted (test_sessions.CookieTests.test_tokens_and_url_tails_are_redacted) ... ok
-test_zero_expiry_is_session_not_expired (test_sessions.CookieTests.test_zero_expiry_is_session_not_expired) ... ok
-test_authenticated_mweb_owns_download_from_start (test_sessions.SessionPipelineTests.test_authenticated_mweb_owns_download_from_start) ... Progressive fixture: first MP3 bytes in 107 ms, source still held open; complete MP3 320574 bytes
-v39.1 source attempt failed {"videoId": "siRAwwaNc1M", "path": "fg-pot", "client": "mweb", "usesCookies": false, "stage": "extract", "code": "SOURCE_ACCESS_DENIED", "error": "not a bot", "evidence": {}, "diagnostics": []}
-ok
-test_cancel_cleans_parent_owned_download_directory (test_sessions.SessionPipelineTests.test_cancel_cleans_parent_owned_download_directory) ... ok
-test_missing_auth_file_is_not_silent_anonymous_attempt (test_sessions.SessionPipelineTests.test_missing_auth_file_is_not_silent_anonymous_attempt) ... ok
-test_mweb_args_equal_except_cookiefile (test_sessions.SessionPipelineTests.test_mweb_args_equal_except_cookiefile) ... ok
-test_agent_failure_reaches_original_waiter (test_source_agent.AgentTests.test_agent_failure_reaches_original_waiter) ... ok
-test_agent_key_cannot_access_worker_or_submit_unleased_audio (test_source_agent.AgentTests.test_agent_key_cannot_access_worker_or_submit_unleased_audio) ... ok
-test_agent_upload_fulfills_shared_playback_and_completed_cache (test_source_agent.AgentTests.test_agent_upload_fulfills_shared_playback_and_completed_cache) ... ok
-test_bad_hash_is_rejected_and_same_lease_can_retry_valid_bytes (test_source_agent.AgentTests.test_bad_hash_is_rejected_and_same_lease_can_retry_valid_bytes) ... ok
-test_heartbeat_keeps_agent_online_during_download (test_source_agent.AgentTests.test_heartbeat_keeps_agent_online_during_download) ... ok
-test_offline_agent_returns_clear_failure_without_render_fallback (test_source_agent.AgentTests.test_offline_agent_returns_clear_failure_without_render_fallback) ... ok
-test_old_agent_cannot_replace_reclaimed_lease (test_source_agent.AgentTests.test_old_agent_cannot_replace_reclaimed_lease) ... ok
-test_real_client_upload_function_reuses_completed_bytes (test_source_agent.AgentTests.test_real_client_upload_function_reuses_completed_bytes) ... {"videoId": "siRAwwaNc1M", "status": "delivered", "bytes": 48483, "localCacheHit": false}
-ok
-
-----------------------------------------------------------------------
-Ran 73 tests in 4.490s
-
-OK
