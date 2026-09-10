@@ -119,13 +119,13 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
         c=self.core;media=types.SimpleNamespace(client='mweb',format_id='251',video_id='siRAwwaNc1M')
         job=types.SimpleNamespace(metadata={});iterator=object()
         with patch.object(c,'get_writable_cookie_file',return_value='/private/cookies'), \
-             patch.object(c._fg_pot_pool,'download_source',AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
+             patch.object(c._fg_pot_pool,'download_source',AsyncMock(side_effect=AssertionError('auth must not wait for anonymous'))) as anonymous, \
              patch.object(c._fg_mweb_auth_pool,'resolve',AsyncMock(side_effect=AssertionError('must retain session'))) as resolve, \
              patch.object(c._fg_mweb_auth_pool,'download_source',AsyncMock(return_value=media)) as download, \
              patch.object(c,'prepare_live_mp3_stream',AsyncMock(return_value=iterator)):
             result=await c.produce_mp3('siRAwwaNc1M',None,job)
         self.assertIs(result,iterator);download.assert_awaited_once();resolve.assert_not_awaited()
-        self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);self.assertIn('not a bot',job.metadata['attempts'][0]['error'])
+        self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);anonymous.assert_not_awaited()
     async def test_mweb_args_equal_except_cookiefile(self):
         with patch.object(self.core,'get_writable_cookie_file',return_value='/private/cookies'):
             a=self.core.ytdlp_options('mweb',None,False);b=self.core.ytdlp_options('mweb',None,True)

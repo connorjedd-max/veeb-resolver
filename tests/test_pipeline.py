@@ -240,7 +240,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
              patch.object(core._fg_anon_pool,'resolve',AsyncMock(return_value=media)), \
              patch.object(core,'get_writable_cookie_file',return_value='/private/cookies'):
             result=await core.resolve_ytdlp_foreground_v35('siRAwwaNc1M','live')
-        self.assertIs(result,media); self.assertEqual(order,['mweb-anon','mweb-auth'])
+        self.assertIs(result,media); self.assertEqual(order,['mweb-auth','mweb-anon'])
         self.assertFalse(core._fg_pot_pool.use_cookies)
         self.assertTrue(core._fg_mweb_auth_pool.use_cookies)
 
