@@ -12,3 +12,10 @@ This is feature-gated with `VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT`. Set it to
 rest of the resolver.
 
 See **CHANGES-V40.4.md** for scope, caveats and expected telemetry.
+
+
+## v40.5 primary-path client-config optimization
+
+Authenticated mweb playback skips the separate client-config request by default.
+Set `VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG=false` for immediate rollback. The
+cookie-free mweb fallback always retains the normal client-config request.

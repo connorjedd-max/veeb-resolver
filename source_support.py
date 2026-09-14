@@ -169,6 +169,8 @@ class DiagnosticLog:
         low = raw.lower()
         if 'downloading webpage' in low:
             self.mark('webpageMs')
+        if 'client config' in low:
+            self.mark('clientConfigMs')
         if 'player api json' in low:
             self.mark('playerApiMs')
         # yt-dlp may intentionally delay a download to honour a detected preroll.

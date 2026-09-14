@@ -32,8 +32,8 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-RESOLVER_VERSION = 'v40.4-ad-playback-context'
-app = FastAPI(title='Veeb YouTube Resolver V40.4 Ad Playback Context', docs_url=None, redoc_url=None)
+RESOLVER_VERSION = 'v40.5-mweb-skip-client-config'
+app = FastAPI(title='Veeb YouTube Resolver V40.5 Mweb Skip Client Config', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
 JOB_ID_RE = re.compile('^[a-f0-9]{12}$')
@@ -58,6 +58,8 @@ def env_bool(name: str, default: bool=False) -> bool:
     if value in {'0', 'false', 'no', 'off', 'disabled'}:
         return False
     return bool(default)
+
+YTDLP_SKIP_MWEB_CLIENT_CONFIG = env_bool('VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG', True)
 
 # yt-dlp's official mweb/web_music preroll bypass. This does not change source
 # ownership or downloader semantics. It only asks YouTube for an ad-free playback
@@ -278,17 +280,21 @@ class YtdlpPhaseLogger:
     def error(self, message: str) -> None:
         self.debug(message)
 
-def youtube_extractor_args_dict(client: str) -> dict[str, list[str]]:
+def youtube_extractor_args_dict(client: str, *, use_cookies: bool=False) -> dict[str, list[str]]:
     args = {}
     if client not in {'', 'default', 'anonymous'}:
         args['player_client'] = [client]
     if client in {'visionos', 'android'}:
         args['player_skip'] = ['webpage']
     if client == 'mweb':
-        # Identical provider policy in cookie-free and authenticated modes.
+        # Keep the known-good POT/ad policy on every mweb route. Only the first
+        # authenticated foreground path skips the client-config request. If that
+        # fast path fails, fg-pot still exercises the normal v40.4 config flow.
         args['fetch_pot'] = ['auto']
         if YTDLP_USE_AD_PLAYBACK_CONTEXT:
             args['use_ad_playback_context'] = ['true']
+        if use_cookies and YTDLP_SKIP_MWEB_CLIENT_CONFIG:
+            args['player_skip'] = ['configs']
     return args
 
 def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=False) -> dict[str, Any]:
@@ -302,7 +308,7 @@ def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=
             'socket_timeout': YTDLP_SOCKET_TIMEOUT_SECONDS, 'retries': 0,
             'extractor_retries': YTDLP_EXTRACTOR_RETRIES, 'check_formats': False,
             'js_runtimes': {JSC_RUNTIME: {}},
-            'extractor_args': {'youtube': youtube_extractor_args_dict(client_name),
+            'extractor_args': {'youtube': youtube_extractor_args_dict(client_name, use_cookies=use_cookies),
                               'youtubepot-bgutilhttp': {'base_url': [BGUTIL_BASE_URL]}}, 'logger': logger}
     if cookie_file:
         opts['cookiefile'] = cookie_file
@@ -439,7 +445,7 @@ class YtdlpEnginePool:
         result = await self._child(video_id, download=False, timeout=18.0, purpose=purpose)
         media = self._media(video_id, result['media'], resolver_path=self.resolver_path)
         media._source_evidence = result.get('evidence') or {}
-        print('v40.4 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
+        print('v40.5 source selected', json.dumps({'videoId': video_id, 'client': self.client_name,
               'usesCookies': self.use_cookies, 'formatId': media.format_id}), flush=True)
         return media
 
@@ -460,7 +466,7 @@ class YtdlpEnginePool:
         except BaseException:
             cleanup_owned_source(media)
             raise
-        print('v40.4 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
+        print('v40.5 source downloaded by yt-dlp', json.dumps({'videoId': video_id, 'client': self.client_name,
               'usesCookies': self.use_cookies, 'formatId': media.format_id, 'bytes': result.get('downloadBytes')}), flush=True)
         return media
 
@@ -923,10 +929,11 @@ async def produce_mp3(video_id: str, request: Request, job):
                     mark_job_timing(job, 'source_ready', overwrite=True)
                     source_timing = dict(getattr(media, '_source_startup_timing', {}) or {})
                     job.metadata['sourceTiming'] = source_timing
-                    print('v40.4 source acquisition phases', json.dumps({
+                    print('v40.5 source acquisition phases', json.dumps({
                         'videoId': video_id, 'jobId': getattr(job, 'job_id', None), 'path': pool.name,
                         'sourceAcquireMs': elapsed_ms(attempt_started, time.monotonic()),
                         'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT,
+                        'skipClientConfig': bool(pool.client_name == 'mweb' and pool.use_cookies and YTDLP_SKIP_MWEB_CLIENT_CONFIG),
                         **source_timing
                     }), flush=True)
                     iterator = await prepare_live_mp3_stream(media, video_id, request, job=job)
@@ -950,7 +957,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                     detail = attempt_detail(pool, exc, 'download')
                     detail['elapsedMs'] = elapsed_ms(attempt_started, time.monotonic())
                     attempts.append(detail)
-                    print('v40.4 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
+                    print('v40.5 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
                     if getattr(exc, 'code', '') in {'SOURCE_ROUTE_COOLDOWN', 'SOURCE_PROXY_CONFIG_INVALID', 'SOURCE_DURATION_UNSUPPORTED'}:
                         raise
     except TimeoutError as exc:
@@ -1033,7 +1040,7 @@ async def startup_session() -> None:
     load_youtube_cookie_session(force=True)
     get_http_client()
     init_ytdlp_pools()
-    print('v40.4 ready: foreground-first MP3 jobs; preemptible background cache capacity; reserved playback lane ' + json.dumps({'maxConcurrent': MP3_MAX_CONCURRENT_TRANSCODES, 'maxBackground': MP3_MAX_BACKGROUND_JOBS, 'foregroundReserved': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS), 'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT}), flush=True)
+    print('v40.5 ready: foreground-first MP3 jobs; preemptible background cache capacity; reserved playback lane ' + json.dumps({'maxConcurrent': MP3_MAX_CONCURRENT_TRANSCODES, 'maxBackground': MP3_MAX_BACKGROUND_JOBS, 'foregroundReserved': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS), 'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT, 'skipMwebClientConfig': YTDLP_SKIP_MWEB_CLIENT_CONFIG}), flush=True)
 
 @app.on_event('shutdown')
 async def shutdown_http_client() -> None:
@@ -1067,7 +1074,7 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
     audit, stats = inspect_cookies(YOUTUBE_COOKIE_FILE), _media_jobs.stats()
     return {'ok': True, 'service': 'veeb-resolver', 'version': RESOLVER_VERSION,
             'ytDlpVersion': version, 'sourceSelector': YTDLP_SOURCE_SELECTOR,
-            'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT,
+            'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT, 'skipMwebClientConfig': YTDLP_SKIP_MWEB_CLIENT_CONFIG,
             'cookieFilePresent': audit['present'], 'cookieAuthFieldsPresent': audit['activeAuthCookieFieldsPresent'],
             'cookieSessionRecognized': _last_cookie_session_test.get('youtubeReportsLoggedIn'),
             'cookieAuthenticationVerified': _last_cookie_session_test.get('youtubeReportsLoggedIn'),
