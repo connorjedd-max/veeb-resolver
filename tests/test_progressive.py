@@ -1,4 +1,5 @@
 """Real yt-dlp HTTP downloader + real FFmpeg, no external music/source requests."""
+import json
 import asyncio
 from functools import partial
 from pathlib import Path
@@ -117,6 +118,26 @@ class ProgressiveTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_late_download_failure_never_publishes_complete_mp3(self):
         await self.run_http_case(fail=True)
+
+    async def test_progressive_source_carries_startup_phase_timing(self):
+        stopped=asyncio.Event()
+        async def download(directory):
+            try:
+                path=Path(directory)/'source.webm.part'; path.write_bytes(self.data[:48000])
+                (Path(directory)/'.veeb-parent-timing.json').write_text(json.dumps({'sourceSlotWaitMs':37}))
+                publish_streamable_progress({'downloaded_bytes':48000,'tmpfilename':str(path),
+                    'info_dict':{'ext':'webm','vcodec':'none','acodec':'opus','protocol':'http','duration':20}},
+                    directory, {'ytDlpImportMs':41,'gvsTokenReadyMs':912,'source8192Ms':1050})
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        owned=ProgressiveSource(download, lambda info:self.core.YtdlpEnginePool('f',1,'f','f')._media('siRAwwaNc1M',info,resolver_path='f'))
+        media=await owned.start()
+        self.assertEqual(media._source_startup_timing['sourceSlotWaitMs'],37)
+        self.assertEqual(media._source_startup_timing['ytDlpImportMs'],41)
+        self.assertEqual(media._source_startup_timing['gvsTokenReadyMs'],912)
+        await owned.close()
+        self.assertTrue(stopped.is_set())
 
     async def test_cancel_reaps_owned_download_while_waiting_for_encoder_slot(self):
         stopped = asyncio.Event()

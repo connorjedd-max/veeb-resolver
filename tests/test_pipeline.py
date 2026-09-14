@@ -182,12 +182,79 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await release.wait()
                 yield self.mp3[20000:]
             return body()
-        manager=self.manager(producer,max_jobs=1);job=manager.get('siRAwwaNc1M',None)
-        await manager.wait(job)
-        with self.assertRaises(JobError):manager.get('dQw4w9WgXcQ',None,background=True)
-        first=manager.read(job);await anext(first);await first.aclose()
-        second=asyncio.create_task(self.collect(manager,job));release.set()
-        self.assertEqual(await second,self.mp3)
+        manager=self.manager(producer,max_jobs=4,max_active=3,max_background=2)
+        foreground=manager.get('siRAwwaNc1M',None,purpose='playback')
+        background=manager.get('dQw4w9WgXcQ',None,background=True,purpose='r2-background-prefetch')
+        await asyncio.gather(manager.wait(foreground),manager.wait(background))
+        # A second background job is allowed while one foreground job is active,
+        # but the configured background cap still prevents a third background job.
+        background2=manager.get('C2elY5Tctqg',None,background=True,purpose='r2-library-warm')
+        with self.assertRaises(JobError):
+            manager.get('EbVb_qE_T5o',None,background=True,purpose='r2-library-warm')
+        first=manager.read(foreground);await anext(first);await first.aclose()
+        release.set()
+        await asyncio.gather(manager.wait(foreground,complete=True),manager.wait(background,complete=True),
+                             manager.wait(background2,complete=True))
+
+    async def test_foreground_preempts_background_when_capacity_is_full(self):
+        release=asyncio.Event()
+        async def producer(*args):
+            async def body():
+                yield self.mp3[:20000]
+                await release.wait()
+                yield self.mp3[20000:]
+            return body()
+        manager=self.manager(producer,max_active=3,max_background=2)
+        bg1=manager.get('dQw4w9WgXcQ',None,background=True,purpose='r2-background-prefetch')
+        bg2=manager.get('C2elY5Tctqg',None,background=True,purpose='r2-library-warm')
+        fg1=manager.get('siRAwwaNc1M',None,purpose='playback')
+        await asyncio.gather(manager.wait(bg1),manager.wait(bg2),manager.wait(fg1))
+        fg2=manager.get('EbVb_qE_T5o',None,purpose='playback')
+        await asyncio.sleep(0)
+        preempted=[job for job in (bg1,bg2) if job.preempt_requested]
+        self.assertEqual(len(preempted),1)
+        await asyncio.sleep(0)
+        self.assertTrue(preempted[0].done.is_set())
+        self.assertEqual(getattr(preempted[0].error,'code',None),'BACKGROUND_PREEMPTED')
+        self.assertEqual(manager.stats()['backgroundPreemptions'],1)
+        release.set()
+        await asyncio.gather(manager.wait(fg1,complete=True),manager.wait(fg2,complete=True))
+
+    async def test_next_prefetch_preempts_lower_priority_library_warm(self):
+        release=asyncio.Event()
+        async def producer(*args):
+            async def body():
+                yield self.mp3[:20000]
+                await release.wait()
+                yield self.mp3[20000:]
+            return body()
+        manager=self.manager(producer,max_active=3,max_background=2)
+        low1=manager.get('dQw4w9WgXcQ',None,background=True,purpose='r2-library-warm')
+        low2=manager.get('C2elY5Tctqg',None,background=True,purpose='r2-library-warm')
+        await asyncio.gather(manager.wait(low1),manager.wait(low2))
+        high=manager.get('EbVb_qE_T5o',None,background=True,purpose='r2-next-prefetch')
+        await asyncio.sleep(0)
+        self.assertEqual(sum(job.preempt_requested for job in (low1,low2)),1)
+        self.assertEqual(high.priority,70)
+        release.set()
+        await manager.wait(high,complete=True)
+
+    async def test_foreground_claims_existing_background_job(self):
+        release=asyncio.Event()
+        async def producer(*args):
+            async def body():
+                yield self.mp3[:20000]
+                await release.wait()
+                yield self.mp3[20000:]
+            return body()
+        manager=self.manager(producer,max_active=3,max_background=2)
+        job=manager.get('siRAwwaNc1M',None,background=True,purpose='r2-background-prefetch')
+        same=manager.get('siRAwwaNc1M',None,background=False,purpose='playback')
+        self.assertIs(job,same)
+        self.assertFalse(job.background)
+        self.assertEqual(job.purpose,'playback')
+        release.set()
+        await manager.wait(job,complete=True)
 
     async def test_timeout_cleans_producer(self):
         cleaned=asyncio.Event()
@@ -275,6 +342,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):await task
             self.assertFalse(core._extraction_sem.locked())
 
+    async def test_r2_background_prefetch_is_classified_as_background(self):
+        core=self.core
+        self.assertTrue(core.is_background_purpose('r2-background-prefetch'))
+        self.assertTrue(core.is_background_purpose('r2-library-warm'))
+        self.assertTrue(core.is_background_purpose('r2-next-prefetch'))
+        self.assertFalse(core.is_background_purpose('playback'))
+
     async def test_cache_response_is_finite_and_complete(self):
         core=self.core
         media=types.SimpleNamespace(client='test',format_id='140',resolver_path='fixture')
@@ -288,6 +362,82 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.headers['Content-Length'],str(len(self.mp3)))
             self.assertEqual(response.headers['X-Veeb-MP3-Complete'],'1')
             self.assertEqual(b''.join([x async for x in response.content]),self.mp3)
+
+    async def test_playback_response_exposes_startup_telemetry_without_changing_startup_bytes(self):
+        core=self.core
+        media=types.SimpleNamespace(client='test',format_id='251',resolver_path='fixture-progressive')
+        async def producer(video_id,request,job):
+            core.mark_job_timing(job,'producer_start')
+            await asyncio.sleep(.002)
+            core.mark_job_timing(job,'source_attempt_start',overwrite=True)
+            await asyncio.sleep(.002)
+            core.mark_job_timing(job,'source_ready',overwrite=True)
+            core.mark_job_timing(job,'ffmpeg_spawn_start',overwrite=True)
+            await asyncio.sleep(.002)
+            core.mark_job_timing(job,'mp3_first_bytes',overwrite=True)
+            job.metadata.update(media=media,cache='MISS-PROGRESSIVE')
+            async def body():yield self.mp3
+            return body()
+        manager=self.manager(producer)
+        with patch.object(core,'_media_jobs',manager):
+            response=await core.proxy_media(self.request(),'siRAwwaNc1M')
+            self.assertEqual(response.headers['X-Veeb-MP3-Startup-Bytes'],str(core.MP3_STARTUP_MIN_BYTES))
+            self.assertEqual(response.headers['X-Veeb-Startup-SLA-Ms'],str(core.PLAYBACK_START_SLA_MS))
+            self.assertIn('X-Veeb-Startup-Total-Ms',response.headers)
+            self.assertIn('X-Veeb-Startup-Source-Ms',response.headers)
+            self.assertIn('X-Veeb-Startup-Encoder-Ms',response.headers)
+            self.assertRegex(response.headers['X-Veeb-MP3-Job'],r'^[a-f0-9]{12}$')
+            self.assertEqual(b''.join([x async for x in response.content]),self.mp3)
+
+    async def test_job_status_reports_stream_health_without_exposing_media_url(self):
+        core=self.core
+        media=types.SimpleNamespace(client='mweb',format_id='251',resolver_path='fixture-progressive',url='https://secret.example/media?sig=private')
+        async def producer(video_id,request,job):
+            core.mark_job_timing(job,'producer_start')
+            core.mark_job_timing(job,'source_attempt_start',overwrite=True)
+            core.mark_job_timing(job,'source_ready',overwrite=True)
+            core.mark_job_timing(job,'ffmpeg_spawn_start',overwrite=True)
+            core.mark_job_timing(job,'mp3_first_bytes',overwrite=True)
+            job.metadata.update(media=media,cache='MISS-PROGRESSIVE',attempts=[{'path':'fg-mweb-auth','ok':True}])
+            async def body():yield self.mp3
+            return body()
+        manager=self.manager(producer)
+        job=manager.get('siRAwwaNc1M',self.request())
+        await manager.wait(job)
+        payload=core.job_status_payload(job)
+        self.assertEqual(payload['jobId'],job.job_id)
+        self.assertEqual(payload['state'],'complete')
+        self.assertEqual(payload['client'],'mweb')
+        self.assertNotIn('url',payload)
+        self.assertNotIn('secret.example',str(payload))
+
+    async def test_midstream_encoder_stall_has_explicit_error_code(self):
+        core=self.core
+        class Stdout:
+            def __init__(self):self.calls=0
+            async def read(self,n):
+                self.calls+=1
+                if self.calls==1:return b'x'*core.MP3_STARTUP_MIN_BYTES
+                await asyncio.sleep(60)
+        class Stderr:
+            async def read(self):return b''
+        class Proc:
+            def __init__(self):
+                self.stdout=Stdout();self.stderr=Stderr();self.stdin=None;self.returncode=None
+            def kill(self):self.returncode=-9
+            async def wait(self):
+                while self.returncode is None:await asyncio.sleep(.001)
+                return self.returncode
+        proc=Proc()
+        media=core.ResolvedMedia('siRAwwaNc1M','https://example.test/source',{},'test','251','webm','webm','opus','none',128,180,'tone',0,9999999999,'fixture')
+        job=types.SimpleNamespace(job_id='abc123abc123',metadata={})
+        with patch.object(core,'spawn_owned_process',AsyncMock(return_value=proc)),              patch.object(core,'MP3_OUTPUT_STALL_TIMEOUT_SECONDS',0.01):
+            body=await core.prepare_live_mp3_stream(media,'siRAwwaNc1M',self.request(),job=job)
+            self.assertEqual(len(await anext(body)),core.MP3_STARTUP_MIN_BYTES)
+            with self.assertRaises(JobError) as caught:
+                await anext(body)
+        self.assertEqual(caught.exception.code,'MP3_OUTPUT_STALLED')
+        self.assertEqual(job.metadata['terminalFailure']['code'],'MP3_OUTPUT_STALLED')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

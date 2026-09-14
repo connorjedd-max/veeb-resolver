@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-from source_support import CookieStore, inspect_cookies, redact, reported_login_state, SourceAttemptError, DiagnosticLog
+from source_support import CookieStore, inspect_cookies, redact, reported_login_state, SourceAttemptError, DiagnosticLog, failure_code
 import extract_source
 from test_pipeline import load_core
 
@@ -74,6 +74,26 @@ class CookieTests(unittest.TestCase):
         for _ in range(30):log.debug('[pot:cache] PoTokenResponse(po_token=SECRET)')
         log.error('HTTP Error 403: Forbidden');self.assertTrue(log.evidence['jsChallengeFailed'])
         self.assertIn('403',log.lines[-1]);self.assertNotIn('SECRET',json.dumps(log.lines))
+    def test_source_phase_timing_is_redacted_and_monotonic(self):
+        log=DiagnosticLog()
+        log.debug('Downloading webpage')
+        log.debug('Detected a 15s ad skippable after 5s for mweb')
+        log.debug('Generating a GVS PO Token')
+        log.debug('Retrieved a GVS PO Token')
+        log.debug('Invoking http downloader')
+        log.progress({'status':'downloading','downloaded_bytes':8192,'info_dict':{'format_id':'251','protocol':'https'}})
+        timing=log.timing_snapshot()
+        for key in ('webpageMs','adDetectedMs','potRequestMs','gvsTokenReadyMs','downloaderInvokedMs','firstDownloadProgressMs','source8192Ms'):
+            self.assertIn(key,timing)
+            self.assertGreaterEqual(timing[key],0)
+        self.assertTrue(log.evidence['gvsTokenReturned'])
+        self.assertEqual(log.evidence['downloadedBytes'],8192)
+
+    def test_permanent_video_failure_is_distinguished_from_route_failure(self):
+        self.assertEqual(failure_code('ERROR: [youtube] abc: Video unavailable'),'SOURCE_VIDEO_UNAVAILABLE')
+        self.assertEqual(failure_code('This video is unavailable'),'SOURCE_VIDEO_UNAVAILABLE')
+        self.assertEqual(failure_code('This video is not available in your country'),'SOURCE_REGION_RESTRICTED')
+        self.assertEqual(failure_code('Sign in to confirm you are not a bot'),'SOURCE_ACCESS_DENIED')
     def test_anonymous_child_has_no_cookiefile(self):
         seen=[]
         class Ydl:
@@ -131,7 +151,16 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
             a=self.core.ytdlp_options('mweb',None,False);b=self.core.ytdlp_options('mweb',None,True)
         self.assertEqual(a['extractor_args'],b['extractor_args']);self.assertNotIn('cookiefile',a)
         self.assertEqual(b['cookiefile'],'/private/cookies');self.assertNotIn('pot_trace',a['extractor_args']['youtube'])
-        self.assertNotIn('use_ad_playback_context',a['extractor_args']['youtube'])
+        self.assertEqual(a['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
+    async def test_ad_playback_context_has_single_flag_rollback(self):
+        with patch.object(self.core,'YTDLP_USE_AD_PLAYBACK_CONTEXT',False):
+            args=self.core.youtube_extractor_args_dict('mweb')
+        self.assertNotIn('use_ad_playback_context',args)
+        with patch.object(self.core,'YTDLP_USE_AD_PLAYBACK_CONTEXT',True):
+            args=self.core.youtube_extractor_args_dict('mweb')
+        self.assertEqual(args.get('use_ad_playback_context'),['true'])
+        self.assertNotIn('use_ad_playback_context',self.core.youtube_extractor_args_dict('default'))
+
     async def test_missing_auth_file_is_not_silent_anonymous_attempt(self):
         with patch.object(self.core,'get_writable_cookie_file',return_value=None):
             with self.assertRaises(SourceAttemptError):self.core.ytdlp_options('mweb',None,True)

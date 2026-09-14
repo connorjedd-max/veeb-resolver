@@ -26,6 +26,17 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
             r=await self.client.get('/health',headers=self.headers)
         self.assertEqual(r.status_code,200)
         self.assertIn({'path':'fg-mweb-auth','client':'mweb','usesCookies':True},r.json()['acquisitionModes'])
+    async def test_job_status_endpoint_is_protected_and_returns_safe_payload(self):
+        event=__import__('asyncio').Event();event.set()
+        job=types.SimpleNamespace(job_id='abc123abc123',video_id='siRAwwaNc1M',purpose='playback',background=False,priority=100,size=4096,created=1.0,ready_at=2.0,last_byte_at=2.0,done=event,ready=event,error=None,metadata={'media':types.SimpleNamespace(client='mweb',format_id='251',resolver_path='test'),'attempts':[]})
+        manager=types.SimpleNamespace(find_by_job_id=lambda value:job if value==job.job_id else None)
+        with patch.object(server,'_media_jobs',manager):
+            self.assertEqual((await self.client.get('/job/'+job.job_id)).status_code,401)
+            bad=await self.client.get('/job/not-a-job',headers=self.headers);self.assertEqual(bad.status_code,400)
+            good=await self.client.get('/job/'+job.job_id,headers=self.headers)
+        self.assertEqual(good.status_code,200);data=good.json();self.assertEqual(data['jobId'],job.job_id)
+        self.assertEqual(data['client'],'mweb');self.assertNotIn('url',data)
+
     async def test_real_diagnose_json_preserves_phases_and_cookie_result(self):
         attempts=[{'path':'fg-pot','code':'MEDIA_HTTP_403','stage':'download','error':'HTTP Error 403: Forbidden'},
                   {'path':'fg-mweb-auth','code':'SOURCE_ACCESS_DENIED','stage':'extract','error':'not a bot','usesCookies':True}]
