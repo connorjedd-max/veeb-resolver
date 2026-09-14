@@ -94,6 +94,7 @@ class MediaJobs:
         self.collection_grace = collection_grace
         self.jobs = {}
         self.preemptions = 0
+        self.source_preemptions = 0
 
     def _remove(self, video_id):
         job = self.jobs.pop(video_id)
@@ -116,8 +117,8 @@ class MediaJobs:
         return [j for j in self.jobs.values() if not j.done.is_set()]
 
     def _preempt_one_background(self, incoming_priority=100):
-        candidates = [j for j in self._active() if j.background and j.task and not j.task.done()
-                      and int(j.priority) < int(incoming_priority)]
+        candidates = [j for j in self._active() if j.background and not j.preempt_requested
+                      and j.task and not j.task.done() and int(j.priority) < int(incoming_priority)]
         if not candidates:
             return None
         # Preserve the more valuable/older work when possible. Preempt the lowest
@@ -129,6 +130,28 @@ class MediaJobs:
         job.task.cancel()
         self.preemptions += 1
         return job
+
+    def _preempt_background_source_acquisitions(self, exclude=None):
+        """Yield serialized source extraction to real foreground playback.
+
+        Download/transcode capacity already reserves a foreground lane, but source
+        extraction is intentionally serialized. A background warmer can therefore
+        occupy that single extraction lane for several seconds even while playback
+        capacity is free. Cancel only background jobs that are still in source
+        acquisition; jobs that have already published source bytes keep running.
+        """
+        candidates = [
+            j for j in self._active()
+            if j is not exclude and j.background and not j.preempt_requested
+            and j.task and not j.task.done()
+            and bool(j.metadata.get('sourceAcquisitionActive'))
+        ]
+        for job in candidates:
+            job.preempt_requested = True
+            job.task.cancel()
+            self.preemptions += 1
+            self.source_preemptions += 1
+        return candidates
 
     def _task_finished(self, job, task):
         # A task can be cancelled before _run receives its first timeslice. Make
@@ -157,14 +180,21 @@ class MediaJobs:
         if existing:
             existing.touched = time.monotonic() if not existing.error else existing.touched
             # If a user asks for a track already being warmed, that exact job becomes
-            # foreground-owned and must no longer be eligible for preemption.
+            # foreground-owned and must no longer be eligible for preemption. Also
+            # clear any other background source acquisition blocking the one serialized
+            # extraction lane.
             if not background and existing.background and not existing.done.is_set():
                 existing.background = False
                 existing.purpose = purpose
                 existing.priority = 100
+                self._preempt_background_source_acquisitions(exclude=existing)
             return existing
 
-        active = self._active()
+        if not background:
+            self._preempt_background_source_acquisitions()
+
+        # Jobs already asked to yield are cancellation cleanup, not usable capacity.
+        active = [j for j in self._active() if not j.preempt_requested]
         active_background = sum(1 for job in active if job.background)
         if background:
             if self.max_background <= 0:
@@ -327,6 +357,7 @@ class MediaJobs:
             'maxBackground': self.max_background,
             'foregroundReserved': max(0, self.max_active - self.max_background),
             'backgroundPreemptions': self.preemptions,
+            'backgroundSourcePreemptions': self.source_preemptions,
         }
 
     async def close(self):

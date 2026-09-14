@@ -1,21 +1,25 @@
-# Veeb resolver V40.4
+# Veeb resolver v40.6
 
-Start with **DEPLOY-V40.4.txt**.
+Start with **DEPLOY-V40.6.txt** and **CHANGES-V40.6.md**.
 
-V40.4 is the first deliberately narrow startup-speed change after V40.3
-identified source acquisition as the dominant cold-playback bottleneck.
-It enables yt-dlp's official `mweb` ad playback context so yt-dlp can avoid the
-mandatory preroll wait before starting the source download.
+v40.6 is a narrow foreground-priority reliability release. Production v40.5.1
+telemetry showed that background warming could still add several seconds of
+`sourceSlotWaitMs` to real playback because source extraction is serialized even
+though download/transcode capacity reserves a foreground lane.
 
-This is feature-gated with `VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT`. Set it to
-`false` to restore the previous mweb extractor behavior without reverting the
-rest of the resolver.
+v40.6 keeps extraction concurrency at one and preserves the v40.5.1 source,
+POT, cookie, progressive WebM, FFmpeg and R2 architecture. The only behavioral
+change is that foreground playback preempts background jobs that are still in
+source acquisition. Background jobs that have already published source bytes
+continue normally.
 
-See **CHANGES-V40.4.md** for scope, caveats and expected telemetry.
+Known stable startup settings remain:
 
+- `VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT=true`
+- `VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG=false`
+- `YOUTUBE_JSC_RUNTIME=deno`
 
-## v40.5 primary-path client-config optimization
+The primary v40.6 production metric is foreground `sourceSlotWaitMs` while
+background warming is active. It should now remain near zero.
 
-Authenticated mweb playback skips the separate client-config request by default.
-Set `VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG=false` for immediate rollback. The
-cookie-free mweb fallback always retains the normal client-config request.
+Historical change notes remain in the `CHANGES-V40.*.md` files.

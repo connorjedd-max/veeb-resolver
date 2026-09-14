@@ -1,0 +1,14 @@
+V40.6 local regression result
+
+99 tests discovered.
+96 tests pass in this sandbox.
+3 existing real-yt-dlp tests cannot run here because the sandbox does not have
+the yt_dlp package installed. They are the same environment-only tests seen in
+prior releases; the Docker build installs the pinned dependency before running
+the suite.
+
+New v40.6 tests passing:
+- foreground preempts background source acquisition even when MP3 job capacity is free
+- foreground does not preempt background work after source bytes are published
+- same-track foreground promotion preserves that job and preempts other source blockers
+- production producer marks and clears only the source-acquisition interval

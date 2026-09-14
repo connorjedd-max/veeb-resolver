@@ -1,0 +1,31 @@
+VEEB RESOLVER V40.6 - FOREGROUND SOURCE PRIORITY
+
+PURPOSE
+Prevent background cache warming from adding multi-second source-slot waits to
+real playback while preserving the known-good v40.5.1 extraction architecture.
+
+RECOMMENDED ENVIRONMENT
+  VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT=true
+  VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG=false
+  YOUTUBE_JSC_RUNTIME=deno
+
+Keep the existing concurrency settings unless intentionally changed:
+  VEEB_MP3_MAX_CONCURRENT=3
+  VEEB_MP3_MAX_BACKGROUND=2
+
+NO WORKER CHANGE REQUIRED.
+
+ACCEPTANCE CHECK
+1. Deploy v40.6 with the same secrets/cookie file and concurrency settings.
+2. Confirm /health reports:
+     version = v40.6-foreground-source-priority
+     foregroundPreemptsBackgroundSourceAcquisition = true
+3. Let background warming run.
+4. Start 2-3 genuinely uncached foreground tracks.
+5. Copy the `source acquisition phases` and `playback startup` lines.
+6. The important field is `sourceSlotWaitMs` on PURPOSE=playback jobs.
+   It should be near zero even when background warming is active.
+7. Confirm background jobs already past source publication still complete.
+
+ROLLBACK
+Redeploy v40.5.1. No schema/data migration exists.
