@@ -147,7 +147,10 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
             result=await c.produce_mp3('siRAwwaNc1M',None,job)
         self.assertIs(result,iterator);download.assert_awaited_once();resolve.assert_not_awaited()
         self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);anonymous.assert_not_awaited()
-    async def test_authenticated_mweb_fast_path_skips_config_but_fallback_does_not(self):
+    async def test_skip_client_config_default_is_safe_off(self):
+        self.assertFalse(self.core.YTDLP_SKIP_MWEB_CLIENT_CONFIG)
+
+    async def test_authenticated_mweb_uses_stable_config_flow_by_default(self):
         with patch.object(self.core,'get_writable_cookie_file',return_value='/private/cookies'):
             fallback=self.core.ytdlp_options('mweb',None,False);fast=self.core.ytdlp_options('mweb',None,True)
         self.assertNotIn('cookiefile',fallback);self.assertEqual(fast['cookiefile'],'/private/cookies')
@@ -155,9 +158,9 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fallback['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
         self.assertEqual(fast['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
         self.assertNotIn('player_skip',fallback['extractor_args']['youtube'])
-        self.assertEqual(fast['extractor_args']['youtube'].get('player_skip'), ['configs'])
+        self.assertNotIn('player_skip',fast['extractor_args']['youtube'])
 
-    async def test_skip_client_config_has_single_flag_rollback(self):
+    async def test_skip_client_config_is_explicit_opt_in_only(self):
         with patch.object(self.core,'YTDLP_SKIP_MWEB_CLIENT_CONFIG',False):
             args=self.core.youtube_extractor_args_dict('mweb',use_cookies=True)
         self.assertNotIn('player_skip',args)
