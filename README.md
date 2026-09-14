@@ -1,38 +1,14 @@
-# Veeb resolver V40.3
+# Veeb resolver V40.4
 
-Start with **DEPLOY-V40.3.txt**. V40.3 is a source-acquisition diagnostic
-release built directly on V40.2. Production V40.2 measurements show healthy
-uncached tracks spending about 9.5-10.1 seconds before FFmpeg, while encoder
-startup is only about 165-205 ms. V40.3 splits that source-acquisition time into
-source-slot, child-process/yt-dlp, POT/extraction, downloader-start and first-8-KiB
-phases without changing the resolver's acquisition behaviour.
+Start with **DEPLOY-V40.4.txt**.
 
-See **CHANGES-V40.3.md** for the exact fields.
+V40.4 is the first deliberately narrow startup-speed change after V40.3
+identified source acquisition as the dominant cold-playback bottleneck.
+It enables yt-dlp's official `mweb` ad playback context so yt-dlp can avoid the
+mandatory preroll wait before starting the source download.
 
-The V40.1 acquisition architecture is intentionally preserved: authenticated
-mweb priority, progressive WebM-to-MP3, shared jobs, finite MP3 validation,
-owned-process cancellation, foreground reservation, background preemption,
-source cooldowns and R2 completion rules are unchanged.
+This is feature-gated with `VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT`. Set it to
+`false` to restore the previous mweb extractor behavior without reverting the
+rest of the resolver.
 
-The focus of V40.2 is the playback requirement: an uncached track should become
-audible reliably within roughly **2-3 seconds**. Before tuning the critical path,
-V40.2 makes every startup measurable as queue, source acquisition, encoder
-startup and total resolver startup time. It also gives every stream a resolver
-job ID and exposes a protected `/job/{jobId}` diagnostic so a mid-stream failure
-can be traced to an explicit resolver state.
-
-V40.2 does **not** increase the 4096-byte MP3 startup threshold and does not
-change source fallback order. This avoids trading away startup speed or
-reintroducing older source-routing failures before production timing data shows
-that such a change is justified.
-
-New terminal classifications include `MP3_STARTUP_TIMEOUT`,
-`MP3_STARTUP_EMPTY`, `MP3_OUTPUT_STALLED`, `FFMPEG_FAILED`,
-`SOURCE_VIDEO_UNAVAILABLE` and `SOURCE_REGION_RESTRICTED`.
-
-The existing V40.1 Worker remains compatible. A later Worker update can consume
-the new response headers and `/job/{jobId}` endpoint for end-to-end playback
-recovery and diagnostics.
-
-The Docker build installs dependencies and runs the complete test suite before
-starting the service.
+See **CHANGES-V40.4.md** for scope, caveats and expected telemetry.

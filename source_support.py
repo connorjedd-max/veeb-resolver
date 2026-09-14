@@ -171,6 +171,11 @@ class DiagnosticLog:
             self.mark('webpageMs')
         if 'player api json' in low:
             self.mark('playerApiMs')
+        # yt-dlp may intentionally delay a download to honour a detected preroll.
+        # Record detection only; the actual bypass is controlled by the official
+        # youtube:use_ad_playback_context extractor argument.
+        if re.search(r'detected\s+(?:an?\s+)?\d+(?:\.\d+)?s\s+ad\b', low):
+            self.mark('adDetectedMs')
         if 'generating a gvs po token' in low or 'generating pot' in low:
             self.mark('potRequestMs')
         if 'solving js challenge' in low or 'solving js challenges' in low:

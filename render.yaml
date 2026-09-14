@@ -15,5 +15,7 @@ services:
         value: "2"
       - key: VEEB_PLAYBACK_START_SLA_MS
         value: "3000"
+      - key: VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT
+        value: "true"
       - key: VEEB_MP3_OUTPUT_STALL_TIMEOUT
         value: "20"

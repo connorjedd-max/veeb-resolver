@@ -1,0 +1,34 @@
+VEEB RESOLVER V40.4 - DEPLOY / VERIFY
+=====================================
+
+This is a one-variable performance experiment on top of V40.3. It does not
+change source ownership, client order, concurrency, FFmpeg, MP3 thresholds or
+R2 completion.
+
+1. Deploy the supplied resolver exactly as the current service is deployed.
+2. Preserve the existing paid/always-on Render plan and all existing secrets.
+3. Ensure this environment variable is true:
+
+   VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT=true
+
+4. After deploy, confirm the startup line contains:
+
+   "adPlaybackContext": true
+
+5. Play 3 genuinely uncached, healthy tracks. Capture:
+
+   v40.4 source acquisition phases
+   v40.4 mp3 first bytes ready
+   v40.4 playback startup ready/slow
+
+6. Compare sourceAcquireMs with the V40.3 baseline (~9500-10100 ms).
+
+ROLLBACK
+--------
+If mweb extraction becomes less reliable or format selection regresses, do not
+roll back the whole resolver. Set:
+
+   VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT=false
+
+and restart/redeploy the service. That restores the V40.3 mweb extractor
+behavior while keeping V40.4 diagnostics.
