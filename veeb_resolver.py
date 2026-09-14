@@ -32,8 +32,8 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-RESOLVER_VERSION = 'v40.5-mweb-skip-client-config'
-app = FastAPI(title='Veeb YouTube Resolver V40.5 Mweb Skip Client Config', docs_url=None, redoc_url=None)
+RESOLVER_VERSION = 'v40.5.1-stable-config-default'
+app = FastAPI(title='Veeb YouTube Resolver V40.5.1 Stable Config Default', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
 JOB_ID_RE = re.compile('^[a-f0-9]{12}$')
@@ -59,7 +59,7 @@ def env_bool(name: str, default: bool=False) -> bool:
         return False
     return bool(default)
 
-YTDLP_SKIP_MWEB_CLIENT_CONFIG = env_bool('VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG', True)
+YTDLP_SKIP_MWEB_CLIENT_CONFIG = env_bool('VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG', False)
 
 # yt-dlp's official mweb/web_music preroll bypass. This does not change source
 # ownership or downloader semantics. It only asks YouTube for an ad-free playback
@@ -929,7 +929,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                     mark_job_timing(job, 'source_ready', overwrite=True)
                     source_timing = dict(getattr(media, '_source_startup_timing', {}) or {})
                     job.metadata['sourceTiming'] = source_timing
-                    print('v40.5 source acquisition phases', json.dumps({
+                    print('v40.5.1 source acquisition phases', json.dumps({
                         'videoId': video_id, 'jobId': getattr(job, 'job_id', None), 'path': pool.name,
                         'sourceAcquireMs': elapsed_ms(attempt_started, time.monotonic()),
                         'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT,
@@ -957,7 +957,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                     detail = attempt_detail(pool, exc, 'download')
                     detail['elapsedMs'] = elapsed_ms(attempt_started, time.monotonic())
                     attempts.append(detail)
-                    print('v40.5 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
+                    print('v40.5.1 source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
                     if getattr(exc, 'code', '') in {'SOURCE_ROUTE_COOLDOWN', 'SOURCE_PROXY_CONFIG_INVALID', 'SOURCE_DURATION_UNSUPPORTED'}:
                         raise
     except TimeoutError as exc:
@@ -1040,7 +1040,7 @@ async def startup_session() -> None:
     load_youtube_cookie_session(force=True)
     get_http_client()
     init_ytdlp_pools()
-    print('v40.5 ready: foreground-first MP3 jobs; preemptible background cache capacity; reserved playback lane ' + json.dumps({'maxConcurrent': MP3_MAX_CONCURRENT_TRANSCODES, 'maxBackground': MP3_MAX_BACKGROUND_JOBS, 'foregroundReserved': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS), 'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT, 'skipMwebClientConfig': YTDLP_SKIP_MWEB_CLIENT_CONFIG}), flush=True)
+    print('v40.5.1 ready: foreground-first MP3 jobs; preemptible background cache capacity; reserved playback lane ' + json.dumps({'maxConcurrent': MP3_MAX_CONCURRENT_TRANSCODES, 'maxBackground': MP3_MAX_BACKGROUND_JOBS, 'foregroundReserved': max(0, MP3_MAX_CONCURRENT_TRANSCODES - MP3_MAX_BACKGROUND_JOBS), 'adPlaybackContext': YTDLP_USE_AD_PLAYBACK_CONTEXT, 'skipMwebClientConfig': YTDLP_SKIP_MWEB_CLIENT_CONFIG}), flush=True)
 
 @app.on_event('shutdown')
 async def shutdown_http_client() -> None:
