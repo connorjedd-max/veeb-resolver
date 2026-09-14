@@ -46,11 +46,12 @@ def failure_code(message, stage='extract'):
 
 
 class SourceAttemptError(RuntimeError):
-    def __init__(self, message, *, stage='extract', evidence=None, diagnostics=None, code=None):
+    def __init__(self, message, *, stage='extract', evidence=None, diagnostics=None, code=None, startup_timing=None):
         super().__init__(redact(message))
         self.stage, self.code = stage, code or failure_code(message, stage)
         self.evidence = evidence or {}
         self.diagnostics = [redact(x, 220) for x in (diagnostics or [])][-3:]
+        self.startup_timing = dict(startup_timing or {})
 
 
 def inspect_cookies(path):
@@ -149,20 +150,45 @@ def reported_login_state(text):
 
 
 class DiagnosticLog:
-    def __init__(self):
+    """Redacted yt-dlp evidence plus monotonic phase timings for startup diagnosis."""
+    def __init__(self, started=None):
         self.lines = []
         self.evidence = {'sourceSelected': False}
+        self.started = float(started if started is not None else time.monotonic())
+        self.phase_ms = {}
+
+    def mark(self, phase):
+        if phase not in self.phase_ms:
+            self.phase_ms[phase] = max(0, int(round((time.monotonic() - self.started) * 1000)))
+
+    def timing_snapshot(self):
+        return dict(self.phase_ms)
 
     def record(self, message, warning=False):
         raw = str(message)
         low = raw.lower()
+        if 'downloading webpage' in low:
+            self.mark('webpageMs')
+        if 'player api json' in low:
+            self.mark('playerApiMs')
+        if 'generating a gvs po token' in low or 'generating pot' in low:
+            self.mark('potRequestMs')
+        if 'solving js challenge' in low or 'solving js challenges' in low:
+            self.mark('jsChallengeMs')
+        if 'downloading player ' in low:
+            self.mark('playerJsMs')
+        if 'downloading 1 format' in low or 'format(s):' in low:
+            self.mark('formatSelectedMs')
         if 'invoking ' in low and ' downloader' in low:
+            self.mark('downloaderInvokedMs')
             self.evidence.update(sourceSelected=True, stage='download')
         if 'challenge solving failed' in low or 'signature extraction failed' in low:
             self.evidence['jsChallengeFailed'] = True
         if 'retrieved a gvs po token' in low:
+            self.mark('gvsTokenReadyMs')
             self.evidence['gvsTokenReturned'] = True
         if 'retrieved a player po token' in low:
+            self.mark('playerTokenReadyMs')
             self.evidence['playerTokenReturned'] = True
         if '[pot:cache]' in low or 'potokenresponse(' in low:
             return
@@ -183,9 +209,13 @@ class DiagnosticLog:
 
     def progress(self, data):
         if data.get('status') in {'downloading', 'finished'}:
+            self.mark('firstDownloadProgressMs')
             self.evidence.update(sourceSelected=True, stage='download')
         if data.get('downloaded_bytes') is not None:
-            self.evidence['downloadedBytes'] = int(data['downloaded_bytes'])
+            downloaded = int(data['downloaded_bytes'])
+            self.evidence['downloadedBytes'] = downloaded
+            if downloaded >= 8192:
+                self.mark('source8192Ms')
         info = data.get('info_dict') or {}
         for key, field in [('format_id', 'sourceFormat'), ('protocol', 'sourceProtocol')]:
             if info.get(key) is not None:

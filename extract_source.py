@@ -40,13 +40,18 @@ def verify_cookie_session(ydl):
 
 
 def run(payload):
+    run_started = __import__('time').monotonic()
+    import_started = __import__('time').monotonic()
     import yt_dlp
+    import_finished = __import__('time').monotonic()
     video_id = str(payload.get('videoId') or '')
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id): raise ValueError('Invalid video ID')
     download = bool(payload.get('download'))
     session_only = payload.get('operation') == 'session'
     options = dict(payload['options'])
-    logger = DiagnosticLog()
+    logger = DiagnosticLog(started=run_started)
+    logger.phase_ms['ytDlpImportMs'] = max(0, int(round((import_finished - import_started) * 1000)))
+    logger.mark('childReadyMs')
     evidence = logger.evidence
     evidence.update(stage='session' if session_only else 'extract', usesCookies=bool(options.get('cookiefile')))
     captured_out, captured_err = io.StringIO(), io.StringIO()
@@ -70,7 +75,7 @@ def run(payload):
                 def progress(data):
                     logger.progress(data)
                     publish_download_started(data, download_dir)
-                    publish_streamable_progress(data, download_dir)
+                    publish_streamable_progress(data, download_dir, logger.timing_snapshot())
                     if int(data.get('downloaded_bytes') or 0) > MAX_SOURCE_BYTES:
                         raise RuntimeError('Source exceeds the 80 MiB size limit')
                 options['progress_hooks'] = [progress]
@@ -89,7 +94,9 @@ def run(payload):
                             if not options.get('cookiefile'):
                                 return {'ok': True, 'cookieSessionTest': {'tested': False, 'youtubeReportsLoggedIn': None, 'status': 'no_usable_cookie_file'}}
                             return {'ok': True, 'cookieSessionTest': verify_cookie_session(ydl)}
+                        logger.mark('extractInfoStartMs')
                         info = ydl.extract_info('https://www.youtube.com/watch?v=' + video_id, download=download)
+                        logger.mark('extractInfoDoneMs')
             finally:
                 update_path = payload.get('cookieUpdatePath')
                 if update_path and options.get('cookiefile') and Path(options['cookiefile']).is_file():
@@ -111,10 +118,10 @@ def run(payload):
                 media['local_path'] = str(source)
                 evidence.update(stage='download', downloadCompleted=True, downloadedBytes=download_bytes)
             succeeded = True
-            return {'ok': True, 'media': media, 'diagnostics': logger.lines[-3:], 'evidence': evidence, 'downloadBytes': download_bytes}
+            return {'ok': True, 'media': media, 'diagnostics': logger.lines[-3:], 'evidence': evidence, 'downloadBytes': download_bytes, 'startupTiming': logger.timing_snapshot()}
     except Exception as exc:
         stage = evidence.get('stage', 'extract')
-        return {'ok': False, 'code': failure_code(exc, stage), 'stage': stage, 'error': redact(exc, 600), 'evidence': evidence, 'diagnostics': logger.lines[-3:]}
+        return {'ok': False, 'code': failure_code(exc, stage), 'stage': stage, 'error': redact(exc, 600), 'evidence': evidence, 'diagnostics': logger.lines[-3:], 'startupTiming': logger.timing_snapshot()}
     finally:
         if download_dir and not succeeded: shutil.rmtree(download_dir, ignore_errors=True)
 

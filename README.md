@@ -1,7 +1,13 @@
-# Veeb resolver V40.2
+# Veeb resolver V40.3
 
-Start with **DEPLOY.txt**. V40.2 is a conservative reliability/observability
-release built directly on the V40.1 priority-aware resolver.
+Start with **DEPLOY-V40.3.txt**. V40.3 is a source-acquisition diagnostic
+release built directly on V40.2. Production V40.2 measurements show healthy
+uncached tracks spending about 9.5-10.1 seconds before FFmpeg, while encoder
+startup is only about 165-205 ms. V40.3 splits that source-acquisition time into
+source-slot, child-process/yt-dlp, POT/extraction, downloader-start and first-8-KiB
+phases without changing the resolver's acquisition behaviour.
+
+See **CHANGES-V40.3.md** for the exact fields.
 
 The V40.1 acquisition architecture is intentionally preserved: authenticated
 mweb priority, progressive WebM-to-MP3, shared jobs, finite MP3 validation,

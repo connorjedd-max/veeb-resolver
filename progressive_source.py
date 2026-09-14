@@ -11,6 +11,7 @@ import shutil
 import tempfile
 
 PROGRESS_FILE = '.veeb-progress.json'
+PARENT_TIMING_FILE = '.veeb-parent-timing.json'
 
 
 class ProgressiveSource:
@@ -40,7 +41,15 @@ class ProgressiveSource:
                         except FileNotFoundError:
                             pass
                     if self.file is not None:
+                        startup_timing = dict(info.pop('_startup_timing', {}) or {})
+                        try:
+                            parent_timing = json.loads((self.directory / PARENT_TIMING_FILE).read_text())
+                            if isinstance(parent_timing, dict):
+                                startup_timing.update(parent_timing)
+                        except (OSError, ValueError):
+                            pass
                         media = self.make_media(info)
+                        media._source_startup_timing = startup_timing
                         media._owned_download = self
                         return media
                 await asyncio.sleep(.02)
@@ -85,7 +94,7 @@ class ProgressiveSource:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
-def publish_streamable_progress(data, directory):
+def publish_streamable_progress(data, directory, startup_timing=None):
     """Called by the actual yt-dlp hook. No URLs or credentials in the sidecar."""
     marker = Path(directory) / PROGRESS_FILE
     if marker.exists() or int(data.get('downloaded_bytes') or 0) < 8192:
@@ -101,6 +110,7 @@ def publish_streamable_progress(data, directory):
     fields = ('format_id', 'ext', 'container', 'acodec', 'vcodec', 'abr', 'duration', 'title')
     progress = {key: info.get(key) for key in fields}
     progress['part_path'] = str(part)
+    progress['_startup_timing'] = dict(startup_timing or {})
     temporary = marker.with_suffix('.tmp')
     temporary.write_text(json.dumps(progress))
     temporary.chmod(0o600)

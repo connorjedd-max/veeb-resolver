@@ -1,0 +1,24 @@
+Veeb Resolver V40.3 local validation
+=====================================
+
+Python syntax compilation:
+PASS for veeb_resolver.py, extract_source.py, progressive_source.py and source_support.py.
+
+Local test collection:
+92 tests total.
+89 PASS in this sandbox.
+3 existing real-yt-dlp integration tests cannot execute here because the sandbox Python environment does not have the yt_dlp package installed.
+
+Those three tests are:
+- test_late_download_failure_never_publishes_complete_mp3
+- test_real_downloader_starts_mp3_before_source_eof
+- test_real_ytdlp_aborts_missing_hls_fragment_instead_of_publishing_partial_source
+
+The Dockerfile installs requirements.txt, which includes yt-dlp, before running the full unittest suite during image build.
+
+New V40.3 timing tests PASS:
+- DiagnosticLog source phase timing markers
+- progressive source timing propagation and parent source-slot timing merge
+
+No V40.3 change intentionally modifies source ordering, POT policy, concurrency,
+FFmpeg encoding, progressive ownership, or MP3 startup thresholds.
