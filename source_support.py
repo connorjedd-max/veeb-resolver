@@ -29,6 +29,11 @@ def failure_code(message, stage='extract'):
         return 'MEDIA_HTTP_403' if stage in {'download', 'transcode', 'media-fetch'} else 'SOURCE_HTTP_403'
     if '429' in low or 'too many requests' in low:
         return 'SOURCE_RATE_LIMITED'
+    if any(x in low for x in ('video unavailable', 'private video', 'video has been removed',
+                               'removed by the uploader', 'this video is unavailable')):
+        return 'SOURCE_VIDEO_UNAVAILABLE'
+    if any(x in low for x in ('not available in your country', 'not available in your region')):
+        return 'SOURCE_REGION_RESTRICTED'
     if 'timed out' in low or 'timeout' in low:
         return 'SOURCE_TIMEOUT'
     if 'requested format' in low or 'no usable source' in low:

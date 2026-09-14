@@ -13,3 +13,7 @@ services:
         value: "3"
       - key: VEEB_MP3_MAX_BACKGROUND
         value: "2"
+      - key: VEEB_PLAYBACK_START_SLA_MS
+        value: "3000"
+      - key: VEEB_MP3_OUTPUT_STALL_TIMEOUT
+        value: "20"

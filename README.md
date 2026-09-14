@@ -1,28 +1,32 @@
-# Veeb resolver V40.1
+# Veeb resolver V40.2
 
-Start with **DEPLOY.txt**. This is a full priority-aware resolver release. Pair it with
-**veeb-worker-r2-priority-parallel-v40.1.txt** in Cloudflare.
+Start with **DEPLOY.txt**. V40.2 is a conservative reliability/observability
+release built directly on the V40.1 priority-aware resolver.
 
-V40.1 keeps serialized extraction startup but makes active MP3 jobs priority-aware.
-Background R2 work has bounded parallel capacity, foreground playback has reserved
-capacity, and foreground can preempt a lower-priority background job if total capacity
-is full. Next-track prefetch also outranks bulk library warming.
+The V40.1 acquisition architecture is intentionally preserved: authenticated
+mweb priority, progressive WebM-to-MP3, shared jobs, finite MP3 validation,
+owned-process cancellation, foreground reservation, background preemption,
+source cooldowns and R2 completion rules are unchanged.
 
-Cookie-based mweb gets first priority when a usable cookie file is available and
-has not been explicitly rejected by the session diagnostic. Known rejected
-sessions are skipped until the secret changes. Cookie fields and recognised
-login now have separate health fields.
+The focus of V40.2 is the playback requirement: an uncached track should become
+audible reliably within roughly **2-3 seconds**. Before tuning the critical path,
+V40.2 makes every startup measurable as queue, source acquisition, encoder
+startup and total resolver startup time. It also gives every stream a resolver
+job ID and exposes a protected `/job/{jobId}` diagnostic so a mid-stream failure
+can be traced to an explicit resolver state.
 
-Progressive WebM-to-MP3, shared jobs, finite MP3 validation, R2 completion rules,
-source cooldowns and owned-process cancellation are preserved. A rejected
-YouTube session must still be repaired in Render.
+V40.2 does **not** increase the 4096-byte MP3 startup threshold and does not
+change source fallback order. This avoids trading away startup speed or
+reintroducing older source-routing failures before production timing data shows
+that such a change is justified.
 
-**COMPARISON.md** explains the older fast path, its reproduced cancellation bug,
-the supplied live diagnostic and the changes made here.
-**TEST-RESULTS.txt** describes local verification and its production limits.
-The Docker build discovers all tests under `tests/` and requires them to pass.
-The complete release has nine test modules and 85 tests.
+New terminal classifications include `MP3_STARTUP_TIMEOUT`,
+`MP3_STARTUP_EMPTY`, `MP3_OUTPUT_STALLED`, `FFMPEG_FAILED`,
+`SOURCE_VIDEO_UNAVAILABLE` and `SOURCE_REGION_RESTRICTED`.
 
-The optional desktop agent remains available for existing users. Normal
-installation uses `VEEB_SOURCE_MODE=direct`. The agent uploads completed MP3s
-and is not an instant-play solution.
+The existing V40.1 Worker remains compatible. A later Worker update can consume
+the new response headers and `/job/{jobId}` endpoint for end-to-end playback
+recovery and diagnostics.
+
+The Docker build installs dependencies and runs the complete test suite before
+starting the service.

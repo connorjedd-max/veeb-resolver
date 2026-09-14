@@ -39,6 +39,10 @@ class Job:
     purpose: str = 'playback'
     preempt_requested: bool = False
     priority: int = 100
+    created: float = field(default_factory=time.monotonic)
+    ready_at: float | None = None
+    done_at: float | None = None
+    last_byte_at: float | None = None
 
 
 def mp3_frames_valid(data):
@@ -138,6 +142,7 @@ class MediaJobs:
         else:
             job.error = JobError('JOB_CANCELLED', 'MP3 job was cancelled.')
         job.touched = time.monotonic()
+        job.done_at = job.touched
         job.path.unlink(missing_ok=True)
         job.size = 0
         job.done.set()
@@ -212,6 +217,10 @@ class MediaJobs:
                         validator.feed(chunk)
                         output.write(chunk)
                         job.size += len(chunk)
+                        now = time.monotonic()
+                        job.last_byte_at = now
+                        if not job.ready.is_set():
+                            job.ready_at = now
                         job.ready.set()
                         job.changed.set()
                 if not job.size:
@@ -240,6 +249,7 @@ class MediaJobs:
                 except BaseException:
                     pass
             job.touched = time.monotonic()
+            job.done_at = job.touched
             job.done.set()
             job.ready.set()
             job.changed.set()
@@ -295,6 +305,13 @@ class MediaJobs:
                 yield chunk
         finally:
             close()
+
+    def find_by_job_id(self, job_id):
+        job_id = str(job_id or '').strip()
+        for job in self.jobs.values():
+            if job.job_id == job_id:
+                return job
+        return None
 
     def stats(self):
         self._evict()
