@@ -77,13 +77,14 @@ class CookieTests(unittest.TestCase):
     def test_source_phase_timing_is_redacted_and_monotonic(self):
         log=DiagnosticLog()
         log.debug('Downloading webpage')
+        log.debug('Downloading mweb client config')
         log.debug('Detected a 15s ad skippable after 5s for mweb')
         log.debug('Generating a GVS PO Token')
         log.debug('Retrieved a GVS PO Token')
         log.debug('Invoking http downloader')
         log.progress({'status':'downloading','downloaded_bytes':8192,'info_dict':{'format_id':'251','protocol':'https'}})
         timing=log.timing_snapshot()
-        for key in ('webpageMs','adDetectedMs','potRequestMs','gvsTokenReadyMs','downloaderInvokedMs','firstDownloadProgressMs','source8192Ms'):
+        for key in ('webpageMs','clientConfigMs','adDetectedMs','potRequestMs','gvsTokenReadyMs','downloaderInvokedMs','firstDownloadProgressMs','source8192Ms'):
             self.assertIn(key,timing)
             self.assertGreaterEqual(timing[key],0)
         self.assertTrue(log.evidence['gvsTokenReturned'])
@@ -146,12 +147,24 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
             result=await c.produce_mp3('siRAwwaNc1M',None,job)
         self.assertIs(result,iterator);download.assert_awaited_once();resolve.assert_not_awaited()
         self.assertTrue(job.metadata['attempts'][-1]['usesCookies']);anonymous.assert_not_awaited()
-    async def test_mweb_args_equal_except_cookiefile(self):
+    async def test_authenticated_mweb_fast_path_skips_config_but_fallback_does_not(self):
         with patch.object(self.core,'get_writable_cookie_file',return_value='/private/cookies'):
-            a=self.core.ytdlp_options('mweb',None,False);b=self.core.ytdlp_options('mweb',None,True)
-        self.assertEqual(a['extractor_args'],b['extractor_args']);self.assertNotIn('cookiefile',a)
-        self.assertEqual(b['cookiefile'],'/private/cookies');self.assertNotIn('pot_trace',a['extractor_args']['youtube'])
-        self.assertEqual(a['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
+            fallback=self.core.ytdlp_options('mweb',None,False);fast=self.core.ytdlp_options('mweb',None,True)
+        self.assertNotIn('cookiefile',fallback);self.assertEqual(fast['cookiefile'],'/private/cookies')
+        self.assertNotIn('pot_trace',fallback['extractor_args']['youtube'])
+        self.assertEqual(fallback['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
+        self.assertEqual(fast['extractor_args']['youtube'].get('use_ad_playback_context'), ['true'])
+        self.assertNotIn('player_skip',fallback['extractor_args']['youtube'])
+        self.assertEqual(fast['extractor_args']['youtube'].get('player_skip'), ['configs'])
+
+    async def test_skip_client_config_has_single_flag_rollback(self):
+        with patch.object(self.core,'YTDLP_SKIP_MWEB_CLIENT_CONFIG',False):
+            args=self.core.youtube_extractor_args_dict('mweb',use_cookies=True)
+        self.assertNotIn('player_skip',args)
+        with patch.object(self.core,'YTDLP_SKIP_MWEB_CLIENT_CONFIG',True):
+            args=self.core.youtube_extractor_args_dict('mweb',use_cookies=True)
+        self.assertEqual(args.get('player_skip'),['configs'])
+        self.assertNotIn('player_skip',self.core.youtube_extractor_args_dict('mweb',use_cookies=False))
     async def test_ad_playback_context_has_single_flag_rollback(self):
         with patch.object(self.core,'YTDLP_USE_AD_PLAYBACK_CONTEXT',False):
             args=self.core.youtube_extractor_args_dict('mweb')
