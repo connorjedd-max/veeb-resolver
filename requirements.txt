@@ -1,5 +1,5 @@
 fastapi==0.141.1
 uvicorn==0.52.4
 httpx[http2]==0.28.1
-yt-dlp[default,curl-cffi]==2026.8.30.232658.dev0
+yt-dlp[default,curl-cffi]==2026.9.16.232951.dev0
 bgutil-ytdlp-pot-provider==2.0.0

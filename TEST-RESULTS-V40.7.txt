@@ -1,0 +1,13 @@
+V40.7 local verification
+
+- Python syntax compilation passed for resolver, media jobs, source extraction and source support.
+- 100 unit tests discovered in the existing suite plus the new compatibility regression test.
+- 97 tests passed in this analysis environment.
+- 3 tests require the yt_dlp package at runtime and could not execute here because the analysis environment does not have yt_dlp installed. The Dockerfile installs requirements before running the same suite during image build.
+
+Primary compatibility changes verified offline:
+- yt-dlp requirement pinned to 2026.9.16.232951.dev0
+- explicit web_embedded fallback exists
+- web_embedded uses audio-first / low-bandwidth muxed fallback selection
+- v40.6 foreground source preemption remains intact
+- stream failures include sanitized per-route attempts

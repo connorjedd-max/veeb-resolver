@@ -32,8 +32,8 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-RESOLVER_VERSION = 'v40.6-foreground-source-priority'
-app = FastAPI(title='Veeb YouTube Resolver V40.5.1 Stable Config Default', docs_url=None, redoc_url=None)
+RESOLVER_VERSION = 'v40.7-youtube-sep16-compat'
+app = FastAPI(title='Veeb YouTube Resolver V40.7 YouTube Compatibility', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
 JOB_ID_RE = re.compile('^[a-f0-9]{12}$')
@@ -116,6 +116,7 @@ _resolve_tasks: dict[str, asyncio.Task[ResolvedMedia]] = {}
 _http_client: httpx.AsyncClient | None = None
 _fg_auth_pool = None
 _fg_mweb_auth_pool = None
+_fg_web_embedded_pool = None
 _fg_pot_pool = None
 _fg_android_pool = None
 _fg_safari_pool = None
@@ -302,7 +303,15 @@ def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=
     if use_cookies and not cookie_file:
         raise SourceAttemptError('No usable Netscape cookie file with active login fields.',
                                  stage='cookie-file', code='COOKIE_FILE_UNUSABLE')
-    selector = '18/best[acodec!=none]/bestaudio/best' if client_name == 'android' else YTDLP_SOURCE_SELECTOR
+    if client_name == 'android':
+        selector = '18/best[acodec!=none]/bestaudio/best'
+    elif client_name == 'web_embedded':
+        # September 2026 YouTube changes can leave web_embedded with only muxed
+        # fallback formats. We only need audio, so prefer audio-only first and then
+        # the smallest usable muxed format instead of downloading the largest video.
+        selector = 'bestaudio[ext=webm]/bestaudio/18/worst[acodec!=none][vcodec!=none]/best[acodec!=none]/best'
+    else:
+        selector = YTDLP_SOURCE_SELECTOR
     opts = {'format': selector, 'skip_download': True, 'noplaylist': True,
             'quiet': True, 'no_warnings': False, 'verbose': True, 'cachedir': YTDLP_CACHE_DIR,
             'socket_timeout': YTDLP_SOCKET_TIMEOUT_SECONDS, 'retries': 0,
@@ -484,25 +493,29 @@ class YtdlpEnginePool:
         pass
 
 def init_ytdlp_pools() -> None:
-    global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_mweb_auth_pool
+    global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_mweb_auth_pool, _fg_web_embedded_pool
     if _fg_anon_pool is None:
-        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v39.2', False)
-        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v39.2', True)
-        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v39.2', False)
-        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v39.2', True)
+        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v40.7', False)
+        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v40.7', True)
+        # yt-dlp nightly 2026.09.16 contains the Safari-UA compatibility fix for
+        # web_embedded. Keep this route explicit so a broken mweb experiment or
+        # PO-token path cannot take the whole resolver down.
+        _fg_web_embedded_pool = YtdlpEnginePool('fg-web-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v40.7', False)
+        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v40.7', False)
+        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v40.7', True)
 
 
 def foreground_pools():
     init_ytdlp_pools()
     cookies = bool(get_writable_cookie_file())
-    # The earlier fast resolver used cookies on its first mweb attempt. Do not
-    # make a usable session wait behind an anonymous bot rejection. A negative
-    # session diagnostic disables cookie attempts until the secret changes.
+    # Keep the authenticated mweb route first for continuity, but immediately
+    # follow it with an explicit web_embedded route from the Sep-16 yt-dlp fix.
+    # A negative session diagnostic disables cookie attempts until the secret changes.
     rejected = _last_cookie_session_test.get('youtubeReportsLoggedIn') is False
     use_auth = cookies and not rejected
     pools = [_fg_mweb_auth_pool] if use_auth else []
-    pools.extend([_fg_pot_pool, _fg_anon_pool])
-    if use_auth and YTDLP_AUTH_CLIENT != 'mweb':
+    pools.extend([_fg_web_embedded_pool, _fg_pot_pool, _fg_anon_pool])
+    if use_auth and YTDLP_AUTH_CLIENT not in {'mweb', 'web_embedded'}:
         pools.append(_fg_auth_pool)
     return pools
 
@@ -988,7 +1001,14 @@ async def produce_mp3(video_id: str, request: Request, job):
                          message)
         error.retry_after = 120
         raise error
-    raise JobError('SOURCE_ACQUISITION_FAILED', 'Source attempts failed. Per-attempt stages identify extraction, download or conversion failure.')
+    summary = ', '.join(
+        str(a.get('path') or '?') + '=' + str(a.get('code') or 'UNKNOWN')
+        for a in attempts[-6:]
+    )
+    raise JobError(
+        'SOURCE_ACQUISITION_FAILED',
+        'Source attempts failed' + (': ' + summary if summary else '.')
+    )
 
 
 def cleanup_owned_source(media):
@@ -1041,6 +1061,7 @@ async def proxy_media(request: Request, video_id: str):
             error_headers['X-Veeb-MP3-Job'] = job.job_id
             payload['jobId'] = job.job_id
             payload['timing'] = job_timing_summary(job)
+            payload['attempts'] = job.metadata.get('attempts', [])[-6:]
         return JSONResponse(payload, status_code=status, headers=error_headers)
 
 @app.on_event('startup')
@@ -1109,6 +1130,8 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
             'backgroundPurposeHeaders': ['cache-fill', 'r2-background-prefetch', 'r2-next-prefetch', 'r2-library-warm'],
             'foregroundPreemptsBackground': True,
             'foregroundPreemptsBackgroundSourceAcquisition': True,
+            'youtubeCompatibility': 'yt-dlp-nightly-2026.09.16+explicit-web-embedded',
+            'explicitWebEmbeddedFallback': True,
             'extractionSlotReleasedAfterSourceBytes': True,
             'completedMp3Endpoint': '/completed/{videoId}', 'completedEndpointStartsAcquisition': False, 'jobs': stats}
 

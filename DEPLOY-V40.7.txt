@@ -1,0 +1,17 @@
+Veeb resolver v40.7 deployment
+
+Deploy this directory as the resolver service. No Worker or database migration is required.
+
+Keep existing secrets/environment variables. Recommended values remain:
+  VEEB_MP3_MAX_CONCURRENT=3
+  VEEB_MP3_MAX_BACKGROUND=2
+  VEEB_PLAYBACK_START_SLA_MS=3000
+  VEEB_YTDLP_USE_AD_PLAYBACK_CONTEXT=true
+  VEEB_YTDLP_SKIP_MWEB_CLIENT_CONFIG=false
+  YOUTUBE_JSC_RUNTIME=deno
+
+After deploy:
+1. GET /health with resolver auth. Confirm version v40.7-youtube-sep16-compat and ytDlpVersion 2026.09.16.232951.
+2. POST /diagnose/<known-good-video-id> with resolver auth.
+3. A failed /stream response now contains sanitized per-route attempts.
+4. Watch for `v40.7-youtube-sep16-compat source downloaded by yt-dlp` in Render logs.

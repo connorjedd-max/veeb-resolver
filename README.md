@@ -1,3 +1,7 @@
+# Veeb resolver v40.7
+
+September 2026 YouTube compatibility release. Start with **DEPLOY-V40.7.txt** and **CHANGES-V40.7.md**.
+
 # Veeb resolver v40.6
 
 Start with **DEPLOY-V40.6.txt** and **CHANGES-V40.6.md**.
