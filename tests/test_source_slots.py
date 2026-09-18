@@ -149,10 +149,11 @@ class SessionPriorityTests(unittest.IsolatedAsyncioTestCase):
         c = self.core
         with patch.object(c, 'get_writable_cookie_file', return_value='/private/cookies'), \
              patch.object(c, '_last_cookie_session_test', {'youtubeReportsLoggedIn': False}), \
+             patch.object(c._fg_web_embedded_pool, 'stream_source', AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
              patch.object(c._fg_pot_pool, 'stream_source', AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
              patch.object(c._fg_anon_pool, 'stream_source', AsyncMock(side_effect=SourceAttemptError('not a bot'))), \
              patch.object(c._fg_mweb_auth_pool, 'stream_source', AsyncMock(side_effect=AssertionError('known rejected session'))) as auth:
-            self.assertEqual(c.foreground_pools(), [c._fg_pot_pool, c._fg_anon_pool])
+            self.assertEqual(c.foreground_pools(), [c._fg_web_embedded_pool, c._fg_pot_pool, c._fg_anon_pool])
             with self.assertRaises(c.JobError) as failure:
                 await c.produce_mp3('siRAwwaNc1M', None, types.SimpleNamespace(metadata={}))
             self.assertEqual(failure.exception.code, 'SOURCE_ACCESS_DENIED')

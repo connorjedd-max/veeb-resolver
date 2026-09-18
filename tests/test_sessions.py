@@ -136,6 +136,15 @@ class CookieTests(unittest.TestCase):
 class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):self.core=load_core();self.core.init_ytdlp_pools()
     async def asyncTearDown(self):await self.core._media_jobs.close()
+
+    def test_web_embedded_uses_small_muxed_fallback_selector(self):
+        c = self.core
+        with patch.object(c, 'get_writable_cookie_file', return_value=None):
+            opts = c.ytdlp_options('web_embedded', None, use_cookies=False)
+        self.assertIn('bestaudio', opts['format'])
+        self.assertIn('worst[acodec!=none][vcodec!=none]', opts['format'])
+        self.assertIn(c._fg_web_embedded_pool, c.foreground_pools())
+
     async def test_authenticated_mweb_owns_download_from_start(self):
         c=self.core;media=types.SimpleNamespace(client='mweb',format_id='251',video_id='siRAwwaNc1M')
         job=types.SimpleNamespace(metadata={});iterator=object()

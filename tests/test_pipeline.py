@@ -220,6 +220,105 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(manager.wait(fg1,complete=True),manager.wait(fg2,complete=True))
 
+    async def test_foreground_preempts_background_source_acquisition_even_with_free_job_capacity(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        active_background = 0
+
+        async def producer(video_id, request, job):
+            nonlocal active_background
+            if job.background:
+                job.metadata['sourceAcquisitionActive'] = True
+                active_background += 1
+                if active_background >= 2:
+                    entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    job.metadata['sourceAcquisitionActive'] = False
+                async def background_body():
+                    yield self.mp3
+                return background_body()
+            async def foreground_body():
+                yield self.mp3
+            return foreground_body()
+
+        manager = self.manager(producer, max_active=3, max_background=2)
+        bg1 = manager.get('dQw4w9WgXcQ', None, background=True, purpose='r2-library-warm')
+        bg2 = manager.get('C2elY5Tctqg', None, background=True, purpose='r2-background-prefetch')
+        await asyncio.wait_for(entered.wait(), 1)
+
+        # Capacity is not full: the old logic would let playback start as a job
+        # but leave it queued behind the serialized background extraction lane.
+        fg = manager.get('siRAwwaNc1M', None, purpose='playback')
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertTrue(bg1.preempt_requested)
+        self.assertTrue(bg2.preempt_requested)
+        self.assertEqual(manager.stats()['backgroundSourcePreemptions'], 2)
+        await manager.wait(fg, complete=True)
+        for job in (bg1, bg2):
+            self.assertTrue(job.done.is_set())
+            self.assertEqual(getattr(job.error, 'code', None), 'BACKGROUND_PREEMPTED')
+        release.set()
+
+    async def test_foreground_does_not_preempt_background_after_source_bytes_are_published(self):
+        release = asyncio.Event()
+        async def producer(video_id, request, job):
+            job.metadata['sourceAcquisitionActive'] = False
+            async def body():
+                yield self.mp3[:20000]
+                if job.background:
+                    await release.wait()
+                    yield self.mp3[20000:]
+                else:
+                    yield self.mp3[20000:]
+            return body()
+
+        manager = self.manager(producer, max_active=3, max_background=2)
+        bg = manager.get('dQw4w9WgXcQ', None, background=True, purpose='r2-library-warm')
+        await manager.wait(bg)
+        fg = manager.get('siRAwwaNc1M', None, purpose='playback')
+        await asyncio.sleep(0)
+        self.assertFalse(bg.preempt_requested)
+        self.assertEqual(manager.stats()['backgroundSourcePreemptions'], 0)
+        await manager.wait(fg, complete=True)
+        release.set()
+        await manager.wait(bg, complete=True)
+
+    async def test_foreground_claim_of_same_background_source_preempts_other_blocker_not_itself(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        count = 0
+        async def producer(video_id, request, job):
+            nonlocal count
+            if job.background:
+                job.metadata['sourceAcquisitionActive'] = True
+                count += 1
+                if count >= 2:
+                    entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    job.metadata['sourceAcquisitionActive'] = False
+            async def body():
+                yield self.mp3
+            return body()
+
+        manager = self.manager(producer, max_active=3, max_background=2)
+        same = manager.get('siRAwwaNc1M', None, background=True, purpose='r2-next-prefetch')
+        other = manager.get('C2elY5Tctqg', None, background=True, purpose='r2-library-warm')
+        await asyncio.wait_for(entered.wait(), 1)
+        claimed = manager.get('siRAwwaNc1M', None, background=False, purpose='playback')
+        await asyncio.sleep(0)
+        self.assertIs(claimed, same)
+        self.assertFalse(same.background)
+        self.assertFalse(same.preempt_requested)
+        self.assertTrue(other.preempt_requested)
+        release.set()
+        await manager.wait(same, complete=True)
+
     async def test_next_prefetch_preempts_lower_priority_library_warm(self):
         release=asyncio.Event()
         async def producer(*args):
@@ -294,6 +393,24 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result,iterator); prepare.assert_awaited_once()
         download.assert_awaited_once(); resolve.assert_not_awaited()
         self.assertEqual(job.metadata['cache'],'MISS-DOWNLOADED')
+
+    async def test_producer_marks_only_the_source_acquisition_interval(self):
+        c = self.core
+        observed = []
+        class FakePool:
+            name = 'fake'
+            client_name = 'mweb'
+            use_cookies = True
+            async def stream_source(self, video_id, purpose):
+                observed.append(bool(job.metadata.get('sourceAcquisitionActive')))
+                raise c.SourceAttemptError('synthetic unavailable', code='SOURCE_VIDEO_UNAVAILABLE')
+
+        job = types.SimpleNamespace(metadata={}, job_id='test-job')
+        with patch.object(c, 'foreground_pools', return_value=[FakePool()]),              patch.object(c._source_guard, 'check'),              patch.object(c._source_guard, 'failed'):
+            with self.assertRaises(c.JobError):
+                await c.produce_mp3('siRAwwaNc1M', self.request(purpose='r2-library-warm'), job)
+        self.assertEqual(observed, [True])
+        self.assertFalse(job.metadata.get('sourceAcquisitionActive'))
 
     async def test_foreground_order_includes_explicit_authenticated_mweb(self):
         core=self.core; core.init_ytdlp_pools(); order=[]
