@@ -1,0 +1,5 @@
+Veeb Resolver v40.9 targeted validation
+
+- Python compile: PASS
+- Targeted terminal-failure / pipeline / HTTP / session tests: 58 passed
+- Full suite in local sandbox: 99 passed, 3 integration tests unavailable because yt_dlp is not installed in the sandbox runtime. Those are the same three environment-dependent tests seen in v40.7/v40.8 validation.

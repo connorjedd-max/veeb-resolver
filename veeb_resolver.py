@@ -32,7 +32,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-RESOLVER_VERSION = 'v40.8-mweb-format18-fallback'
+RESOLVER_VERSION = 'v40.9-terminal-source-failures'
 app = FastAPI(title='Veeb YouTube Resolver V40.7 YouTube Compatibility', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
@@ -90,6 +90,13 @@ YOUTUBE_PROXY_URL = os.environ.get('YOUTUBE_PROXY_URL', '').strip()
 _source_guard = AcquisitionGuard()
 _source_broker = SourceBroker()
 _last_source_success = None
+# Short-lived negative cache for definitive per-video failures. This prevents
+# overlapping Worker retries from repeatedly launching yt-dlp for a video that
+# YouTube has already told us is unavailable. The Worker persists the durable
+# unavailable state; this cache only protects the resolver during that handoff.
+_permanent_source_failures = {}
+PERMANENT_SOURCE_FAILURE_TTL_SECONDS = 6 * 60 * 60
+PERMANENT_SOURCE_CODES = {'SOURCE_VIDEO_UNAVAILABLE', 'SOURCE_REGION_RESTRICTED'}
 
 @dataclass
 class ResolvedMedia:
@@ -500,14 +507,14 @@ class YtdlpEnginePool:
 def init_ytdlp_pools() -> None:
     global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_mweb_auth_pool, _fg_web_embedded_pool
     if _fg_anon_pool is None:
-        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v40.8', False)
-        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v40.8', True)
+        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v40.9', False)
+        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v40.9', True)
         # yt-dlp nightly 2026.09.16 contains the Safari-UA compatibility fix for
         # web_embedded. Keep this route explicit so a broken mweb experiment or
         # PO-token path cannot take the whole resolver down.
-        _fg_web_embedded_pool = YtdlpEnginePool('fg-web-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v40.8', False)
-        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v40.8', False)
-        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v40.8', True)
+        _fg_web_embedded_pool = YtdlpEnginePool('fg-web-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v40.9', False)
+        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v40.9', False)
+        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v40.9', True)
 
 
 def foreground_pools():
@@ -911,10 +918,42 @@ def error_detail(error: BaseException) -> dict[str, str]:
         return {'code': 'SOURCE_TIMEOUT', 'message': 'Acquisition or conversion exceeded its time budget.'}
     return {'code': failure_code(error), 'message': redact(error, 450)}
 
+def cached_permanent_source_failure(video_id: str):
+    now = time.time()
+    row = _permanent_source_failures.get(str(video_id))
+    if not row:
+        return None
+    code, expires_at = row
+    if expires_at <= now:
+        _permanent_source_failures.pop(str(video_id), None)
+        return None
+    return code
+
+
+def remember_permanent_source_failure(video_id: str, code: str) -> None:
+    if code in PERMANENT_SOURCE_CODES:
+        _permanent_source_failures[str(video_id)] = (code, time.time() + PERMANENT_SOURCE_FAILURE_TTL_SECONDS)
+
+
+def permanent_source_job_error(code: str, *, cached: bool = False) -> JobError:
+    if code == 'SOURCE_REGION_RESTRICTED':
+        message = 'YouTube reports this specific source video is region-restricted.'
+    else:
+        message = 'YouTube reports this specific source video is unavailable.'
+    if cached:
+        message += ' Resolver negative cache hit.'
+    error = JobError(code, message)
+    error.retry_after = 21600
+    return error
+
+
 async def produce_mp3(video_id: str, request: Request, job):
     global _last_source_success
     purpose = request_purpose(request)
     mark_job_timing(job, 'producer_start')
+    cached_permanent = cached_permanent_source_failure(video_id)
+    if cached_permanent:
+        raise permanent_source_job_error(cached_permanent, cached=True)
     imported = getattr(request, 'scope', {}).get('_veeb_import_media')
     if imported is not None:
         job.metadata.update(media=imported, cache='R2-IMPORT', attempts=[])
@@ -938,6 +977,7 @@ async def produce_mp3(video_id: str, request: Request, job):
     # of that budget so a failed authenticated mweb attempt can still reach the
     # cookie-free mweb+POT fallback. Foreground playback keeps the tighter SLA.
     source_startup_deadline = 24 if is_background_purpose(purpose) else 20
+    permanent_counts = {}
     try:
         async with asyncio.timeout(source_startup_deadline):
             for pool in foreground_pools():
@@ -989,6 +1029,18 @@ async def produce_mp3(video_id: str, request: Request, job):
                     detail['elapsedMs'] = elapsed_ms(attempt_started, time.monotonic())
                     attempts.append(detail)
                     print(RESOLVER_VERSION + ' source attempt failed', json.dumps({'videoId': video_id, **detail}), flush=True)
+                    code = str(detail.get('code') or getattr(exc, 'code', '') or '')
+                    if code in PERMANENT_SOURCE_CODES:
+                        permanent_counts[code] = permanent_counts.get(code, 0) + 1
+                        # Background warming values throughput over exhaustive route
+                        # confirmation. An authenticated mweb "Video unavailable" is
+                        # definitive enough to stop immediately. Foreground playback
+                        # gets one independent confirmation before giving up, reducing
+                        # the chance of a client-specific false negative.
+                        confirmations_needed = 1 if is_background_purpose(purpose) else 2
+                        if permanent_counts[code] >= confirmations_needed:
+                            remember_permanent_source_failure(video_id, code)
+                            raise permanent_source_job_error(code)
                     if getattr(exc, 'code', '') in {'SOURCE_ROUTE_COOLDOWN', 'SOURCE_PROXY_CONFIG_INVALID', 'SOURCE_DURATION_UNSUPPORTED'}:
                         raise
     except TimeoutError as exc:
@@ -997,9 +1049,11 @@ async def produce_mp3(video_id: str, request: Request, job):
     codes = {a.get('code') for a in attempts if a.get('code')}
     _source_guard.failed(video_id, codes)
     if codes == {'SOURCE_VIDEO_UNAVAILABLE'}:
-        raise JobError('SOURCE_VIDEO_UNAVAILABLE', 'YouTube reports this specific source video is unavailable on every configured resolver route.')
+        remember_permanent_source_failure(video_id, 'SOURCE_VIDEO_UNAVAILABLE')
+        raise permanent_source_job_error('SOURCE_VIDEO_UNAVAILABLE')
     if codes == {'SOURCE_REGION_RESTRICTED'}:
-        raise JobError('SOURCE_REGION_RESTRICTED', 'YouTube reports this specific source video is region-restricted on every configured resolver route.')
+        remember_permanent_source_failure(video_id, 'SOURCE_REGION_RESTRICTED')
+        raise permanent_source_job_error('SOURCE_REGION_RESTRICTED')
     if codes and codes <= AcquisitionGuard.BLOCK_CODES:
         message = (
             'YouTube refused source access. Its session check reports the saved cookies are not logged in. '
@@ -1064,7 +1118,14 @@ async def proxy_media(request: Request, video_id: str):
         return StreamingResponse(body, headers=headers, media_type='audio/mpeg', background=BackgroundTask(close))
     except Exception as exc:
         detail = error_detail(exc)
-        status = 503 if detail['code'] in {'RESOLVER_BUSY', 'BACKGROUND_PREEMPTED', 'SOURCE_ROUTE_COOLDOWN', 'SOURCE_AGENT_OFFLINE'} else 502
+        if detail['code'] == 'SOURCE_VIDEO_UNAVAILABLE':
+            status = 410
+        elif detail['code'] == 'SOURCE_REGION_RESTRICTED':
+            status = 451
+        elif detail['code'] in {'RESOLVER_BUSY', 'BACKGROUND_PREEMPTED', 'SOURCE_ROUTE_COOLDOWN', 'SOURCE_AGENT_OFFLINE'}:
+            status = 503
+        else:
+            status = 502
         error_headers = {'Cache-Control': 'no-store', 'Retry-After': str(getattr(exc, 'retry_after', 15)), 'X-Veeb-Error-Code': detail['code']}
         payload = {'ok': False, 'stage': 'source-or-transcode', **detail}
         if job is not None:
@@ -1132,6 +1193,9 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
             'startupTelemetryEnabled': True,
             'sourceStartupDeadlineSeconds': {'foreground': 20, 'background': 24},
             'mwebSourceSelector': '251/140/18/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best',
+            'permanentSourceFailureCacheEntries': sum(1 for _, expiry in _permanent_source_failures.values() if expiry > time.time()),
+            'permanentSourceFailureTtlSeconds': PERMANENT_SOURCE_FAILURE_TTL_SECONDS,
+            'permanentSourceFailurePolicy': 'background stops after first definitive unavailable; foreground requires two matching route confirmations',
             'note': 'Liveness only. Current completed jobs prove MP3 production; cookie fields alone prove no login.',
             'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1,
             'sourceDownloadConcurrency': MP3_MAX_CONCURRENT_TRANSCODES,

@@ -1,8 +1,8 @@
-# Veeb resolver v40.8
+# Veeb resolver v40.9
 
-## v40.8 hotfix
+## v40.9 hotfix
 
-September 2026 YouTube behaviour can leave authenticated mweb sessions with only progressive format 18. v40.8 makes 18 an explicit mweb fallback, tries cookie-free mweb+POT before anonymous web_embedded, and gives background R2 acquisition enough time to reach that fallback. See `CHANGES-V40.8.md`.
+v40.9 keeps the v40.8 mweb format-18 compatibility fix, but stops wasting the full fallback chain on definitive per-video failures. Background R2 warms stop after the first `SOURCE_VIDEO_UNAVAILABLE`; foreground playback requires two matching confirmations. Permanent failures return HTTP 410/451 instead of generic 502 and are held in a six-hour in-memory negative cache. See `CHANGES-V40.9.md`.
 
 
 September 2026 YouTube compatibility release. Start with **DEPLOY-V40.7.txt** and **CHANGES-V40.7.md**.
