@@ -1,0 +1,12 @@
+Veeb resolver v40.8 deployment
+
+1. Deploy this bundle over the existing resolver service.
+2. Keep the existing RESOLVER_SECRET, YouTube cookie secret, bgutil PO-token service and one-instance/one-worker settings.
+3. If Render still has a YOUTUBE_SOURCE_SELECTOR environment variable from an old build, remove it. v40.8 ignores it for mweb anyway, but removing it avoids confusing /health diagnostics for other clients.
+4. GET /health with resolver auth. Confirm:
+   version = v40.8-mweb-format18-fallback
+   ytDlpVersion = 2026.9.16.232951.dev0
+   mwebSourceSelector contains /18/
+   sourceStartupDeadlineSeconds.background = 24
+5. Watch Render logs. On affected tracks, successful fallback may report sourceFormat 18 instead of 251.
+6. Healthy R2 behaviour is a mix of 200 /stream responses and per-track failures. A run of SOURCE_FORMAT_UNAVAILABLE on mweb followed by a successful fg-pot attempt is expected recovery behaviour.

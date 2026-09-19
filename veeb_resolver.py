@@ -32,7 +32,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-RESOLVER_VERSION = 'v40.7-youtube-sep16-compat'
+RESOLVER_VERSION = 'v40.8-mweb-format18-fallback'
 app = FastAPI(title='Veeb YouTube Resolver V40.7 YouTube Compatibility', docs_url=None, redoc_url=None)
 RESOLVER_SECRET = os.environ.get('RESOLVER_SECRET', '')
 VIDEO_ID_RE = re.compile('^[A-Za-z0-9_-]{11}$')
@@ -305,10 +305,15 @@ def ytdlp_options(client_name: str, logger: YtdlpPhaseLogger, use_cookies: bool=
                                  stage='cookie-file', code='COOKIE_FILE_UNUSABLE')
     if client_name == 'android':
         selector = '18/best[acodec!=none]/bestaudio/best'
+    elif client_name == 'mweb':
+        # Sep-2026 YouTube can expose only progressive format 18 for mweb on some
+        # sessions/cookies. Do not let a stale Render YOUTUBE_SOURCE_SELECTOR override
+        # make those videos look unavailable. Prefer the normal audio-only formats,
+        # then explicitly fall back to 18 before the generic selectors.
+        selector = '251/140/18/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best'
     elif client_name == 'web_embedded':
-        # September 2026 YouTube changes can leave web_embedded with only muxed
-        # fallback formats. We only need audio, so prefer audio-only first and then
-        # the smallest usable muxed format instead of downloading the largest video.
+        # web_embedded can expose muxed/HLS fallback formats. It is a tertiary route
+        # on datacenter IPs because YouTube may challenge anonymous embedded sessions.
         selector = 'bestaudio[ext=webm]/bestaudio/18/worst[acodec!=none][vcodec!=none]/best[acodec!=none]/best'
     else:
         selector = YTDLP_SOURCE_SELECTOR
@@ -495,26 +500,27 @@ class YtdlpEnginePool:
 def init_ytdlp_pools() -> None:
     global _fg_auth_pool, _fg_pot_pool, _fg_anon_pool, _fg_mweb_auth_pool, _fg_web_embedded_pool
     if _fg_anon_pool is None:
-        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v40.7', False)
-        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v40.7', True)
+        _fg_pot_pool = YtdlpEnginePool('fg-pot', 1, 'mweb', 'yt-dlp-mweb-v40.8', False)
+        _fg_mweb_auth_pool = YtdlpEnginePool('fg-mweb-auth', 1, 'mweb', 'yt-dlp-mweb-auth-v40.8', True)
         # yt-dlp nightly 2026.09.16 contains the Safari-UA compatibility fix for
         # web_embedded. Keep this route explicit so a broken mweb experiment or
         # PO-token path cannot take the whole resolver down.
-        _fg_web_embedded_pool = YtdlpEnginePool('fg-web-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v40.7', False)
-        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v40.7', False)
-        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v40.7', True)
+        _fg_web_embedded_pool = YtdlpEnginePool('fg-web-embedded', 1, 'web_embedded', 'yt-dlp-web-embedded-v40.8', False)
+        _fg_anon_pool = YtdlpEnginePool('fg-anon', 1, 'anonymous', 'yt-dlp-anonymous-v40.8', False)
+        _fg_auth_pool = YtdlpEnginePool('fg-auth', 1, YTDLP_AUTH_CLIENT, 'yt-dlp-auth-v40.8', True)
 
 
 def foreground_pools():
     init_ytdlp_pools()
     cookies = bool(get_writable_cookie_file())
-    # Keep the authenticated mweb route first for continuity, but immediately
-    # follow it with an explicit web_embedded route from the Sep-16 yt-dlp fix.
-    # A negative session diagnostic disables cookie attempts until the secret changes.
+    # Keep authenticated mweb first. If a cookie-bound mweb session loses audio-only
+    # formats, retry cookie-free mweb+POT before web_embedded. Current Render logs show
+    # anonymous web_embedded is frequently challenged while cookie-free mweb can still
+    # obtain progressive format 18. A negative session diagnostic disables cookie attempts.
     rejected = _last_cookie_session_test.get('youtubeReportsLoggedIn') is False
     use_auth = cookies and not rejected
     pools = [_fg_mweb_auth_pool] if use_auth else []
-    pools.extend([_fg_web_embedded_pool, _fg_pot_pool, _fg_anon_pool])
+    pools.extend([_fg_pot_pool, _fg_web_embedded_pool, _fg_anon_pool])
     if use_auth and YTDLP_AUTH_CLIENT not in {'mweb', 'web_embedded'}:
         pools.append(_fg_auth_pool)
     return pools
@@ -928,8 +934,12 @@ async def produce_mp3(video_id: str, request: Request, job):
         raise JobError('SOURCE_MODE_INVALID', 'VEEB_SOURCE_MODE must be direct or agent.')
 
     _source_guard.check()
+    # The Worker gives background R2 acquisition about 26 seconds. Allow almost all
+    # of that budget so a failed authenticated mweb attempt can still reach the
+    # cookie-free mweb+POT fallback. Foreground playback keeps the tighter SLA.
+    source_startup_deadline = 24 if is_background_purpose(purpose) else 20
     try:
-        async with asyncio.timeout(20):
+        async with asyncio.timeout(source_startup_deadline):
             for pool in foreground_pools():
                 media = None
                 attempt_started = time.monotonic()
@@ -983,7 +993,7 @@ async def produce_mp3(video_id: str, request: Request, job):
                         raise
     except TimeoutError as exc:
         attempts.append({'path': 'acquisition', 'stage': 'deadline', 'code': 'SOURCE_TIMEOUT'})
-        raise JobError('SOURCE_TIMEOUT', 'Source startup exceeded 20 seconds. Inspect per-attempt source errors.') from exc
+        raise JobError('SOURCE_TIMEOUT', f'Source startup exceeded {source_startup_deadline} seconds. Inspect per-attempt source errors.') from exc
     codes = {a.get('code') for a in attempts if a.get('code')}
     _source_guard.failed(video_id, codes)
     if codes == {'SOURCE_VIDEO_UNAVAILABLE'}:
@@ -1120,7 +1130,8 @@ async def health(authorization: str | None=Header(default=None)) -> dict[str, An
             'mp3OutputStallTimeoutSeconds': MP3_OUTPUT_STALL_TIMEOUT_SECONDS,
             'playbackStartSlaMs': PLAYBACK_START_SLA_MS,
             'startupTelemetryEnabled': True,
-            'sourceStartupDeadlineSeconds': 20,
+            'sourceStartupDeadlineSeconds': {'foreground': 20, 'background': 24},
+            'mwebSourceSelector': '251/140/18/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best',
             'note': 'Liveness only. Current completed jobs prove MP3 production; cookie fields alone prove no login.',
             'deliveryFormat': 'audio/mpeg', 'speculativeExtraction': False, 'extractionConcurrency': 1,
             'sourceDownloadConcurrency': MP3_MAX_CONCURRENT_TRANSCODES,

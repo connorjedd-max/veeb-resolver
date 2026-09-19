@@ -1,4 +1,9 @@
-# Veeb resolver v40.7
+# Veeb resolver v40.8
+
+## v40.8 hotfix
+
+September 2026 YouTube behaviour can leave authenticated mweb sessions with only progressive format 18. v40.8 makes 18 an explicit mweb fallback, tries cookie-free mweb+POT before anonymous web_embedded, and gives background R2 acquisition enough time to reach that fallback. See `CHANGES-V40.8.md`.
+
 
 September 2026 YouTube compatibility release. Start with **DEPLOY-V40.7.txt** and **CHANGES-V40.7.md**.
 
