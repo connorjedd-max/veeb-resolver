@@ -145,6 +145,19 @@ class SessionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('worst[acodec!=none][vcodec!=none]', opts['format'])
         self.assertIn(c._fg_web_embedded_pool, c.foreground_pools())
 
+    def test_mweb_selector_explicitly_falls_back_to_18_and_ignores_stale_override(self):
+        c = self.core
+        with patch.object(c, 'YTDLP_SOURCE_SELECTOR', '251'),              patch.object(c, 'get_writable_cookie_file', return_value=None):
+            opts = c.ytdlp_options('mweb', None, use_cookies=False)
+        self.assertEqual(opts['format'], '251/140/18/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best')
+        self.assertIn('/18/', opts['format'])
+
+    def test_foreground_pool_order_prefers_mweb_pot_before_web_embedded(self):
+        c = self.core
+        with patch.object(c, 'get_writable_cookie_file', return_value='/private/cookies'),              patch.object(c, '_last_cookie_session_test', {'youtubeReportsLoggedIn': True}):
+            pools = c.foreground_pools()
+        self.assertEqual(pools[:3], [c._fg_mweb_auth_pool, c._fg_pot_pool, c._fg_web_embedded_pool])
+
     async def test_authenticated_mweb_owns_download_from_start(self):
         c=self.core;media=types.SimpleNamespace(client='mweb',format_id='251',video_id='siRAwwaNc1M')
         job=types.SimpleNamespace(metadata={});iterator=object()
