@@ -294,6 +294,10 @@ def youtube_extractor_args_dict(client: str, *, use_cookies: bool=False) -> dict
         args['player_client'] = [client]
     if client in {'visionos', 'android'}:
         args['player_skip'] = ['webpage']
+    if client == 'web_embedded':
+        # YouTube's GVS PO-token experiment requires an explicit token request
+        # on this fallback, even when yt-dlp can select a format without one.
+        args['fetch_pot'] = ['always']
     if client == 'mweb':
         # Keep the known-good POT/ad policy on every mweb route. Only the first
         # authenticated foreground path skips the client-config request. If that
